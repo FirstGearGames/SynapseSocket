@@ -15,7 +15,7 @@ namespace SynapseSocket.Packets;
 /// </summary>
 public sealed class PacketReassembler : PacketSegmenter
 {
-    private readonly Dictionary<ushort, SegmentAssembly> _currentSegments = new();
+    private readonly Dictionary<ushort, SegmentAssembly> _currentSegments = [];
     private readonly object _lock = new();
     private uint _maximumConcurrentAssemblies;
 

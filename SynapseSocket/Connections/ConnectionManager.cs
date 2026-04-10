@@ -2,6 +2,7 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
+using SynapseSocket.Core.Events;
 
 namespace SynapseSocket.Connections;
 
@@ -15,9 +16,9 @@ public sealed class ConnectionManager
     /// Current live connection count.
     /// </summary>
     public int Count => _byEndPoint.Count;
-    private readonly ConcurrentDictionary<EndPointKey, SynapseConnection> _byEndPoint = new();
+    private readonly ConcurrentDictionary<EndPointKey, SynapseConnection> _byEndPoint = [];
 
-    private readonly ConcurrentDictionary<ulong, SynapseConnection> _bySignature = new();
+    private readonly ConcurrentDictionary<ulong, SynapseConnection> _bySignature = [];
 
     /// <summary>
     /// Tries to find an existing connection by its remote endpoint.
@@ -38,7 +39,7 @@ public sealed class ConnectionManager
     /// The newer connection wins the reverse-lookup slot. Subscribe for telemetry;
     /// no corrective action is taken automatically.
     /// </summary>
-    public event Action<ulong>? SignatureCollisionDetected;
+    public event SignatureCollisionDelegate? SignatureCollisionDetected;
 
     /// <summary>
     /// Registers a new connection.

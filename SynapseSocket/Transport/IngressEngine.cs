@@ -35,11 +35,11 @@ public sealed partial class IngressEngine
     private readonly TransmissionEngine _sender;
     private readonly Telemetry _telemetry;
     // Tracks the last probe-response ticks per source IP; limits outbound amplification.
-    private readonly ConcurrentDictionary<IpKey, long> _natProbeRateLimiter = new();
+    private readonly ConcurrentDictionary<IpKey, long> _natProbeLastResponseTicks = [];
     private long _lastProbeEvictionTicks;
     // Replay cache: maps handshake signature → first-seen ticks. Prevents replayed handshakes
     // from re-establishing connections after the original session ends.
-    private readonly ConcurrentDictionary<ulong, long> _seenHandshakes = new();
+    private readonly ConcurrentDictionary<ulong, long> _seenHandshakes = [];
     private long _lastHandshakeEvictionTicks;
     public event PayloadDeliveredDelegate? PayloadDelivered;
     public event ConnectionDelegate? ConnectionEstablished;
@@ -414,10 +414,10 @@ public sealed partial class IngressEngine
 
     private void RemoveExpiredProbeLimitEntries(long nowTicks, long staleTicks)
     {
-        foreach (KeyValuePair<IpKey, long> entry in _natProbeRateLimiter)
+        foreach (KeyValuePair<IpKey, long> entry in _natProbeLastResponseTicks)
         {
             if (nowTicks - entry.Value > staleTicks)
-                _natProbeRateLimiter.TryRemove(entry.Key, out _);
+                _natProbeLastResponseTicks.TryRemove(entry.Key, out _);
         }
     }
 
@@ -532,12 +532,4 @@ public sealed partial class IngressEngine
             {
                 Span<byte> b = stackalloc byte[16];
                 address.TryWriteBytes(b, out _);
-                return new(MemoryMarshal.Read<ulong>(b), MemoryMarshal.Read<ulong>(b.Slice(8)));
-            }
-        }
-
-        public bool Equals(IpKey other) => _upper64 == other._upper64 && _lower64 == other._lower64;
-        public override bool Equals(object? obj) => obj is IpKey other && Equals(other);
-        public override int GetHashCode() => HashCode.Combine(_upper64, _lower64);
-    }
-}
+                return new(MemoryMarshal.Read<ulong>(b), MemoryMarshal.Rea

@@ -180,7 +180,7 @@ public sealed partial class TransmissionEngine
 
     private async Task SendDirectAsync(byte[] buffer, int length, IPEndPoint target)
     {
-        Socket socket = target.AddressFamily == AddressFamily.InterNetworkV6 && _ipv6Socket != null ? _ipv6Socket : _ipv4Socket;
+        Socket socket = target.AddressFamily == AddressFamily.InterNetworkV6 && _ipv6Socket is not null ? _ipv6Socket : _ipv4Socket;
         int bytesSent = await socket.SendToAsync(new(buffer, 0, length), SocketFlags.None, target).ConfigureAwait(false);
         _telemetry.OnSent(bytesSent);
     }

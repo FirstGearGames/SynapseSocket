@@ -131,9 +131,13 @@ public sealed class SynapseConfig
     /// </summary>
     public NatTraversalConfig NatTraversal = new();
 
-    /// <summary>Sentinel value: pass as <see cref="MaximumSegments"/> to disable segmentation.</summary>
+    /// <summary>
+    /// Sentinel value: pass as <see cref="MaximumSegments"/> to disable segmentation.
+    /// </summary>
     public const uint DisabledMaximumSegments = 0;
 
-    /// <summary>Sentinel value: pass as <see cref="MaximumPacketsPerSecond"/> to disable rate limiting.</summary>
+    /// <summary>
+    /// Sentinel value: pass as <see cref="MaximumPacketsPerSecond"/> to disable rate limiting.
+    /// </summary>
     public const uint UnsetMaximumPacketsPerSecond = 0;
 }

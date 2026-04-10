@@ -52,10 +52,10 @@ public sealed partial class IngressEngine
             if (Interlocked.CompareExchange(ref _lastProbeEvictionTicks, nowTicks, lastProbeEvict) == lastProbeEvict)
                 RemoveExpiredProbeLimitEntries(nowTicks, staleTicks: minIntervalTicks * 10);
 
-        long lastTicks = _natProbeRateLimiter.GetOrAdd(addressKey, 0L);
+        long lastTicks = _natProbeLastResponseTicks.GetOrAdd(addressKey, 0L);
         if (nowTicks - lastTicks < minIntervalTicks)
             return;
-        _natProbeRateLimiter[addressKey] = nowTicks;
+        _natProbeLastResponseTicks[addressKey] = nowTicks;
 
         _ = _sender.SendNatProbeAsync(fromEndPoint, cancellationToken);
         _ = _sender.SendHandshakeAsync(fromEndPoint, cancellationToken);

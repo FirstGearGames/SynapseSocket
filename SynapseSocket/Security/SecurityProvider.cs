@@ -15,8 +15,8 @@ public sealed class SecurityProvider
     /// The signature calculator in use.
     /// </summary>
     public ISignatureProvider SignatureProvider { get; }
-    private readonly ConcurrentDictionary<ulong, byte> _blacklist = new();
-    private readonly ConcurrentDictionary<ulong, RateBucket> _rateBuckets = new();
+    private readonly ConcurrentDictionary<ulong, byte> _blacklist = [];
+    private readonly ConcurrentDictionary<ulong, RateBucket> _rateBuckets = [];
     private readonly uint _maximumPacketsPerSecond;
     private readonly uint _maximumPacketSize;
     /// <summary>

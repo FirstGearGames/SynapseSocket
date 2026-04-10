@@ -51,12 +51,12 @@ public sealed class SynapseConnection
     /// <summary>
     /// Pending unacked reliable packets keyed by sequence.
     /// </summary>
-    internal readonly ConcurrentDictionary<ushort, PendingReliable> PendingReliableQueue = new();
+    internal readonly ConcurrentDictionary<ushort, PendingReliable> PendingReliableQueue = [];
 
     /// <summary>
     /// Out-of-order reliable packets awaiting delivery.
     /// </summary>
-    internal readonly Dictionary<ushort, ArraySegment<byte>> ReorderBuffer = new();
+    internal readonly Dictionary<ushort, ArraySegment<byte>> ReorderBuffer = [];
 
     /// <summary>
     /// Gate for reorder buffer and sequence manipulation.
