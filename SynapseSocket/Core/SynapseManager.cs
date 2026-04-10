@@ -277,6 +277,57 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Central violation handler.
+    /// Builds a <see cref="ViolationEventArgs"/> via the pool, applies the caller-supplied <paramref name="initialAction"/>
+    /// as the default response, invokes any user listener (which may mutate <see cref="ViolationEventArgs.Action"/>),
+    /// and then applies the final action.
+    /// </summary>
+    internal void HandleViolation(IPEndPoint endPoint, ulong signature, ViolationReason violationReason, int packetSize, string? details, ViolationAction initialAction = ViolationAction.KickAndBlacklist)
+    {
+        Connections.TryGet(endPoint, out SynapseConnection? synapseConnection);
+
+        ViolationEventArgs violationEventArgs = ResettableObjectPool<ViolationEventArgs>.Rent();
+        violationEventArgs.Initialize(endPoint, signature, violationReason, synapseConnection, packetSize, details, initialAction);
+
+        try
+        {
+            try
+            {
+                ViolationDetected?.Invoke(violationEventArgs);
+            }
+            catch
+            {
+                /* never let a listener crash the ingress path */
+            }
+
+            switch (violationEventArgs.Action)
+            {
+                case ViolationAction.Ignore:
+                    return;
+
+                case ViolationAction.Drop:
+                    return;
+
+                case ViolationAction.Kick:
+                    KickEndpoint(endPoint, blacklist: false);
+                    return;
+
+                case ViolationAction.KickAndBlacklist:
+                default: // ViolationAction.KickAndBlacklist
+                    if (signature != SecurityProvider.UnsetSignature)
+                        Security.AddToBlacklist(signature);
+
+                    KickEndpoint(endPoint, blacklist: false);
+                    return;
+            }
+        }
+        finally
+        {
+            ResettableObjectPool<ViolationEventArgs>.Return(violationEventArgs);
+        }
+    }
+
+    /// <summary>
     /// Stops the engine and releases all resources. Prefer <see cref="DisposeAsync"/> in async contexts.
     /// </summary>
     public void Dispose()
@@ -509,57 +560,6 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         finally
         {
             ResettableObjectPool<ConnectionFailedEventArgs>.Return(connectionFailedEventArgs);
-        }
-    }
-
-    /// <summary>
-    /// Central violation handler.
-    /// Builds a <see cref="ViolationEventArgs"/> via the pool, applies the caller-supplied <paramref name="initialAction"/>
-    /// as the default response, invokes any user listener (which may mutate <see cref="ViolationEventArgs.Action"/>),
-    /// and then applies the final action.
-    /// </summary>
-    internal void HandleViolation(IPEndPoint endPoint, ulong signature, ViolationReason violationReason, int packetSize, string? details, ViolationAction initialAction = ViolationAction.KickAndBlacklist)
-    {
-        Connections.TryGet(endPoint, out SynapseConnection? synapseConnection);
-
-        ViolationEventArgs violationEventArgs = ResettableObjectPool<ViolationEventArgs>.Rent();
-        violationEventArgs.Initialize(endPoint, signature, violationReason, synapseConnection, packetSize, details, initialAction);
-
-        try
-        {
-            try
-            {
-                ViolationDetected?.Invoke(violationEventArgs);
-            }
-            catch
-            {
-                /* never let a listener crash the ingress path */
-            }
-
-            switch (violationEventArgs.Action)
-            {
-                case ViolationAction.Ignore:
-                    return;
-
-                case ViolationAction.Drop:
-                    return;
-
-                case ViolationAction.Kick:
-                    KickEndpoint(endPoint, blacklist: false);
-                    return;
-
-                case ViolationAction.KickAndBlacklist:
-                default: // ViolationAction.KickAndBlacklist
-                    if (signature != SecurityProvider.UnsetSignature)
-                        Security.AddToBlacklist(signature);
-
-                    KickEndpoint(endPoint, blacklist: false);
-                    return;
-            }
-        }
-        finally
-        {
-            ResettableObjectPool<ViolationEventArgs>.Return(violationEventArgs);
         }
     }
 

@@ -39,13 +39,6 @@ public sealed partial class TransmissionEngine
         return _latency.ProcessAsync(segment.Array!, segment.Count, target, SendDirectAsync, cancellationToken);
     }
 
-    private async Task SendDirectAsync(byte[] buffer, int length, IPEndPoint target)
-    {
-        Socket socket = target.AddressFamily == AddressFamily.InterNetworkV6 && _ipv6Socket != null ? _ipv6Socket : _ipv4Socket;
-        int bytesSent = await socket.SendToAsync(new(buffer, 0, length), SocketFlags.None, target).ConfigureAwait(false);
-        _telemetry.OnSent(bytesSent);
-    }
-    
     internal async Task SendUnreliableUnsegmentedAsync(SynapseConnection synapseConnection, ArraySegment<byte> payload, CancellationToken cancellationToken)
     {
         const PacketFlags Flags = PacketFlags.None;
@@ -183,6 +176,13 @@ public sealed partial class TransmissionEngine
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Flags, 0, 0, 0, 0);
         return SendAndReturnAsync(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint, cancellationToken);
+    }
+
+    private async Task SendDirectAsync(byte[] buffer, int length, IPEndPoint target)
+    {
+        Socket socket = target.AddressFamily == AddressFamily.InterNetworkV6 && _ipv6Socket != null ? _ipv6Socket : _ipv4Socket;
+        int bytesSent = await socket.SendToAsync(new(buffer, 0, length), SocketFlags.None, target).ConfigureAwait(false);
+        _telemetry.OnSent(bytesSent);
     }
 
     private async Task SendAndReturnAsync(ArraySegment<byte> segment, IPEndPoint target, CancellationToken cancellationToken)

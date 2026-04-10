@@ -18,16 +18,24 @@ namespace SynapseSocket.Packets;
 /// </summary>
 public static class PacketHeader
 {
-    /// <summary>Size in bytes of the mandatory flag field.</summary>
+    /// <summary>
+    /// Size in bytes of the mandatory flag field.
+    /// </summary>
     public const int FlagSize = 1;
 
-    /// <summary>Size in bytes of the reliable sequence field when present.</summary>
+    /// <summary>
+    /// Size in bytes of the reliable sequence field when present.
+    /// </summary>
     public const int SequenceSize = 2;
 
-    /// <summary>Size in bytes of the segmentation fields when present.</summary>
+    /// <summary>
+    /// Size in bytes of the segmentation fields when present.
+    /// </summary>
     public const int SegmentSize = 4;
 
-    /// <summary>Maximum theoretical header size (all optional fields present).</summary>
+    /// <summary>
+    /// Maximum theoretical header size (all optional fields present).
+    /// </summary>
     public const int MaxHeaderSize = FlagSize + SequenceSize + SegmentSize;
 
     /// <summary>
