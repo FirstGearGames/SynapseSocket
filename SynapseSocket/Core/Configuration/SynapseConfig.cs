@@ -41,6 +41,26 @@ public sealed class SynapseConfig
     public uint MaximumSegments = DisabledMaximumSegments;
 
     /// <summary>
+    /// Maximum number of concurrent incomplete segment assemblies per connection.
+    /// Once reached, further segmented packets from that connection are treated as a protocol violation.
+    /// Default is 16.
+    /// </summary>
+    public uint MaximumConcurrentSegmentAssembliesPerConnection = 16;
+
+    /// <summary>
+    /// Maximum number of simultaneous connections the engine will accept.
+    /// Handshakes from new peers are rejected with <see cref="Core.Events.ConnectionRejectedReason.ServerFull"/>
+    /// when the limit is reached. Set to 0 to disable.
+    /// </summary>
+    public uint MaximumConcurrentConnections = 0;
+
+    /// <summary>
+    /// Maximum number of out-of-order reliable packets buffered per connection before raising a violation.
+    /// Default is 64. Set to 0 to disable.
+    /// </summary>
+    public uint MaximumOutOfOrderReliablePackets = 64;
+
+    /// <summary>
     /// Controls how the engine handles unreliable payloads that exceed the MTU.
     /// Defaults to <see cref="UnreliableSegmentMode.SegmentUnreliable"/>: oversized sends are split into unreliable segments.
     /// </summary>

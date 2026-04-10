@@ -29,5 +29,11 @@ public enum ConnectionRejectedReason
     /// <summary>
     /// NAT traversal (hole punching) failed: no response was received after exhausting all punch attempts.
     /// </summary>
-    NatTraversalFailed
+    NatTraversalFailed,
+
+    /// <summary>
+    /// The engine has reached <see cref="SynapseSocket.Core.Configuration.SynapseConfig.MaximumConcurrentConnections"/>
+    /// and cannot accept new peers until an existing connection closes.
+    /// </summary>
+    ServerFull
 }

@@ -36,11 +36,11 @@ public sealed partial class IngressEngine
     private readonly Telemetry _telemetry;
     // Tracks the last probe-response ticks per source IP; limits outbound amplification.
     private readonly ConcurrentDictionary<IpKey, long> _natProbeRateLimiter = new();
-    private int _natProbeCounter;
+    private long _lastProbeEvictionTicks;
     // Replay cache: maps handshake signature → first-seen ticks. Prevents replayed handshakes
     // from re-establishing connections after the original session ends.
     private readonly ConcurrentDictionary<ulong, long> _seenHandshakes = new();
-    private int _handshakeCounter;
+    private long _lastHandshakeEvictionTicks;
     public event PayloadDeliveredDelegate? PayloadDelivered;
     public event ConnectionDelegate? ConnectionEstablished;
     public event ConnectionDelegate? ConnectionClosed;
@@ -353,7 +353,7 @@ public sealed partial class IngressEngine
             return synapseConnection.Reassembler;
 
         PacketReassembler rented = ResettableObjectPool<PacketReassembler>.Rent();
-        rented.Initialize(_config.MaximumTransmissionUnit, _config.MaximumSegments);
+        rented.Initialize(_config.MaximumTransmissionUnit, _config.MaximumSegments, _config.MaximumConcurrentSegmentAssembliesPerConnection);
 
         PacketReassembler? existing = Interlocked.CompareExchange(ref synapseConnection.Reassembler, rented, null);
         if (existing is not null)
@@ -385,6 +385,20 @@ public sealed partial class IngressEngine
             else
             {
                 // Out of order - buffer (only if not already received).
+                if (_config.MaximumOutOfOrderReliablePackets > 0
+                    && synapseConnection.ReorderBuffer.Count >= _config.MaximumOutOfOrderReliablePackets)
+                {
+                    if (payload.Array is not null)
+                        ArrayPool<byte>.Shared.Return(payload.Array);
+                    ViolationOccurred?.Invoke(
+                        synapseConnection.RemoteEndPoint,
+                        synapseConnection.Signature,
+                        ViolationReason.Oversized,
+                        0,
+                        $"Reorder buffer cap ({_config.MaximumOutOfOrderReliablePackets}) exceeded",
+                        ViolationAction.KickAndBlacklist);
+                    return;
+                }
                 synapseConnection.ReorderBuffer.TryAdd(sequence, payload);
             }
         }
@@ -440,6 +454,15 @@ public sealed partial class IngressEngine
             return;
         }
 
+        // Connection cap: reject new peers when the engine is full.
+        if (_config.MaximumConcurrentConnections > 0
+            && _connections.Count >= _config.MaximumConcurrentConnections
+            && !_connections.TryGet(fromEndPoint, out _))
+        {
+            ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.ServerFull, "Connection limit reached");
+            return;
+        }
+
         // Replay check: the nonce embedded in handshakePayload makes each legitimate handshake's
         // signature unique. A replayed packet carries the same bytes → same signature → reject.
         long nowTicks = DateTime.UtcNow.Ticks;
@@ -451,8 +474,10 @@ public sealed partial class IngressEngine
         }
 
         // Periodic eviction: keep the replay cache from growing without bound.
-        if (Interlocked.Increment(ref _handshakeCounter) % 100 == 0)
-            RemoveExpiredHandshakeEntries(nowTicks, _config.Connection.TimeoutMilliseconds * TimeSpan.TicksPerMillisecond * 2);
+        long lastHandshakeEvict = Volatile.Read(ref _lastHandshakeEvictionTicks);
+        if (nowTicks - lastHandshakeEvict > TimeSpan.TicksPerMinute)
+            if (Interlocked.CompareExchange(ref _lastHandshakeEvictionTicks, nowTicks, lastHandshakeEvict) == lastHandshakeEvict)
+                RemoveExpiredHandshakeEntries(nowTicks, _config.Connection.TimeoutMilliseconds * TimeSpan.TicksPerMillisecond * 2);
 
         if (_config.SignatureValidator is not null && !_config.SignatureValidator.Validate(fromEndPoint, signature, handshakePayload))
         {

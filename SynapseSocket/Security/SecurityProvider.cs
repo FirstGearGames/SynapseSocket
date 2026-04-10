@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Net;
 
 namespace SynapseSocket.Security;
@@ -105,8 +106,22 @@ public sealed class SecurityProvider
         return InspectEstablished(packetLength, signature);
     }
 
+    /// <summary>
+    /// Removes rate buckets that have not seen traffic in longer than <paramref name="expiryTicks"/>.
+    /// Call from the maintenance loop to bound <c>_rateBuckets</c> growth.
+    /// </summary>
+    public void RemoveExpiredRateBuckets(long nowTicks, long expiryTicks)
+    {
+        foreach (KeyValuePair<ulong, RateBucket> entry in _rateBuckets)
+        {
+            if (nowTicks - entry.Value.LastAccessTicks > expiryTicks)
+                _rateBuckets.TryRemove(entry.Key, out _);
+        }
+    }
+
     private sealed class RateBucket
     {
+        public long LastAccessTicks;
         private long _windowStartTicks;
         private uint _packetCount;
         private readonly object _lock = new();
@@ -116,6 +131,7 @@ public sealed class SecurityProvider
             lock (_lock)
             {
                 long nowTicks = DateTime.UtcNow.Ticks;
+                LastAccessTicks = nowTicks;
                 long windowTicks = TimeSpan.TicksPerSecond;
                 if (nowTicks - _windowStartTicks >= windowTicks)
                 {

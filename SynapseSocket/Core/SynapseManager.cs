@@ -270,6 +270,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             await _sender.SendDisconnectAsync(synapseConnection, cancellationToken).ConfigureAwait(false);
 
         ReturnConnectionSegmenters(synapseConnection);
+        ReturnReorderBufferToPool(synapseConnection);
         synapseConnection.State = ConnectionState.Disconnected;
         Connections.Remove(synapseConnection.RemoteEndPoint, out _);
 
@@ -460,6 +461,19 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// Atomically clears and returns both the splitter and reassembler on <paramref name="synapseConnection"/>
     /// to their respective pools. Safe to call even when neither was ever rented.
     /// </summary>
+    private static void ReturnReorderBufferToPool(SynapseConnection synapseConnection)
+    {
+        lock (synapseConnection.ReliableLock)
+        {
+            foreach (ArraySegment<byte> segment in synapseConnection.ReorderBuffer.Values)
+            {
+                if (segment.Array is not null)
+                    ArrayPool<byte>.Shared.Return(segment.Array);
+            }
+            synapseConnection.ReorderBuffer.Clear();
+        }
+    }
+
     private static void ReturnConnectionSegmenters(SynapseConnection synapseConnection)
     {
         PacketSplitter? splitter = Interlocked.Exchange(ref synapseConnection.Splitter, null);
@@ -568,6 +582,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         if (Connections.Remove(endPoint, out SynapseConnection? synapseConnection) && synapseConnection is not null)
         {
             ReturnConnectionSegmenters(synapseConnection);
+            ReturnReorderBufferToPool(synapseConnection);
             synapseConnection.State = ConnectionState.Disconnected;
             RaiseConnectionClosed(synapseConnection);
         }

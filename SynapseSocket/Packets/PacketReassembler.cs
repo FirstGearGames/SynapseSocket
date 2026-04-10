@@ -17,6 +17,16 @@ public sealed class PacketReassembler : PacketSegmenter
 {
     private readonly Dictionary<ushort, SegmentAssembly> _currentSegments = new();
     private readonly object _lock = new();
+    private uint _maximumConcurrentAssemblies;
+
+    /// <summary>
+    /// Configures the reassembler after renting from the pool.
+    /// </summary>
+    public void Initialize(uint maximumTransmissionUnit, uint maximumSegments, uint maximumConcurrentAssemblies)
+    {
+        base.Initialize(maximumTransmissionUnit, maximumSegments);
+        _maximumConcurrentAssemblies = maximumConcurrentAssemblies;
+    }
 
     /// <summary>
     /// Feeds a received segment into the reassembly buffer.
@@ -41,6 +51,11 @@ public sealed class PacketReassembler : PacketSegmenter
         {
             if (!_currentSegments.TryGetValue(segmentId, out SegmentAssembly? segmentAssembly))
             {
+                if (_maximumConcurrentAssemblies > 0 && _currentSegments.Count >= _maximumConcurrentAssemblies)
+                {
+                    isProtocolViolation = true;
+                    return false;
+                }
                 segmentAssembly = ResettableObjectPool<SegmentAssembly>.Rent();
                 segmentAssembly.Initialize(segmentCount, isReliable);
                 _currentSegments[segmentId] = segmentAssembly;
@@ -109,6 +124,7 @@ public sealed class PacketReassembler : PacketSegmenter
                 ResettableObjectPool<SegmentAssembly>.Return(segmentAssembly);
             _currentSegments.Clear();
         }
+        _maximumConcurrentAssemblies = 0;
         base.OnReturn();
     }
 

@@ -25,6 +25,7 @@ public sealed partial class SynapseManager
                 ProgressiveKeepAliveSweep(nowTicks, cancellationToken);
                 ReliableRetransmitSweep(nowTicks, cancellationToken);
                 SegmentAssemblyTimeoutSweep(nowTicks);
+                Security.RemoveExpiredRateBuckets(nowTicks, TimeSpan.FromMinutes(5).Ticks);
             }
             catch (OperationCanceledException)
             {
@@ -74,6 +75,7 @@ public sealed partial class SynapseManager
             {
                 synapseConnection.State = ConnectionState.Disconnected;
                 Connections.Remove(synapseConnection.RemoteEndPoint, out _);
+                ReturnReorderBufferToPool(synapseConnection);
                 RaiseConnectionClosed(synapseConnection);
                 HandleViolation(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.Timeout, 0, null, ViolationAction.Kick);
                 continue;

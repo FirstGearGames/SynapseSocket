@@ -43,9 +43,11 @@ public sealed partial class IngressEngine
         long minIntervalTicks = _config.NatTraversal.IntervalMilliseconds * TimeSpan.TicksPerMillisecond;
         IpKey addressKey = IpKey.From(fromEndPoint.Address);
 
-        // Lightweight periodic eviction: run every 100 probes to bound dictionary growth.
-        if (Interlocked.Increment(ref _natProbeCounter) % 100 == 0)
-            RemoveExpiredProbeLimitEntries(nowTicks, staleTicks: minIntervalTicks * 10);
+        // Periodic eviction: bound dictionary growth without relying on traffic volume.
+        long lastProbeEvict = Volatile.Read(ref _lastProbeEvictionTicks);
+        if (nowTicks - lastProbeEvict > TimeSpan.TicksPerMinute)
+            if (Interlocked.CompareExchange(ref _lastProbeEvictionTicks, nowTicks, lastProbeEvict) == lastProbeEvict)
+                RemoveExpiredProbeLimitEntries(nowTicks, staleTicks: minIntervalTicks * 10);
 
         long lastTicks = _natProbeRateLimiter.GetOrAdd(addressKey, 0L);
         if (nowTicks - lastTicks < minIntervalTicks)
