@@ -102,7 +102,7 @@ public class SignatureValidatorTests
 
         await server.StartAsync();
         await client.StartAsync();
-        Connections.SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port));
+        Connections.SynapseConnection _ = await client.ConnectAsync(new(IPAddress.Loopback, port));
         await TestHarness.WaitFor(() => eventRecorder.ConnectionsEstablished >= 1);
 
         // Server should have created the connection with the FIXED signature.
