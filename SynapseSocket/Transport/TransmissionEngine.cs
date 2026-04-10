@@ -89,21 +89,21 @@ public sealed partial class TransmissionEngine
     /// and its lifetime is managed by the retransmission sweep and ACK handler.
     /// For unreliable sends, the backing buffer is returned to the pool after the last send completes.
     /// </summary>
-    internal async Task SendSegmentedAsync(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool reliable, PacketSplitter splitter, CancellationToken cancellationToken)
+    internal async Task SendSegmentedAsync(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable, PacketSplitter splitter, CancellationToken cancellationToken)
     {
-        if (reliable && synapseConnection.PendingReliableQueue.Count >= _config.Reliable.MaximumPending)
+        if (isReliable && synapseConnection.PendingReliableQueue.Count >= _config.Reliable.MaximumPending)
             throw new InvalidOperationException("Reliable backpressure limit reached.");
 
         ushort sequence = 0;
-        if (reliable)
+        if (isReliable)
         {
             lock (synapseConnection.ReliableGate)
                 sequence = synapseConnection.NextOutgoingSequence++;
         }
 
-        ArraySegment<byte>[] segments = splitter.Split(payload.AsSpan(), reliable, out int segmentCount, sequence);
+        ArraySegment<byte>[] segments = splitter.Split(payload.AsSpan(), isReliable, out int segmentCount, sequence);
 
-        if (reliable)
+        if (isReliable)
         {
             SynapseConnection.PendingReliable pendingReliable = new()
             {

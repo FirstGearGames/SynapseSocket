@@ -50,9 +50,9 @@ public sealed class ConnectionManager
     /// </summary>
     public bool Remove(IPEndPoint endPoint, out SynapseConnection? removedSynapseConnection)
     {
-        bool wasRemoved = _byEndPoint.TryRemove(new(endPoint), out removedSynapseConnection);
-        if (wasRemoved && removedSynapseConnection is not null) _bySignature.TryRemove(removedSynapseConnection.Signature, out _);
-        return wasRemoved;
+        bool isRemoved = _byEndPoint.TryRemove(new(endPoint), out removedSynapseConnection);
+        if (isRemoved && removedSynapseConnection is not null) _bySignature.TryRemove(removedSynapseConnection.Signature, out _);
+        return isRemoved;
     }
 
     /// <summary>

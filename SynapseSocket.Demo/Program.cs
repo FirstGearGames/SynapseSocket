@@ -25,7 +25,7 @@ internal static class Program
         SynapseConfig serverConfig = new()
         {
             BindEndPoints = [new(IPAddress.Any, Port)],
-            EnableTelemetry = true,
+            IsTelemetryEnabled = true,
             MaximumSegments = 128,
             UnreliableSegmentMode = UnreliableSegmentMode.SegmentUnreliable,
         };
@@ -39,7 +39,7 @@ internal static class Program
         SynapseConfig clientConfig = new()
         {
             BindEndPoints = [new(IPAddress.Any, 0)],
-            EnableTelemetry = true,
+            IsTelemetryEnabled = true,
             MaximumSegments = 128,
             UnreliableSegmentMode = UnreliableSegmentMode.SegmentUnreliable,
         };
@@ -56,7 +56,7 @@ internal static class Program
         client.PacketReceived += (packetReceivedEventArgs) =>
         {
             string decodedText = Encoding.UTF8.GetString(packetReceivedEventArgs.Payload);
-            Console.WriteLine($"[client] received ({(packetReceivedEventArgs.Reliable ? "reliable" : "unreliable")}): {decodedText}");
+            Console.WriteLine($"[client] received ({(packetReceivedEventArgs.IsReliable ? "reliable" : "unreliable")}): {decodedText}");
             clientReply.TrySetResult(decodedText);
         };
         client.ConnectionClosed += (connectionEventArgs) => Console.WriteLine($"[client] connection closed: {connectionEventArgs.Connection.RemoteEndPoint}");
@@ -107,13 +107,13 @@ internal static class Program
         server.PacketReceived += async (packetReceivedEventArgs) =>
         {
             string decodedText = Encoding.UTF8.GetString(packetReceivedEventArgs.Payload);
-            Console.WriteLine($"[server] received ({(packetReceivedEventArgs.Reliable ? "reliable" : "unreliable")}) from {packetReceivedEventArgs.Connection.RemoteEndPoint}: {decodedText}");
+            Console.WriteLine($"[server] received ({(packetReceivedEventArgs.IsReliable ? "reliable" : "unreliable")}) from {packetReceivedEventArgs.Connection.RemoteEndPoint}: {decodedText}");
 
             // Echo back on the same channel.
             byte[] replyPayload = Encoding.UTF8.GetBytes($"echo: {decodedText}");
             try
             {
-                await server.SendAsync(packetReceivedEventArgs.Connection, replyPayload, packetReceivedEventArgs.Reliable).ConfigureAwait(false);
+                await server.SendAsync(packetReceivedEventArgs.Connection, replyPayload, packetReceivedEventArgs.IsReliable).ConfigureAwait(false);
             }
             catch (Exception ex)
             {

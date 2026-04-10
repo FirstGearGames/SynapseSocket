@@ -12,7 +12,7 @@ public sealed class Telemetry
     /// <summary>
     /// True when telemetry is enabled.
     /// </summary>
-    public bool Enabled { get; }
+    public bool IsEnabled { get; }
 
     /// <summary>
     /// Total bytes received.
@@ -65,46 +65,46 @@ public sealed class Telemetry
     /// <summary>
     /// Creates a telemetry instance.
     /// </summary>
-    public Telemetry(bool enabled)
+    public Telemetry(bool isEnabled)
     {
-        Enabled = enabled;
+        IsEnabled = isEnabled;
     }
 
     internal void OnReceived(int bytes)
     {
-        if (!Enabled) return;
+        if (!IsEnabled) return;
         Interlocked.Add(ref _bytesIn, bytes);
         Interlocked.Increment(ref _packetsIn);
     }
 
     internal void OnSent(int bytes)
     {
-        if (!Enabled) return;
+        if (!IsEnabled) return;
         Interlocked.Add(ref _bytesOut, bytes);
         Interlocked.Increment(ref _packetsOut);
     }
 
     internal void OnDroppedIn()
     {
-        if (!Enabled) return;
+        if (!IsEnabled) return;
         Interlocked.Increment(ref _packetsDroppedIn);
     }
 
     internal void OnDroppedOut()
     {
-        if (!Enabled) return;
+        if (!IsEnabled) return;
         Interlocked.Increment(ref _packetsDroppedOut);
     }
 
     internal void OnReliableResend()
     {
-        if (!Enabled) return;
+        if (!IsEnabled) return;
         Interlocked.Increment(ref _reliableResends);
     }
 
     internal void OnLost()
     {
-        if (!Enabled) return;
+        if (!IsEnabled) return;
         Interlocked.Increment(ref _packetsLost);
     }
 }

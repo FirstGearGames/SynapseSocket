@@ -7,7 +7,7 @@ namespace SynapseSocket.Core.Events;
 /// <summary>
 /// Internal callback: a payload has been delivered from the ingress path.
 /// </summary>
-public delegate void PayloadDeliveredDelegate(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool reliable);
+public delegate void PayloadDeliveredDelegate(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable);
 
 /// <summary>
 /// Internal callback: a connection was established or closed on the ingress path.

@@ -24,9 +24,9 @@ public sealed class PacketSplitter : PacketSegmenter
     /// Use <paramref name="segmentCount"/> (not the array length) to iterate — the rented
     /// outer array may be larger than needed.
     /// </summary>
-    public ArraySegment<byte>[] Split(ReadOnlySpan<byte> payload, bool reliable, out int segmentCount, ushort sequence = 0)
+    public ArraySegment<byte>[] Split(ReadOnlySpan<byte> payload, bool isReliable, out int segmentCount, ushort sequence = 0)
     {
-        int segmentPayloadSize = (int)MaximumTransmissionUnit - PacketHeader.FlagSize - PacketHeader.SegmentSize - (reliable ? PacketHeader.SequenceSize : 0);
+        int segmentPayloadSize = (int)MaximumTransmissionUnit - PacketHeader.FlagSize - PacketHeader.SegmentSize - (isReliable ? PacketHeader.SequenceSize : 0);
         if (segmentPayloadSize <= 0)
             throw new InvalidOperationException("MTU too small for segmentation headers.");
 
@@ -36,7 +36,7 @@ public sealed class PacketSplitter : PacketSegmenter
 
         segmentCount = totalSegments;
         ushort segmentId = (ushort)Interlocked.Increment(ref _segmentIdCounter);
-        PacketFlags flags = PacketFlags.Segmented | (reliable ? PacketFlags.Reliable : PacketFlags.None);
+        PacketFlags flags = PacketFlags.Segmented | (isReliable ? PacketFlags.Reliable : PacketFlags.None);
         int headerSize = PacketHeader.ComputeHeaderSize(flags);
 
         // Single backing buffer: all N segment packets packed contiguously.

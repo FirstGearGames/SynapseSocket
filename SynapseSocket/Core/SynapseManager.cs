@@ -100,7 +100,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         ISignatureProvider signatureProvider = Config.SignatureProvider ?? new DefaultSignatureProvider();
         Security = new(signatureProvider, Config.MaximumPacketsPerSecond, Config.MaximumPacketSize);
         Connections = new();
-        Telemetry = new(Config.EnableTelemetry);
+        Telemetry = new(Config.IsTelemetryEnabled);
         _latency = new(Config.LatencySimulator);
         _isSegmentingEnabled = Config.MaximumSegments != SynapseConfig.DisabledMaximumSegments;
         /* Unreliable requires a couple bytes less for segmenting when being sent out
@@ -471,10 +471,10 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             ResettableObjectPool<PacketReassembler>.Return(reassembler);
     }
 
-    private void OnPayloadDelivered(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool reliable)
+    private void OnPayloadDelivered(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable)
     {
         PacketReceivedEventArgs packetReceivedEventArgs = ResettableObjectPool<PacketReceivedEventArgs>.Rent();
-        packetReceivedEventArgs.Initialize(synapseConnection, payload, reliable);
+        packetReceivedEventArgs.Initialize(synapseConnection, payload, isReliable);
 
         try
         {
@@ -518,10 +518,10 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         }
     }
 
-    private void RaiseSent(IPEndPoint endPoint, ArraySegment<byte> payload, bool reliable)
+    private void RaiseSent(IPEndPoint endPoint, ArraySegment<byte> payload, bool isReliable)
     {
         PacketSentEventArgs packetSentEventArgs = ResettableObjectPool<PacketSentEventArgs>.Rent();
-        packetSentEventArgs.Initialize(endPoint, payload, reliable);
+        packetSentEventArgs.Initialize(endPoint, payload, isReliable);
 
         try
         {
@@ -563,7 +563,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         }
     }
 
-    private void KickEndpoint(IPEndPoint endPoint, bool blacklist)
+    private void KickEndpoint(IPEndPoint endPoint, bool canBlacklist)
     {
         if (Connections.Remove(endPoint, out SynapseConnection? synapseConnection) && synapseConnection is not null)
         {
@@ -571,7 +571,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             synapseConnection.State = ConnectionState.Disconnected;
             RaiseConnectionClosed(synapseConnection);
         }
-        if (blacklist)
+        if (canBlacklist)
         {
             ulong signature = Security.ComputeSignature(endPoint, ReadOnlySpan<byte>.Empty);
             Security.AddToBlacklist(signature);

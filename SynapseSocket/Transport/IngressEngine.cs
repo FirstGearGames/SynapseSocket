@@ -27,7 +27,7 @@ public sealed partial class IngressEngine
     /// <summary>
     /// True when the ingress loop is running.
     /// </summary>
-    public bool Running { get; private set; }
+    public bool IsRunning { get; private set; }
     private readonly Socket _socket;
     private readonly SynapseConfig _config;
     private readonly SecurityProvider _security;
@@ -66,7 +66,7 @@ public sealed partial class IngressEngine
     /// </summary>
     public Task StartAsync(CancellationToken cancellationToken)
     {
-        Running = true;
+        IsRunning = true;
         return Task.Run(() => ReceiveLoopAsync(cancellationToken), cancellationToken);
     }
 
@@ -81,7 +81,7 @@ public sealed partial class IngressEngine
         while (!cancellationToken.IsCancellationRequested)
         {
             byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
-            bool bufferHandedOff = false;
+            bool isBufferHandedOff = false;
             try
             {
                 SocketReceiveFromResult socketReceiveResult;
@@ -143,7 +143,7 @@ public sealed partial class IngressEngine
                 }
                 _telemetry.OnReceived(receivedLength);
 
-                HandlePacket(rentedBuffer, receivedLength, fromEndPoint, cancellationToken, ref bufferHandedOff);
+                HandlePacket(rentedBuffer, receivedLength, fromEndPoint, cancellationToken, ref isBufferHandedOff);
             }
             catch (OperationCanceledException)
             {
@@ -158,16 +158,16 @@ public sealed partial class IngressEngine
             }
             finally
             {
-                // When CopyReceivedUnreliablePayload is false, ownership of rentedBuffer is transferred to
+                // When IsUnreliablePayloadCopied is false, ownership of rentedBuffer is transferred to
                 // the PayloadDelivered subscriber (via OnPayloadDelivered), which returns it to the pool.
-                if (!bufferHandedOff)
+                if (!isBufferHandedOff)
                     ArrayPool<byte>.Shared.Return(rentedBuffer, clearArray: false);
             }
         }
-        Running = false;
+        IsRunning = false;
     }
 
-    private void HandlePacket(byte[] buffer, int length, IPEndPoint fromEndPoint, CancellationToken cancellationToken, ref bool bufferHandedOff)
+    private void HandlePacket(byte[] buffer, int length, IPEndPoint fromEndPoint, CancellationToken cancellationToken, ref bool isBufferHandedOff)
     {
         PacketFlags flags;
         ushort sequence;
@@ -272,12 +272,12 @@ public sealed partial class IngressEngine
                 if (_config.MaximumSegments != SynapseConfig.DisabledMaximumSegments)
                 {
                     PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
-                    if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, payload, reliable: true, out ArraySegment<byte> assembledPayload, out bool protocolViolation))
+                    if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, payload, isReliable: true, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
                     {
                         _ = _sender.SendAckAsync(synapseConnection, sequence, cancellationToken);
-                        DeliverOrdered(synapseConnection, sequence, assembledPayload, reliable: true);
+                        DeliverOrdered(synapseConnection, sequence, assembledPayload, isReliable: true);
                     }
-                    else if (protocolViolation)
+                    else if (isProtocolViolation)
                     {
                         _telemetry.OnDroppedIn();
                         ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature,
@@ -293,7 +293,7 @@ public sealed partial class IngressEngine
             }
 
             _ = _sender.SendAckAsync(synapseConnection, sequence, cancellationToken);
-            DeliverOrdered(synapseConnection, sequence, payload, reliable: true);
+            DeliverOrdered(synapseConnection, sequence, payload, isReliable: true);
             return;
         }
 
@@ -305,11 +305,11 @@ public sealed partial class IngressEngine
                 byte[] segmentPayloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
                 Buffer.BlockCopy(buffer, headerSize, segmentPayloadBuffer, 0, payloadLength);
                 PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
-                if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, new(segmentPayloadBuffer, 0, payloadLength), reliable: false, out ArraySegment<byte> assembledPayload, out bool protocolViolation))
+                if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, new(segmentPayloadBuffer, 0, payloadLength), isReliable: false, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
                 {
                     PayloadDelivered?.Invoke(synapseConnection, assembledPayload, false);
                 }
-                else if (protocolViolation)
+                else if (isProtocolViolation)
                 {
                     _telemetry.OnDroppedIn();
                     ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature,
@@ -329,9 +329,9 @@ public sealed partial class IngressEngine
         // copy the payload into a fresh pool buffer (safe for immediate caller reuse).
         // When handing off, bufferHandedOff signals the receive loop not to return rentedBuffer —
         // ownership passes to the PayloadDelivered subscriber, which returns it after callbacks.
-        if (!_config.CopyReceivedUnreliablePayload)
+        if (!_config.IsUnreliablePayloadCopied)
         {
-            bufferHandedOff = true;
+            isBufferHandedOff = true;
             PayloadDelivered?.Invoke(synapseConnection, new(buffer, headerSize, payloadLength), false);
         }
         else
@@ -365,7 +365,7 @@ public sealed partial class IngressEngine
         return rented;
     }
 
-    private void DeliverOrdered(SynapseConnection synapseConnection, ushort sequence, ArraySegment<byte> payload, bool reliable)
+    private void DeliverOrdered(SynapseConnection synapseConnection, ushort sequence, ArraySegment<byte> payload, bool isReliable)
     {
         List<ArraySegment<byte>>? toDeliver = null;
         
@@ -394,7 +394,7 @@ public sealed partial class IngressEngine
         if (toDeliver is not null)
         {
             foreach (ArraySegment<byte> deliverPayload in toDeliver)
-                PayloadDelivered?.Invoke(synapseConnection, deliverPayload, reliable);
+                PayloadDelivered?.Invoke(synapseConnection, deliverPayload, isReliable);
         }
     }
 

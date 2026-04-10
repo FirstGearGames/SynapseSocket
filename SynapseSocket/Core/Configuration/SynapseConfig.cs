@@ -68,13 +68,13 @@ public sealed class SynapseConfig
     /// but the buffer must not be retained after the handler returns.
     /// Has no effect on reliable or segmented receives, which always copy.
     /// </summary>
-    public bool CopyReceivedUnreliablePayload = true;
+    public bool IsUnreliablePayloadCopied = true;
 
     /// <summary>
     /// Enables telemetry counters.
     /// Has a minor performance cost; disable in production if not needed.
     /// </summary>
-    public bool EnableTelemetry = false;
+    public bool IsTelemetryEnabled = false;
 
     /// <summary>
     /// Optional custom signature provider.

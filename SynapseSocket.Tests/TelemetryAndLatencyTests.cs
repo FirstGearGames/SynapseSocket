@@ -41,7 +41,7 @@ public class TelemetryAndLatencyTests
         await using SynapseManager server = new(TestHarness.ServerConfig(port));
         await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
-            c.LatencySimulator.Enabled = true;
+            c.LatencySimulator.IsEnabled = true;
             c.LatencySimulator.PacketLossChance = 1.0; // everything dropped at the sender
         }));
 
@@ -69,7 +69,7 @@ public class TelemetryAndLatencyTests
         await using SynapseManager server = new(TestHarness.ServerConfig(port));
         await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
-            c.LatencySimulator.Enabled = true;
+            c.LatencySimulator.IsEnabled = true;
             c.LatencySimulator.BaseLatencyMilliseconds = 200;
         }));
 

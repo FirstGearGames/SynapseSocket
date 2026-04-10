@@ -27,18 +27,18 @@ public sealed class PacketSentEventArgs : EventArgs, IPoolResettable
     /// <summary>
     /// True if the packet was sent via the reliable channel.
     /// </summary>
-    public bool Reliable { get; private set; }
+    public bool IsReliable { get; private set; }
 
     public PacketSentEventArgs() { }
 
     /// <summary>
     /// Initialises the instance for reuse via the object pool.
     /// </summary>
-    public void Initialize(IPEndPoint endPoint, ArraySegment<byte> payload, bool reliable)
+    public void Initialize(IPEndPoint endPoint, ArraySegment<byte> payload, bool isReliable)
     {
         EndPoint = endPoint;
         Payload = payload;
-        Reliable = reliable;
+        IsReliable = isReliable;
     }
 
     public void OnReturn()

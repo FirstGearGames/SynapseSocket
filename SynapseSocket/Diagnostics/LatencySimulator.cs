@@ -15,7 +15,7 @@ public sealed class LatencySimulator
     /// <summary>
     /// True if the simulator is enabled.
     /// </summary>
-    public bool Enabled => _config.Enabled;
+    public bool IsEnabled => _config.IsEnabled;
 
     private readonly LatencySimulatorConfig _config;
     private readonly Random _random = new();
@@ -35,7 +35,7 @@ public sealed class LatencySimulator
     /// </summary>
     public Task ProcessAsync(byte[] buffer, int length, IPEndPoint target, Func<byte[], int, IPEndPoint, Task> sender, CancellationToken cancellationToken)
     {
-        if (!_config.Enabled)
+        if (!_config.IsEnabled)
             return sender(buffer, length, target);
 
         double lossRoll;

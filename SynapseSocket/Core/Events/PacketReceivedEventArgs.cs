@@ -29,18 +29,18 @@ public sealed class PacketReceivedEventArgs : EventArgs, IPoolResettable
     /// <summary>
     /// True if the packet was delivered via the reliable channel.
     /// </summary>
-    public bool Reliable { get; private set; }
+    public bool IsReliable { get; private set; }
 
     public PacketReceivedEventArgs() { }
 
     /// <summary>
     /// Initialises the instance for reuse via the object pool.
     /// </summary>
-    public void Initialize(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool reliable)
+    public void Initialize(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable)
     {
         Connection = synapseConnection;
         Payload = payload;
-        Reliable = reliable;
+        IsReliable = isReliable;
     }
 
     public void OnReturn()

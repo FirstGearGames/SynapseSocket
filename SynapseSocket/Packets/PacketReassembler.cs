@@ -25,14 +25,14 @@ public sealed class PacketReassembler : PacketSegmenter
     /// <see cref="ArrayPool{T}.Shared"/> when done.
     /// The completed <see cref="SegmentAssembly"/> is automatically returned to the pool.
     /// If a protocol violation is detected (e.g. the same segmentId is seen with a different
-    /// segmentCount or reliability flag than previously declared), <paramref name="protocolViolation"/>
+    /// segmentCount or reliability flag than previously declared), <paramref name="isProtocolViolation"/>
     /// is set to true, the stale assembly is evicted, and the method returns false. Callers should
     /// treat this as grounds for kicking/blacklisting the peer.
     /// </summary>
-    public bool TryReassemble(ushort segmentId, byte segmentIndex, byte segmentCount, ReadOnlySpan<byte> segmentData, bool reliable, out ArraySegment<byte> assembledSegments, out bool protocolViolation)
+    public bool TryReassemble(ushort segmentId, byte segmentIndex, byte segmentCount, ReadOnlySpan<byte> segmentData, bool isReliable, out ArraySegment<byte> assembledSegments, out bool isProtocolViolation)
     {
         assembledSegments = default;
-        protocolViolation = false;
+        isProtocolViolation = false;
 
         if (segmentCount == 0 || segmentCount > MaximumSegments || segmentIndex >= segmentCount)
             return false;
@@ -42,17 +42,17 @@ public sealed class PacketReassembler : PacketSegmenter
             if (!_pending.TryGetValue(segmentId, out SegmentAssembly? segmentAssembly))
             {
                 segmentAssembly = ResettableObjectPool<SegmentAssembly>.Rent();
-                segmentAssembly.Initialize(segmentCount, reliable);
+                segmentAssembly.Initialize(segmentCount, isReliable);
                 _pending[segmentId] = segmentAssembly;
             }
-            else if (segmentAssembly.SegmentCount != segmentCount || segmentAssembly.IsReliable != reliable)
+            else if (segmentAssembly.SegmentCount != segmentCount || segmentAssembly.IsReliable != isReliable)
             {
                 // Same segmentId reused with a different declared segmentCount or reliability flag.
                 // This is either a sender bug or a malicious attempt to desync reassembly state.
                 // Evict the stale assembly and signal a protocol violation to the caller.
                 _pending.Remove(segmentId);
                 ResettableObjectPool<SegmentAssembly>.Return(segmentAssembly);
-                protocolViolation = true;
+                isProtocolViolation = true;
 
                 return false;
             }
@@ -136,11 +136,11 @@ public sealed class PacketReassembler : PacketSegmenter
         /// </summary>
         private int _totalLength;
         public SegmentAssembly() { }
-
-        public void Initialize(byte segmentCount, bool reliable)
+        
+        public void Initialize(byte segmentCount, bool isReliable)
         {
             _segmentCount = segmentCount;
-            IsReliable = reliable;
+            IsReliable = isReliable;
 
             _segments = ListPool<ArraySegment<byte>>.Rent();
             for (int i = _segments.Count; i < segmentCount; i++)
@@ -213,5 +213,3 @@ public sealed class PacketReassembler : PacketSegmenter
             FirstReceivedTicks = 0;
             IsReliable = false;
         }
-    }
-}
