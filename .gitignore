@@ -1,0 +1,8 @@
+# Ignore JetBrains IDE folders (IntelliJ, Rider, etc.) 
+# This matches any folder named .idea anywhere in the directory tree
+**/.idea/
+
+# Ignore .NET build output folders
+# This matches any bin or obj folder and all their contents/subfolders
+**/bin/
+**/obj/

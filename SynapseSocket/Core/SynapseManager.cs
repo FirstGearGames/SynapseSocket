@@ -1,0 +1,580 @@
+using System;
+using System.Buffers;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+using System.Threading.Tasks;
+using CodeBoost.Performance;
+using SynapseSocket.Connections;
+using SynapseSocket.Diagnostics;
+using SynapseSocket.Packets;
+using SynapseSocket.Security;
+using SynapseSocket.Transport;
+using SynapseSocket.Core.Configuration;
+using SynapseSocket.Core.Events;
+
+namespace SynapseSocket.Core;
+
+/// <summary>
+/// The main entry point for the SynapseSocket UDP Transport Engine.
+/// This is a partial class; the core API lives here, and the background maintenance loops
+/// (keep-alive, reliable retransmission) live in <c>SynapseManager.Maintenance.cs</c>.
+/// </summary>
+public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
+{
+    /// <summary>
+    /// Raised when a payload is received from any connection.
+    /// </summary>
+    public event PacketReceivedDelegate? PacketReceived;
+    /// <summary>
+    /// Raised after a packet has been transmitted on the wire.
+    /// </summary>
+    public event PacketSentDelegate? PacketSent;
+    /// <summary>
+    /// Raised when a new connection is established.
+    /// </summary>
+    public event ConnectionEstablishedDelegate? ConnectionEstablished;
+    /// <summary>
+    /// Raised when a connection terminates (timeout, peer-disconnect, etc.).
+    /// </summary>
+    public event ConnectionClosedDelegate? ConnectionClosed;
+    /// <summary>
+    /// Raised on any binding, signature, or validation failure.
+    /// </summary>
+    public event ConnectionFailedDelegate? ConnectionFailed;
+    /// <summary>
+    /// Raised when the engine detects a violation (oversized packet, rate limit breach, malformed data, or rejected signature).
+    /// Handlers may override <see cref="ViolationEventArgs.Action"/> to customize how the engine responds.
+    /// When no handler is subscribed, the default action (<see cref="ViolationAction.KickAndBlacklist"/>) is applied.
+    /// </summary>
+    public event ViolationDelegate? ViolationDetected;
+    /// <summary>
+    /// Raised when an unexpected exception escapes a background loop (ingress or maintenance).
+    /// Subscribe to route engine errors into your logging system (e.g., Unity's Debug.LogException).
+    /// The loop that raised the exception continues running after the handler returns.
+    /// If no handler is subscribed the exception is silently discarded.
+    /// </summary>
+    public event UnhandledExceptionDelegate? UnhandledException;
+    /// <summary>
+    /// The configuration the engine was constructed with.
+    /// </summary>
+    public SynapseConfig Config { get; }
+    /// <summary>
+    /// Telemetry counters. Present whether telemetry is enabled or not.
+    /// </summary>
+    public Telemetry Telemetry { get; }
+    /// <summary>
+    /// Live connection manager.
+    /// </summary>
+    public ConnectionManager Connections { get; }
+    /// <summary>
+    /// Security provider used by this engine.
+    /// </summary>
+    public SecurityProvider Security { get; }
+    /// <summary>
+    /// True if <see cref="StartAsync"/> has completed successfully and the engine has not been stopped or disposed.
+    /// </summary>
+    public bool IsRunning => _started && !_disposed;
+    private bool _started;
+    private bool _disposed;
+    private readonly LatencySimulator _latency;
+    private readonly bool _isSegmentingEnabled;
+    private readonly int _maximumUnsegmentedPayload;
+    private readonly List<Socket> _sockets = [];
+    private readonly List<Task> _ingressTasks = [];
+    private TransmissionEngine? _sender;
+    private CancellationTokenSource? _cts;
+    private Task? _maintenanceTask;
+
+    /// <summary>
+    /// Creates a new SynapseSocket engine from the supplied configuration.
+    /// Call <see cref="StartAsync"/> to begin binding and receiving.
+    /// </summary>
+    public SynapseManager(SynapseConfig config)
+    {
+        Config = config ?? throw new ArgumentNullException(nameof(config));
+        if (Config.BindEndPoints.Count == 0)
+            throw new ArgumentException("At least one bind endpoint is required.", nameof(config));
+
+        ISignatureProvider signatureProvider = Config.SignatureProvider ?? new DefaultSignatureProvider();
+        Security = new(signatureProvider, Config.MaximumPacketsPerSecond, Config.MaximumPacketSize);
+        Connections = new();
+        Telemetry = new(Config.EnableTelemetry);
+        _latency = new(Config.LatencySimulator);
+        _isSegmentingEnabled = Config.MaximumSegments != SynapseConfig.DisabledMaximumSegments;
+        /* Unreliable requires a couple bytes less for segmenting when being sent out
+         * of order, which would require different maximum payload sizes between reliable
+         * and unreliable segmented. Rather than add additional complexity and branching
+         * the rare byte cost is consumed. */
+        _maximumUnsegmentedPayload = (int)Config.MaximumTransmissionUnit - PacketHeader.FlagSize - PacketHeader.SequenceSize;
+    }
+
+    /// <summary>
+    /// Binds all configured endpoints, starts ingress loops, and launches background maintenance
+    /// (keep-alive and reliable retransmission).
+    /// </summary>
+    public Task StartAsync(CancellationToken cancellationToken = default)
+    {
+        if (_started)
+            throw new InvalidOperationException("Engine is already running.");
+        if (_disposed)
+            throw new ObjectDisposedException(nameof(SynapseManager));
+
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+        Socket? ipv4Socket = null;
+        Socket? ipv6Socket = null;
+
+        foreach (IPEndPoint bindEndPoint in Config.BindEndPoints)
+        {
+            Socket socket;
+            try
+            {
+                socket = new(bindEndPoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+                if (bindEndPoint.AddressFamily == AddressFamily.InterNetworkV6)
+                    socket.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, false);
+                socket.Bind(bindEndPoint);
+            }
+            catch (SocketException socketException)
+            {
+                RaiseConnectionFailed(bindEndPoint, ConnectionRejectedReason.BindFailed, socketException.Message);
+                continue;
+            }
+
+            _sockets.Add(socket);
+            if (bindEndPoint.AddressFamily == AddressFamily.InterNetworkV6)
+                ipv6Socket = socket;
+            else
+                ipv4Socket = socket;
+        }
+
+        if (_sockets.Count == 0)
+            throw new InvalidOperationException("Failed to bind any configured endpoints.");
+
+        _sender = new(ipv4Socket ?? _sockets[0], ipv6Socket, Config, Telemetry, _latency);
+
+        foreach (Socket socket in _sockets)
+        {
+            IngressEngine ingressEngine = new(socket, Config, Security, Connections, _sender, Telemetry);
+            ingressEngine.PayloadDelivered += OnPayloadDelivered;
+            ingressEngine.ConnectionEstablished += OnConnectionEstablishedInternal;
+            ingressEngine.ConnectionClosed += OnConnectionClosedInternal;
+            ingressEngine.ConnectionFailed += RaiseConnectionFailed;
+            ingressEngine.ViolationOccurred += HandleViolation;
+            ingressEngine.UnhandledException += OnUnhandledException;
+            ingressEngine.NatPeerReady += OnNatPeerReady;
+            ingressEngine.NatSessionFull += OnNatSessionFull;
+            _ingressTasks.Add(ingressEngine.StartAsync(_cts.Token));
+        }
+
+        _maintenanceTask = Task.Run(() => MaintenanceLoopAsync(_cts.Token), _cts.Token);
+        _started = true;
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Gracefully stops all ingress loops and background maintenance, then closes all sockets.
+    /// The engine may be restarted by calling <see cref="StartAsync"/> again after this returns.
+    /// </summary>
+    public async Task StopAsync()
+    {
+        if (!_started || _disposed)
+            return;
+        _started = false;
+        await ShutdownCoreAsync().ConfigureAwait(false);
+        CancellationTokenSource? oldCts = _cts;
+        _cts = null;
+        oldCts?.Dispose();
+    }
+
+    /// <summary>
+    /// Initiates an outgoing connection to the specified remote endpoint.
+    /// Sends a handshake packet; the connection is considered established when the remote handshake response arrives.
+    /// </summary>
+    public async Task<SynapseConnection> ConnectAsync(IPEndPoint endPoint, CancellationToken cancellationToken = default)
+    {
+        if (!_started || _sender is null)
+            throw new InvalidOperationException("Engine not started.");
+
+        ulong signature = Security.ComputeSignature(endPoint, ReadOnlySpan<byte>.Empty);
+        if (Security.IsBlacklisted(signature))
+        {
+            RaiseConnectionFailed(endPoint, ConnectionRejectedReason.Blacklisted, null);
+            throw new InvalidOperationException("Remote endpoint is blacklisted.");
+        }
+
+        SynapseConnection synapseConnection = Connections.GetOrAdd(endPoint, signature, (remoteEndPoint, remoteSignature) => new(remoteEndPoint, remoteSignature));
+
+        await _sender.SendHandshakeAsync(endPoint, cancellationToken).ConfigureAwait(false);
+
+        if (Config.NatTraversal.Mode == NatTraversalMode.FullCone)
+            _ = Task.Run(() => NatPunchAsync(synapseConnection, endPoint, cancellationToken), cancellationToken);
+
+        return synapseConnection;
+    }
+
+    /// <summary>
+    /// Sends an unreliable payload on the given connection.
+    /// When the payload exceeds the MTU, behaviour is controlled by <see cref="SynapseConfig.UnreliableSegmentMode"/>:
+    /// <list type="bullet">
+    /// <item><see cref="UnreliableSegmentMode.Disabled"/> — throws.</item>
+    /// <item><see cref="UnreliableSegmentMode.SegmentUnreliable"/> — splits into unreliable segments (default).</item>
+    /// <item><see cref="UnreliableSegmentMode.SegmentReliable"/> — splits into reliable segments.</item>
+    /// </list>
+    /// </summary>
+    public async Task SendAsync(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable, CancellationToken cancellationToken = default)
+    {
+        EnsureRunning();
+
+        if (payload.Count <= _maximumUnsegmentedPayload)
+        {
+            if (isReliable)
+                await _sender!.SendReliableUnsegmentedAsync(synapseConnection, payload, cancellationToken).ConfigureAwait(false); 
+            else
+                await _sender!.SendUnreliableUnsegmentedAsync(synapseConnection, payload, cancellationToken).ConfigureAwait(false);
+            
+            RaiseSent(synapseConnection.RemoteEndPoint, payload, isReliable);
+
+            return;
+        }
+
+        /* If here, the packet must be segmented. */
+
+        // Segmenting is disabled entirely.
+        if (!_isSegmentingEnabled)
+            throw new InvalidOperationException($"Payload ({payload.Count} bytes) exceeds the MTU-based limit ({_maximumUnsegmentedPayload} bytes). Set MaximumSegments to enable segmentation.");
+
+        // An additional check on segmentation is required for unreliable sending.
+        if (!isReliable)
+        {
+            UnreliableSegmentMode unreliableSegmentMode = Config.UnreliableSegmentMode;
+
+            if (unreliableSegmentMode is UnreliableSegmentMode.Disabled)
+                throw new InvalidOperationException($"Unreliable payload ({payload.Count} bytes) exceeds the MTU-based limit ({_maximumUnsegmentedPayload} bytes). Set UnreliableSegmentMode or reduce payload size.");
+
+            //Make reliable if the unreliableSegmentMode permits.
+            isReliable = unreliableSegmentMode is UnreliableSegmentMode.SegmentReliable;
+        }
+        
+        await _sender!.SendSegmentedAsync(synapseConnection, payload, isReliable, GetOrRentSplitter(synapseConnection), cancellationToken).ConfigureAwait(false);
+        RaiseSent(synapseConnection.RemoteEndPoint, payload, isReliable);
+    }
+
+    /// <summary>
+    /// Gracefully disconnects a connection, notifying the peer.
+    /// </summary>
+    public async Task DisconnectAsync(SynapseConnection synapseConnection, CancellationToken cancellationToken = default)
+    {
+        if (_sender is not null)
+            await _sender.SendDisconnectAsync(synapseConnection, cancellationToken).ConfigureAwait(false);
+
+        ReturnConnectionSegmenters(synapseConnection);
+        synapseConnection.State = ConnectionState.Disconnected;
+        Connections.Remove(synapseConnection.RemoteEndPoint, out _);
+
+        RaiseConnectionClosed(synapseConnection);
+    }
+
+    /// <summary>
+    /// Stops the engine and releases all resources. Prefer <see cref="DisposeAsync"/> in async contexts.
+    /// </summary>
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+
+        _disposed = true;
+        _started = false;
+
+        try
+        {
+            _cts?.Cancel();
+        }
+        catch { }
+
+        CloseSockets();
+
+        List<Task> pendingTasks = [.. _ingressTasks];
+        if (_maintenanceTask is not null)
+            pendingTasks.Add(_maintenanceTask);
+
+        _ingressTasks.Clear();
+        _maintenanceTask = null;
+
+        if (pendingTasks.Count > 0)
+        {
+            try
+            {
+                Task.WhenAll(pendingTasks).Wait(5000);
+            }
+            catch { }
+        }
+
+        _cts?.Dispose();
+    }
+
+    /// <summary>
+    /// Stops the engine and releases all resources asynchronously.
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+            return;
+
+        _disposed = true;
+        _started = false;
+
+        await ShutdownCoreAsync().ConfigureAwait(false);
+
+        _cts?.Dispose();
+    }
+
+    /// <summary>
+    /// Cancels all loops, closes sockets, and waits up to 5 seconds for all background tasks to exit.
+    /// Shared by <see cref="StopAsync"/> and <see cref="DisposeAsync"/>.
+    /// </summary>
+    private async Task ShutdownCoreAsync()
+    {
+        try
+        {
+            _cts?.Cancel();
+        }
+        catch { }
+
+        CloseSockets();
+
+        List<Task> pendingTasks = [.. _ingressTasks];
+        if (_maintenanceTask is not null)
+            pendingTasks.Add(_maintenanceTask);
+
+        _ingressTasks.Clear();
+        _maintenanceTask = null;
+
+        if (pendingTasks.Count > 0)
+            await Task.WhenAny(Task.WhenAll(pendingTasks), Task.Delay(5000)).ConfigureAwait(false);
+    }
+
+    private void CloseSockets()
+    {
+        foreach (Socket socket in _sockets)
+        {
+            try
+            {
+                socket.Close();
+            }
+            catch { }
+            try
+            {
+                socket.Dispose();
+            }
+            catch { }
+        }
+
+        _sockets.Clear();
+    }
+
+    private void OnUnhandledException(Exception exception) => UnhandledException?.Invoke(exception);
+
+    private void EnsureRunning()
+    {
+        if (!_started || _sender is null || _disposed)
+            throw new InvalidOperationException("Engine is not running.");
+    }
+
+    /// <summary>
+    /// Returns the existing splitter for <paramref name="synapseConnection"/>, or rents a fresh one
+    /// from the pool and atomically assigns it. If two threads race, the loser's instance is returned
+    /// to the pool immediately and the winner's instance is used.
+    /// </summary>
+    private PacketSplitter GetOrRentSplitter(SynapseConnection synapseConnection)
+    {
+        if (synapseConnection.Splitter is not null)
+            return synapseConnection.Splitter;
+
+        PacketSplitter rented = ResettableObjectPool<PacketSplitter>.Rent();
+        rented.Initialize(Config.MaximumTransmissionUnit, Config.MaximumSegments);
+
+        PacketSplitter? existing = Interlocked.CompareExchange(ref synapseConnection.Splitter, rented, null);
+        if (existing is not null)
+        {
+            ResettableObjectPool<PacketSplitter>.Return(rented);
+            return existing;
+        }
+
+        return rented;
+    }
+
+    /// <summary>
+    /// Atomically clears and returns both the splitter and reassembler on <paramref name="synapseConnection"/>
+    /// to their respective pools. Safe to call even when neither was ever rented.
+    /// </summary>
+    private static void ReturnConnectionSegmenters(SynapseConnection synapseConnection)
+    {
+        PacketSplitter? splitter = Interlocked.Exchange(ref synapseConnection.Splitter, null);
+        if (splitter is not null)
+            ResettableObjectPool<PacketSplitter>.Return(splitter);
+
+        PacketReassembler? reassembler = Interlocked.Exchange(ref synapseConnection.Reassembler, null);
+        if (reassembler is not null)
+            ResettableObjectPool<PacketReassembler>.Return(reassembler);
+    }
+
+    private void OnPayloadDelivered(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool reliable)
+    {
+        PacketReceivedEventArgs packetReceivedEventArgs = ResettableObjectPool<PacketReceivedEventArgs>.Rent();
+        packetReceivedEventArgs.Initialize(synapseConnection, payload, reliable);
+
+        try
+        {
+            PacketReceived?.Invoke(packetReceivedEventArgs);
+        }
+        finally
+        {
+            ResettableObjectPool<PacketReceivedEventArgs>.Return(packetReceivedEventArgs);
+            if (payload.Array is not null)
+                ArrayPool<byte>.Shared.Return(payload.Array);
+        }
+    }
+
+    private void OnConnectionEstablishedInternal(SynapseConnection synapseConnection)
+    {
+        ConnectionEventArgs connectionEventArgs = ResettableObjectPool<ConnectionEventArgs>.Rent();
+        connectionEventArgs.Initialize(synapseConnection);
+
+        try
+        {
+            ConnectionEstablished?.Invoke(connectionEventArgs);
+        }
+        finally
+        {
+            ResettableObjectPool<ConnectionEventArgs>.Return(connectionEventArgs);
+        }
+    }
+
+    private void OnConnectionClosedInternal(SynapseConnection synapseConnection)
+    {
+        ConnectionEventArgs connectionEventArgs = ResettableObjectPool<ConnectionEventArgs>.Rent();
+        connectionEventArgs.Initialize(synapseConnection);
+
+        try
+        {
+            ConnectionClosed?.Invoke(connectionEventArgs);
+        }
+        finally
+        {
+            ResettableObjectPool<ConnectionEventArgs>.Return(connectionEventArgs);
+        }
+    }
+
+    private void RaiseSent(IPEndPoint endPoint, ArraySegment<byte> payload, bool reliable)
+    {
+        PacketSentEventArgs packetSentEventArgs = ResettableObjectPool<PacketSentEventArgs>.Rent();
+        packetSentEventArgs.Initialize(endPoint, payload, reliable);
+
+        try
+        {
+            PacketSent?.Invoke(packetSentEventArgs);
+        }
+        finally
+        {
+            ResettableObjectPool<PacketSentEventArgs>.Return(packetSentEventArgs);
+        }
+    }
+
+    private void RaiseConnectionClosed(SynapseConnection synapseConnection)
+    {
+        ConnectionEventArgs connectionEventArgs = ResettableObjectPool<ConnectionEventArgs>.Rent();
+        connectionEventArgs.Initialize(synapseConnection);
+
+        try
+        {
+            ConnectionClosed?.Invoke(connectionEventArgs);
+        }
+        finally
+        {
+            ResettableObjectPool<ConnectionEventArgs>.Return(connectionEventArgs);
+        }
+    }
+
+    private void RaiseConnectionFailed(IPEndPoint? endPoint, ConnectionRejectedReason connectionRejectedReason, string? message)
+    {
+        ConnectionFailedEventArgs connectionFailedEventArgs = ResettableObjectPool<ConnectionFailedEventArgs>.Rent();
+        connectionFailedEventArgs.Initialize(endPoint, connectionRejectedReason, message);
+
+        try
+        {
+            ConnectionFailed?.Invoke(connectionFailedEventArgs);
+        }
+        finally
+        {
+            ResettableObjectPool<ConnectionFailedEventArgs>.Return(connectionFailedEventArgs);
+        }
+    }
+
+    /// <summary>
+    /// Central violation handler.
+    /// Builds a <see cref="ViolationEventArgs"/> via the pool, applies the caller-supplied <paramref name="initialAction"/>
+    /// as the default response, invokes any user listener (which may mutate <see cref="ViolationEventArgs.Action"/>),
+    /// and then applies the final action.
+    /// </summary>
+    internal void HandleViolation(IPEndPoint endPoint, ulong signature, ViolationReason violationReason, int packetSize, string? details, ViolationAction initialAction = ViolationAction.KickAndBlacklist)
+    {
+        Connections.TryGet(endPoint, out SynapseConnection? synapseConnection);
+
+        ViolationEventArgs violationEventArgs = ResettableObjectPool<ViolationEventArgs>.Rent();
+        violationEventArgs.Initialize(endPoint, signature, violationReason, synapseConnection, packetSize, details, initialAction);
+
+        try
+        {
+            try
+            {
+                ViolationDetected?.Invoke(violationEventArgs);
+            }
+            catch
+            {
+                /* never let a listener crash the ingress path */
+            }
+
+            switch (violationEventArgs.Action)
+            {
+                case ViolationAction.Ignore:
+                    return;
+
+                case ViolationAction.Drop:
+                    return;
+
+                case ViolationAction.Kick:
+                    KickEndpoint(endPoint, blacklist: false);
+                    return;
+
+                case ViolationAction.KickAndBlacklist:
+                default: // ViolationAction.KickAndBlacklist
+                    if (signature != SecurityProvider.UnsetSignature)
+                        Security.AddToBlacklist(signature);
+
+                    KickEndpoint(endPoint, blacklist: false);
+                    return;
+            }
+        }
+        finally
+        {
+            ResettableObjectPool<ViolationEventArgs>.Return(violationEventArgs);
+        }
+    }
+
+    private void KickEndpoint(IPEndPoint endPoint, bool blacklist)
+    {
+        if (Connections.Remove(endPoint, out SynapseConnection? synapseConnection) && synapseConnection is not null)
+        {
+            ReturnConnectionSegmenters(synapseConnection);
+            synapseConnection.State = ConnectionState.Disconnected;
+            RaiseConnectionClosed(synapseConnection);
+        }
+        if (blacklist)
+        {
+            ulong signature = Security.ComputeSignature(endPoint, ReadOnlySpan<byte>.Empty);
+            Security.AddToBlacklist(signature);
+        }
+    }
+}

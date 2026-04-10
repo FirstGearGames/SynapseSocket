@@ -1,0 +1,3 @@
+[submodule "submodules/CodeBoost"]
+	path = submodules/CodeBoost
+	url = https://github.com/FirstGearGames/CodeBoost
