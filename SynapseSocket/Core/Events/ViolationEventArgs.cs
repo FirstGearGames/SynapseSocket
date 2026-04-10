@@ -48,7 +48,15 @@ public sealed class ViolationEventArgs : EventArgs, IPoolResettable
 
     /// <summary>
     /// The action the engine will take after all handlers return.
-    /// Handlers may override this value to customize the response.
+    /// Handlers may override this value to customise the response.
+    /// <para>
+    /// <b>Warning:</b> downgrading from <see cref="ViolationAction.KickAndBlacklist"/> to
+    /// <see cref="ViolationAction.Ignore"/> or <see cref="ViolationAction.Drop"/> suppresses all
+    /// protective action. Only do so when you have positively identified the violation as a benign
+    /// false positive. A buggy or malicious handler that unconditionally sets this to
+    /// <see cref="ViolationAction.Ignore"/> will silently neutralise every security enforcement
+    /// decision the engine makes.
+    /// </para>
     /// </summary>
     public ViolationAction Action;
 

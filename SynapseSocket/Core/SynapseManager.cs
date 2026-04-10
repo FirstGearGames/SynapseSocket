@@ -47,6 +47,11 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// Raised when the engine detects a violation (oversized packet, rate limit breach, malformed data, or rejected signature).
     /// Handlers may override <see cref="ViolationEventArgs.Action"/> to customize how the engine responds.
     /// When no handler is subscribed, the default action (<see cref="ViolationAction.KickAndBlacklist"/>) is applied.
+    /// <para>
+    /// <b>Warning:</b> do not unconditionally downgrade <see cref="ViolationEventArgs.Action"/> inside a handler.
+    /// Setting the action to <see cref="ViolationAction.Ignore"/> suppresses every protective measure the engine
+    /// would otherwise take. See <see cref="ViolationEventArgs.Action"/> for details.
+    /// </para>
     /// </summary>
     public event ViolationDelegate? ViolationDetected;
     /// <summary>
@@ -96,6 +101,8 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         Config = config ?? throw new ArgumentNullException(nameof(config));
         if (Config.BindEndPoints.Count == 0)
             throw new ArgumentException("At least one bind endpoint is required.", nameof(config));
+        if (Config.SegmentAssemblyTimeoutMilliseconds > 0 && Config.SegmentAssemblyTimeoutMilliseconds > 300_000)
+            throw new ArgumentOutOfRangeException(nameof(config), "SegmentAssemblyTimeoutMilliseconds must not exceed 300000 (5 minutes).");
 
         ISignatureProvider signatureProvider = Config.SignatureProvider ?? new DefaultSignatureProvider();
         Security = new(signatureProvider, Config.MaximumPacketsPerSecond, Config.MaximumPacketSize);

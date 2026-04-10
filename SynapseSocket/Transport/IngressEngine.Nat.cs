@@ -39,6 +39,9 @@ public sealed partial class IngressEngine
             return;
 
         // Rate-limit outbound probe responses per source IP to mitigate amplification abuse.
+        // A spoofed-source probe would cause us to send one probe + one handshake to the spoofed
+        // address, but no more than once per IntervalMilliseconds — bounding the amplification
+        // factor to 2 packets at the configured interval regardless of inbound flood rate.
         long nowTicks = DateTime.UtcNow.Ticks;
         long minIntervalTicks = _config.NatTraversal.IntervalMilliseconds * TimeSpan.TicksPerMillisecond;
         IpKey addressKey = IpKey.From(fromEndPoint.Address);

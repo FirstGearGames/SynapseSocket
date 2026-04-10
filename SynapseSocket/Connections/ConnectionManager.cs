@@ -34,6 +34,13 @@ public sealed class ConnectionManager
         => _bySignature.TryGetValue(signature, out connection);
 
     /// <summary>
+    /// Raised when two connections produce the same 64-bit signature (birthday-bound collision).
+    /// The newer connection wins the reverse-lookup slot. Subscribe for telemetry;
+    /// no corrective action is taken automatically.
+    /// </summary>
+    public event Action<ulong>? SignatureCollisionDetected;
+
+    /// <summary>
     /// Registers a new connection.
     /// Returns the existing one if already present.
     /// </summary>
@@ -41,7 +48,13 @@ public sealed class ConnectionManager
     {
         EndPointKey endPointKey = new(endPoint);
         SynapseConnection synapseConnection = _byEndPoint.GetOrAdd(endPointKey, _ => factory(endPoint, signature));
-        _bySignature[signature] = synapseConnection;
+        if (!_bySignature.TryAdd(signature, synapseConnection))
+        {
+            // Two distinct endpoints produced the same 64-bit signature.
+            // Overwrite so reverse lookup stays current, but surface the collision.
+            _bySignature[signature] = synapseConnection;
+            SignatureCollisionDetected?.Invoke(signature);
+        }
         return synapseConnection;
     }
 

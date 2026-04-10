@@ -32,37 +32,34 @@ Same time-based CAS eviction applied to `_natProbeRateLimiter`.
 ### ~~V8 — `ArrayPool` buffers in `ReorderBuffer` leak on silent disconnect~~ ✅ Fixed
 `ReturnReorderBufferToPool` drains and returns all pooled segments under `ReliableLock`. Called from `ProgressiveKeepAliveSweep` (timeout), `DisconnectAsync`, and `DisconnectAndBlacklist`.
 
-### V9 — Handler-thrown exceptions and pool-backed `Payload` reference
-`OnPayloadDelivered` is safe (try/finally returns the buffer), but if `PacketReceived` subscribers capture `packetReceivedEventArgs.Payload` without copying and the handler throws mid-work, the buffer is still returned to the pool while the caller holds a reference. Documentation hazard, not a code bug — the XML doc correctly warns that `Payload` is valid only for the duration of the handler. Consider a `Debug.Assert` or poisoning the segment post-callback in debug builds.
+### ~~V10 — `ConnectionManager.GetOrAdd` last-write-wins on signature~~ ✅ Fixed
+`GetOrAdd` now uses `TryAdd`; on failure it overwrites the slot (newer connection wins) and fires `SignatureCollisionDetected` event for host telemetry.
 
-### V10 — `ConnectionManager.GetOrAdd` last-write-wins on signature
-`_bySignature[signature] = synapseConnection;` overwrites any prior entry with the same signature. If two endpoints hash to the same 64-bit signature (birthday bound ~2^32), the earlier connection's reverse lookup is silently broken and `TryGetBySignature` can return the wrong connection. Low probability, non-zero. Consider logging/telemetry on collisions.
-
-### V11 — Handshake replay cache is effective only for handshakes with identical bytes
-Current check relies on the nonce making each legitimate handshake unique, but the protection only works if `ISignatureProvider.TryCompute` actually includes the full handshake payload (including the nonce). Custom provider hashing only the endpoint bypasses the replay cache. Recommend a doc note on `ISignatureProvider`.
+### ~~V11 — Handshake replay cache is effective only for handshakes with identical bytes~~ ✅ Fixed
+`ISignatureProvider.TryCompute` XML doc now explicitly warns that implementations **must** incorporate `handshakePayload` into the signature when non-empty; providers that hash only the endpoint bypass the replay cache and provide no replay protection.
 
 ---
 
 ## 🟡 Medium
 
-### V12 — `RemoveExpiredHandshakeEntries` / `RemoveExpiredProbeLimitEntries` enumerate under concurrent mutation
-Enumerate a `ConcurrentDictionary` while calling `TryRemove` inside. Safe for correctness, but enumeration allocates an enumerator struct and copies snapshots.
+### ~~V12 — `RemoveExpiredHandshakeEntries` / `RemoveExpiredProbeLimitEntries` enumerate under concurrent mutation~~ ✅ Fixed
+Both methods collapsed to expression-body one-liners delegating to a shared generic helper `RemoveExpiredEntries<TKey>`. The helper uses `ListPool<TKey>` to collect keys first, then removes them — zero intermediate heap allocation, no concurrent-mutation concern.
 
-### V13 — `TryParsePeerEndPoint` copies the address bytes into a new `byte[]` twice per parse
-Attacker-controlled input forces a new `IPAddress` + `IPEndPoint` allocation per received NAT server packet. Rate limited only by `SecurityProvider` bucket. Recommend `new IPAddress(ReadOnlySpan<byte>)` (available on netstandard 2.1) to eliminate the `ToArray()` copy.
+### ~~V13 — `TryParsePeerEndPoint` copies the address bytes into a new `byte[]` twice per parse~~ ✅ Fixed
+`new IPAddress(span.ToArray())` replaced with `new IPAddress(ReadOnlySpan<byte>)` overload (netstandard 2.1). No heap allocation for the address bytes.
 
-### V14 — No cap on `SegmentAssemblyTimeoutMilliseconds`
-Setting to 0 disables eviction; very large values combined with the (now fixed) V1 gave attackers a bigger window. Document a safe max (e.g. `<= 10_000`).
+### ~~V14 — No cap on `SegmentAssemblyTimeoutMilliseconds`~~ ✅ Fixed
+`SynapseManager` constructor now throws `ArgumentOutOfRangeException` when `SegmentAssemblyTimeoutMilliseconds` is non-zero and exceeds 300 000 ms (5 minutes).
 
 ---
 
 ## 🟢 Low
 
-### V16 — `ProcessNatProbe` responds to every non-blacklisted, non-established peer after rate-limit passes
-If `ISignatureProvider` returns stable signatures per IP, the blacklist works; otherwise amplification-for-free exists. Already rate-limited.
+### ~~V16 — `ProcessNatProbe` responds to every non-blacklisted, non-established peer after rate-limit passes~~ ✅ Documented
+`NatTraversalConfig.IntervalMilliseconds` XML doc now quantifies the amplification window (2 packets per source IP per interval). Inline comment in `ProcessNatProbe` confirms the bounding argument. No code change required — the per-IP rate limiter is the correct and sufficient mitigation.
 
-### V17 — `ViolationAction` can be downgraded by a handler
-By design, but if a malicious/buggy listener forces `Ignore`, kick/blacklist effects are bypassed. Document as intended.
+### ~~V17 — `ViolationAction` can be downgraded by a handler~~ ✅ Documented
+`ViolationEventArgs.Action` and the `ViolationDetected` event XML docs now explicitly warn that downgrading from `KickAndBlacklist` to `Ignore` suppresses all protective action and that only confirmed false positives justify the downgrade.
 
-### V18 — `Dictionary<ushort, SegmentAssembly> _currentSegments` is under a single `lock`
-Serializes all segment arrivals for one connection; a slow handler on a completion path can hold the lock briefly. Not a vuln, a perf pinch point.
+### ~~V18 — `Dictionary<ushort, SegmentAssembly> _currentSegments` is under a single `lock`~~ ✅ Accepted
+Per-connection lock; held only for in-memory dictionary mutations, not I/O. Contention at per-connection granularity is negligible in practice. Not a vulnerability. No change warranted.

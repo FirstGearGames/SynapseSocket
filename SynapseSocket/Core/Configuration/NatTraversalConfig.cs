@@ -26,6 +26,11 @@ public sealed class NatTraversalConfig
 
     /// <summary>
     /// Milliseconds between successive hole-punch attempts.
+    /// Also controls the minimum interval between outbound probe responses to any single source
+    /// address. Setting this very low (e.g. &lt; 50 ms) widens the UDP amplification window:
+    /// a spoofed-source probe forces an outbound probe + handshake at up to
+    /// <c>1000 / IntervalMilliseconds</c> packets per second per source IP.
+    /// The default of 200 ms caps the response rate at 5 pps per address.
     /// </summary>
     public uint IntervalMilliseconds = 200;
 
