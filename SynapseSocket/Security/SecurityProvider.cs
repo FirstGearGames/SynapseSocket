@@ -15,7 +15,7 @@ public sealed class SecurityProvider
     /// </summary>
     public ISignatureProvider SignatureProvider { get; }
     private readonly ConcurrentDictionary<ulong, byte> _blacklist = new();
-    private readonly ConcurrentDictionary<ulong, RateBucket> _rates = new();
+    private readonly ConcurrentDictionary<ulong, RateBucket> _rateBuckets = new();
     private readonly uint _maximumPacketsPerSecond;
     private readonly uint _maximumPacketSize;
     /// <summary>
@@ -78,7 +78,7 @@ public sealed class SecurityProvider
         if (_maximumPacketsPerSecond == 0)
             return FilterResult.Allowed;
 
-        RateBucket rateBucket = _rates.GetOrAdd(cachedSignature, static _ => new());
+        RateBucket rateBucket = _rateBuckets.GetOrAdd(cachedSignature, static _ => new());
         return rateBucket.Allow(_maximumPacketsPerSecond) ? FilterResult.Allowed : FilterResult.RateLimited;
     }
 
@@ -108,23 +108,23 @@ public sealed class SecurityProvider
     private sealed class RateBucket
     {
         private long _windowStartTicks;
-        private uint _count;
-        private readonly object _gate = new();
+        private uint _packetCount;
+        private readonly object _lock = new();
 
         public bool Allow(uint maximumPacketsPerSecond)
         {
-            lock (_gate)
+            lock (_lock)
             {
                 long nowTicks = DateTime.UtcNow.Ticks;
                 long windowTicks = TimeSpan.TicksPerSecond;
                 if (nowTicks - _windowStartTicks >= windowTicks)
                 {
                     _windowStartTicks = nowTicks;
-                    _count = 0;
+                    _packetCount = 0;
                 }
-                if (_count >= maximumPacketsPerSecond)
+                if (_packetCount >= maximumPacketsPerSecond)
                     return false;
-                _count++;
+                _packetCount++;
                 return true;
             }
         }

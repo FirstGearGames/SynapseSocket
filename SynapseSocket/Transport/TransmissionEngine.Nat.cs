@@ -36,7 +36,7 @@ public sealed partial class TransmissionEngine
         int offset = PacketHeader.Write(rentedBuffer.AsSpan(), Flags, 0, 0, 0, 0);
         rentedBuffer[offset++] = (byte)packetType;
         System.Text.Encoding.ASCII.GetBytes(sessionId, 0, SessionIdBytes, rentedBuffer, offset);
-        return SendAndReturnAsync(new(rentedBuffer, 0, totalSize), target, cancellationToken);
+        return SendAndPoolBufferAsync(new(rentedBuffer, 0, totalSize), target, cancellationToken);
     }
 
     public Task SendNatProbeAsync(IPEndPoint target, CancellationToken cancellationToken)
@@ -45,6 +45,6 @@ public sealed partial class TransmissionEngine
         int headerSize = PacketHeader.ComputeHeaderSize(Flags);
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Flags, 0, 0, 0, 0);
-        return SendAndReturnAsync(new(rentedBuffer, 0, headerSize), target, cancellationToken);
+        return SendAndPoolBufferAsync(new(rentedBuffer, 0, headerSize), target, cancellationToken);
     }
 }

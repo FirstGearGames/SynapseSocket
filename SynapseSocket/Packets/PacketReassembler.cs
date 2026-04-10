@@ -15,8 +15,8 @@ namespace SynapseSocket.Packets;
 /// </summary>
 public sealed class PacketReassembler : PacketSegmenter
 {
-    private readonly Dictionary<ushort, SegmentAssembly> _pending = new();
-    private readonly object _gate = new();
+    private readonly Dictionary<ushort, SegmentAssembly> _currentSegments = new();
+    private readonly object _lock = new();
 
     /// <summary>
     /// Feeds a received segment into the reassembly buffer.
@@ -37,20 +37,20 @@ public sealed class PacketReassembler : PacketSegmenter
         if (segmentCount == 0 || segmentCount > MaximumSegments || segmentIndex >= segmentCount)
             return false;
 
-        lock (_gate)
+        lock (_lock)
         {
-            if (!_pending.TryGetValue(segmentId, out SegmentAssembly? segmentAssembly))
+            if (!_currentSegments.TryGetValue(segmentId, out SegmentAssembly? segmentAssembly))
             {
                 segmentAssembly = ResettableObjectPool<SegmentAssembly>.Rent();
                 segmentAssembly.Initialize(segmentCount, isReliable);
-                _pending[segmentId] = segmentAssembly;
+                _currentSegments[segmentId] = segmentAssembly;
             }
             else if (segmentAssembly.SegmentCount != segmentCount || segmentAssembly.IsReliable != isReliable)
             {
                 // Same segmentId reused with a different declared segmentCount or reliability flag.
                 // This is either a sender bug or a malicious attempt to desync reassembly state.
                 // Evict the stale assembly and signal a protocol violation to the caller.
-                _pending.Remove(segmentId);
+                _currentSegments.Remove(segmentId);
                 ResettableObjectPool<SegmentAssembly>.Return(segmentAssembly);
                 isProtocolViolation = true;
 
@@ -61,7 +61,7 @@ public sealed class PacketReassembler : PacketSegmenter
 
             if (segmentAssembly.TryGetAssembledSegments(out assembledSegments))
             {
-                _pending.Remove(segmentId);
+                _currentSegments.Remove(segmentId);
                 ResettableObjectPool<SegmentAssembly>.Return(segmentAssembly);
 
                 return true;
@@ -77,19 +77,19 @@ public sealed class PacketReassembler : PacketSegmenter
     /// </summary>
     public void RemoveExpiredSegments(long nowTicks, long timeoutTicks)
     {
-        lock (_gate)
+        lock (_lock)
         {
             List<ushort> toRemove = ListPool<ushort>.Rent();
             try
             {
-                foreach (KeyValuePair<ushort, SegmentAssembly> keyValuePair in _pending)
+                foreach (KeyValuePair<ushort, SegmentAssembly> keyValuePair in _currentSegments)
                 {
                     if (nowTicks - keyValuePair.Value.FirstReceivedTicks > timeoutTicks)
                         toRemove.Add(keyValuePair.Key);
                 }
                 foreach (ushort id in toRemove)
                 {
-                    if (_pending.Remove(id, out SegmentAssembly? evicted))
+                    if (_currentSegments.Remove(id, out SegmentAssembly? evicted))
                         ResettableObjectPool<SegmentAssembly>.Return(evicted);
                 }
             }
@@ -103,11 +103,11 @@ public sealed class PacketReassembler : PacketSegmenter
     /// <inheritdoc/>
     public override void OnReturn()
     {
-        lock (_gate)
+        lock (_lock)
         {
-            foreach (SegmentAssembly segmentAssembly in _pending.Values)
+            foreach (SegmentAssembly segmentAssembly in _currentSegments.Values)
                 ResettableObjectPool<SegmentAssembly>.Return(segmentAssembly);
-            _pending.Clear();
+            _currentSegments.Clear();
         }
         base.OnReturn();
     }
@@ -213,3 +213,5 @@ public sealed class PacketReassembler : PacketSegmenter
             FirstReceivedTicks = 0;
             IsReliable = false;
         }
+    }
+}

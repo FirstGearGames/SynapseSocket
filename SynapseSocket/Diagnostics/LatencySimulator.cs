@@ -19,7 +19,7 @@ public sealed class LatencySimulator
 
     private readonly LatencySimulatorConfig _config;
     private readonly Random _random = new();
-    private readonly object _gate = new();
+    private readonly object _lock = new();
 
     /// <summary>
     /// Creates a simulator from the provided configuration.
@@ -40,7 +40,7 @@ public sealed class LatencySimulator
 
         double lossRoll;
         int delayMilliseconds;
-        lock (_gate)
+        lock (_lock)
         {
             lossRoll = _random.NextDouble();
             int jitter = _config.JitterMilliseconds > 0 ? _random.Next(0, (int)_config.JitterMilliseconds) : 0;

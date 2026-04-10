@@ -61,7 +61,7 @@ public sealed class SynapseConnection
     /// <summary>
     /// Gate for reorder buffer and sequence manipulation.
     /// </summary>
-    internal readonly object ReliableGate = new();
+    internal readonly object ReliableLock = new();
 
     /// <summary>
     /// Send-side splitter, rented from <see cref="CodeBoost.Performance.ResettableObjectPool{T}"/>
@@ -98,7 +98,7 @@ public sealed class SynapseConnection
     {
         public ushort Sequence;
         public byte[] Payload = [];
-        public int Length;
+        public int PacketLength;
         public ArraySegment<byte>[]? Segments;
         public int SegmentCount;
         public long SentTicks;

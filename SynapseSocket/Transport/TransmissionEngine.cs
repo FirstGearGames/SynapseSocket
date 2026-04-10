@@ -23,7 +23,7 @@ public sealed partial class TransmissionEngine
     private readonly Socket? _ipv6Socket;
     private readonly SynapseConfig _config;
     private readonly Telemetry _telemetry;
-    private readonly LatencySimulator _latency;
+    private readonly LatencySimulator _latencySimulator;
 
     public TransmissionEngine(Socket ipv4Socket, Socket? ipv6Socket, SynapseConfig config, Telemetry telemetry, LatencySimulator latency)
     {
@@ -31,12 +31,12 @@ public sealed partial class TransmissionEngine
         _ipv6Socket = ipv6Socket;
         _config = config;
         _telemetry = telemetry;
-        _latency = latency;
+        _latencySimulator = latency;
     }
 
     public Task SendRawAsync(ArraySegment<byte> segment, IPEndPoint target, CancellationToken cancellationToken)
     {
-        return _latency.ProcessAsync(segment.Array!, segment.Count, target, SendDirectAsync, cancellationToken);
+        return _latencySimulator.ProcessAsync(segment.Array!, segment.Count, target, SendDirectAsync, cancellationToken);
     }
 
     internal async Task SendUnreliableUnsegmentedAsync(SynapseConnection synapseConnection, ArraySegment<byte> payload, CancellationToken cancellationToken)
@@ -61,7 +61,7 @@ public sealed partial class TransmissionEngine
             throw new InvalidOperationException("Reliable backpressure limit reached.");
 
         ushort sequence;
-        lock (synapseConnection.ReliableGate)
+        lock (synapseConnection.ReliableLock)
             sequence = synapseConnection.NextOutgoingSequence++;
 
         const PacketFlags Flags = PacketFlags.Reliable;
@@ -74,7 +74,7 @@ public sealed partial class TransmissionEngine
         {
             Sequence = sequence,
             Payload = packetBuffer,
-            Length = written,
+            PacketLength = written,
             SentTicks = DateTime.UtcNow.Ticks,
             Retries = 0
         };
@@ -97,7 +97,7 @@ public sealed partial class TransmissionEngine
         ushort sequence = 0;
         if (isReliable)
         {
-            lock (synapseConnection.ReliableGate)
+            lock (synapseConnection.ReliableLock)
                 sequence = synapseConnection.NextOutgoingSequence++;
         }
 
@@ -142,7 +142,7 @@ public sealed partial class TransmissionEngine
         int headerSize = PacketHeader.ComputeHeaderSize(Flags);
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Flags, sequence, 0, 0, 0);
-        return SendAndReturnAsync(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint, cancellationToken);
+        return SendAndPoolBufferAsync(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint, cancellationToken);
     }
 
     /// <summary>
@@ -157,7 +157,7 @@ public sealed partial class TransmissionEngine
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(totalSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Flags, 0, 0, 0, 0);
         RandomNumberGenerator.Fill(rentedBuffer.AsSpan(headerSize, NonceSize));
-        return SendAndReturnAsync(new(rentedBuffer, 0, totalSize), target, cancellationToken);
+        return SendAndPoolBufferAsync(new(rentedBuffer, 0, totalSize), target, cancellationToken);
     }
 
     public Task SendKeepAliveAsync(SynapseConnection synapseConnection, CancellationToken cancellationToken)
@@ -166,7 +166,7 @@ public sealed partial class TransmissionEngine
         int headerSize = PacketHeader.ComputeHeaderSize(Flags);
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Flags, 0, 0, 0, 0);
-        return SendAndReturnAsync(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint, cancellationToken);
+        return SendAndPoolBufferAsync(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint, cancellationToken);
     }
 
     public Task SendDisconnectAsync(SynapseConnection synapseConnection, CancellationToken cancellationToken)
@@ -175,7 +175,7 @@ public sealed partial class TransmissionEngine
         int headerSize = PacketHeader.ComputeHeaderSize(Flags);
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Flags, 0, 0, 0, 0);
-        return SendAndReturnAsync(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint, cancellationToken);
+        return SendAndPoolBufferAsync(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint, cancellationToken);
     }
 
     private async Task SendDirectAsync(byte[] buffer, int length, IPEndPoint target)
@@ -185,7 +185,7 @@ public sealed partial class TransmissionEngine
         _telemetry.OnSent(bytesSent);
     }
 
-    private async Task SendAndReturnAsync(ArraySegment<byte> segment, IPEndPoint target, CancellationToken cancellationToken)
+    private async Task SendAndPoolBufferAsync(ArraySegment<byte> segment, IPEndPoint target, CancellationToken cancellationToken)
     {
         try
         {

@@ -24,7 +24,7 @@ public sealed partial class IngressEngine
     /// </summary>
     public event NatSessionFullDelegate? NatSessionFull;
 
-    private void HandleNatProbe(IPEndPoint fromEndPoint, CancellationToken cancellationToken)
+    private void ProcessNatProbe(IPEndPoint fromEndPoint, CancellationToken cancellationToken)
     {
         if (_config.NatTraversal.Mode == NatTraversalMode.Disabled)
             return;
@@ -45,7 +45,7 @@ public sealed partial class IngressEngine
 
         // Lightweight periodic eviction: run every 100 probes to bound dictionary growth.
         if (Interlocked.Increment(ref _natProbeCounter) % 100 == 0)
-            RemoveStaleProbeLimitEntries(nowTicks, staleTicks: minIntervalTicks * 10);
+            RemoveExpiredProbeLimitEntries(nowTicks, staleTicks: minIntervalTicks * 10);
 
         long lastTicks = _natProbeRateLimiter.GetOrAdd(addressKey, 0L);
         if (nowTicks - lastTicks < minIntervalTicks)
@@ -56,7 +56,7 @@ public sealed partial class IngressEngine
         _ = _sender.SendHandshakeAsync(fromEndPoint, cancellationToken);
     }
     
-    private void HandleNatServerPacket(IPEndPoint fromEndPoint, ReadOnlySpan<byte> payload)
+    private void ProcessNatServerPacket(IPEndPoint fromEndPoint, ReadOnlySpan<byte> payload)
     {
         if (_config.NatTraversal.Mode != NatTraversalMode.Server)
             return;

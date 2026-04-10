@@ -75,16 +75,16 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// <summary>
     /// True if <see cref="StartAsync"/> has completed successfully and the engine has not been stopped or disposed.
     /// </summary>
-    public bool IsRunning => _started && !_disposed;
-    private bool _started;
-    private bool _disposed;
-    private readonly LatencySimulator _latency;
+    public bool IsRunning => _isStarted && !_isDisposed;
+    private bool _isStarted;
+    private bool _isDisposed;
+    private readonly LatencySimulator _latencySimulator;
     private readonly bool _isSegmentingEnabled;
     private readonly int _maximumUnsegmentedPayload;
     private readonly List<Socket> _sockets = [];
     private readonly List<Task> _ingressTasks = [];
     private TransmissionEngine? _sender;
-    private CancellationTokenSource? _cts;
+    private CancellationTokenSource? _cancellationTokenSource;
     private Task? _maintenanceTask;
 
     /// <summary>
@@ -101,7 +101,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         Security = new(signatureProvider, Config.MaximumPacketsPerSecond, Config.MaximumPacketSize);
         Connections = new();
         Telemetry = new(Config.IsTelemetryEnabled);
-        _latency = new(Config.LatencySimulator);
+        _latencySimulator = new(Config.LatencySimulator);
         _isSegmentingEnabled = Config.MaximumSegments != SynapseConfig.DisabledMaximumSegments;
         /* Unreliable requires a couple bytes less for segmenting when being sent out
          * of order, which would require different maximum payload sizes between reliable
@@ -116,12 +116,12 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     public Task StartAsync(CancellationToken cancellationToken = default)
     {
-        if (_started)
+        if (_isStarted)
             throw new InvalidOperationException("Engine is already running.");
-        if (_disposed)
+        if (_isDisposed)
             throw new ObjectDisposedException(nameof(SynapseManager));
 
-        _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
         Socket? ipv4Socket = null;
         Socket? ipv6Socket = null;
@@ -152,7 +152,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         if (_sockets.Count == 0)
             throw new InvalidOperationException("Failed to bind any configured endpoints.");
 
-        _sender = new(ipv4Socket ?? _sockets[0], ipv6Socket, Config, Telemetry, _latency);
+        _sender = new(ipv4Socket ?? _sockets[0], ipv6Socket, Config, Telemetry, _latencySimulator);
 
         foreach (Socket socket in _sockets)
         {
@@ -165,11 +165,11 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             ingressEngine.UnhandledException += OnUnhandledException;
             ingressEngine.NatPeerReady += OnNatPeerReady;
             ingressEngine.NatSessionFull += OnNatSessionFull;
-            _ingressTasks.Add(ingressEngine.StartAsync(_cts.Token));
+            _ingressTasks.Add(ingressEngine.StartAsync(_cancellationTokenSource.Token));
         }
 
-        _maintenanceTask = Task.Run(() => MaintenanceLoopAsync(_cts.Token), _cts.Token);
-        _started = true;
+        _maintenanceTask = Task.Run(() => MaintenanceLoopAsync(_cancellationTokenSource.Token), _cancellationTokenSource.Token);
+        _isStarted = true;
         return Task.CompletedTask;
     }
 
@@ -179,12 +179,12 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     public async Task StopAsync()
     {
-        if (!_started || _disposed)
+        if (!_isStarted || _isDisposed)
             return;
-        _started = false;
+        _isStarted = false;
         await ShutdownCoreAsync().ConfigureAwait(false);
-        CancellationTokenSource? oldCts = _cts;
-        _cts = null;
+        CancellationTokenSource? oldCts = _cancellationTokenSource;
+        _cancellationTokenSource = null;
         oldCts?.Dispose();
     }
 
@@ -194,7 +194,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     public async Task<SynapseConnection> ConnectAsync(IPEndPoint endPoint, CancellationToken cancellationToken = default)
     {
-        if (!_started || _sender is null)
+        if (!_isStarted || _sender is null)
             throw new InvalidOperationException("Engine not started.");
 
         ulong signature = Security.ComputeSignature(endPoint, ReadOnlySpan<byte>.Empty);
@@ -234,7 +234,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             else
                 await _sender!.SendUnreliableUnsegmentedAsync(synapseConnection, payload, cancellationToken).ConfigureAwait(false);
             
-            RaiseSent(synapseConnection.RemoteEndPoint, payload, isReliable);
+            RaisePacketSent(synapseConnection.RemoteEndPoint, payload, isReliable);
 
             return;
         }
@@ -258,7 +258,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         }
         
         await _sender!.SendSegmentedAsync(synapseConnection, payload, isReliable, GetOrRentSplitter(synapseConnection), cancellationToken).ConfigureAwait(false);
-        RaiseSent(synapseConnection.RemoteEndPoint, payload, isReliable);
+        RaisePacketSent(synapseConnection.RemoteEndPoint, payload, isReliable);
     }
 
     /// <summary>
@@ -309,7 +309,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
                     return;
 
                 case ViolationAction.Kick:
-                    KickEndpoint(endPoint, blacklist: false);
+                    DisconnectAndBlacklist(endPoint, canBlacklist: false);
                     return;
 
                 case ViolationAction.KickAndBlacklist:
@@ -317,7 +317,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
                     if (signature != SecurityProvider.UnsetSignature)
                         Security.AddToBlacklist(signature);
 
-                    KickEndpoint(endPoint, blacklist: false);
+                    DisconnectAndBlacklist(endPoint, canBlacklist: false);
                     return;
             }
         }
@@ -332,15 +332,15 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     public void Dispose()
     {
-        if (_disposed)
+        if (_isDisposed)
             return;
 
-        _disposed = true;
-        _started = false;
+        _isDisposed = true;
+        _isStarted = false;
 
         try
         {
-            _cts?.Cancel();
+            _cancellationTokenSource?.Cancel();
         }
         catch { }
 
@@ -362,7 +362,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             catch { }
         }
 
-        _cts?.Dispose();
+        _cancellationTokenSource?.Dispose();
     }
 
     /// <summary>
@@ -370,15 +370,15 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        if (_disposed)
+        if (_isDisposed)
             return;
 
-        _disposed = true;
-        _started = false;
+        _isDisposed = true;
+        _isStarted = false;
 
         await ShutdownCoreAsync().ConfigureAwait(false);
 
-        _cts?.Dispose();
+        _cancellationTokenSource?.Dispose();
     }
 
     /// <summary>
@@ -389,7 +389,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     {
         try
         {
-            _cts?.Cancel();
+            _cancellationTokenSource?.Cancel();
         }
         catch { }
 
@@ -429,7 +429,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
 
     private void EnsureRunning()
     {
-        if (!_started || _sender is null || _disposed)
+        if (!_isStarted || _sender is null || _isDisposed)
             throw new InvalidOperationException("Engine is not running.");
     }
 
@@ -518,7 +518,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         }
     }
 
-    private void RaiseSent(IPEndPoint endPoint, ArraySegment<byte> payload, bool isReliable)
+    private void RaisePacketSent(IPEndPoint endPoint, ArraySegment<byte> payload, bool isReliable)
     {
         PacketSentEventArgs packetSentEventArgs = ResettableObjectPool<PacketSentEventArgs>.Rent();
         packetSentEventArgs.Initialize(endPoint, payload, isReliable);
@@ -563,7 +563,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         }
     }
 
-    private void KickEndpoint(IPEndPoint endPoint, bool canBlacklist)
+    private void DisconnectAndBlacklist(IPEndPoint endPoint, bool canBlacklist)
     {
         if (Connections.Remove(endPoint, out SynapseConnection? synapseConnection) && synapseConnection is not null)
         {

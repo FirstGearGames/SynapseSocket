@@ -143,7 +143,7 @@ public sealed partial class IngressEngine
                 }
                 _telemetry.OnReceived(receivedLength);
 
-                HandlePacket(rentedBuffer, receivedLength, fromEndPoint, cancellationToken, ref isBufferHandedOff);
+                ProcessPacket(rentedBuffer, receivedLength, fromEndPoint, cancellationToken, ref isBufferHandedOff);
             }
             catch (OperationCanceledException)
             {
@@ -167,7 +167,7 @@ public sealed partial class IngressEngine
         IsRunning = false;
     }
 
-    private void HandlePacket(byte[] buffer, int length, IPEndPoint fromEndPoint, CancellationToken cancellationToken, ref bool isBufferHandedOff)
+    private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, CancellationToken cancellationToken, ref bool isBufferHandedOff)
     {
         PacketFlags flags;
         ushort sequence;
@@ -191,7 +191,7 @@ public sealed partial class IngressEngine
         // Handshake from a new peer.
         if ((flags & PacketFlags.Handshake) != 0)
         {
-            HandleHandshake(fromEndPoint, buffer, headerSize, length, cancellationToken);
+            ProcessHandshake(fromEndPoint, buffer, headerSize, length, cancellationToken);
             return;
         }
 
@@ -199,9 +199,9 @@ public sealed partial class IngressEngine
         if (flags == PacketFlags.Extended)
         {
             if (length > headerSize)
-                HandleNatServerPacket(fromEndPoint, buffer.AsSpan(headerSize, length - headerSize));
+                ProcessNatServerPacket(fromEndPoint, buffer.AsSpan(headerSize, length - headerSize));
             else
-                HandleNatProbe(fromEndPoint, cancellationToken);
+                ProcessNatProbe(fromEndPoint, cancellationToken);
             return;
         }
 
@@ -369,7 +369,7 @@ public sealed partial class IngressEngine
     {
         List<ArraySegment<byte>>? toDeliver = null;
         
-        lock (synapseConnection.ReliableGate)
+        lock (synapseConnection.ReliableLock)
         {
             if (sequence == synapseConnection.NextExpectedSequence)
             {
@@ -398,7 +398,7 @@ public sealed partial class IngressEngine
         }
     }
 
-    private void RemoveStaleProbeLimitEntries(long nowTicks, long staleTicks)
+    private void RemoveExpiredProbeLimitEntries(long nowTicks, long staleTicks)
     {
         foreach (KeyValuePair<IpKey, long> entry in _natProbeRateLimiter)
         {
@@ -428,7 +428,7 @@ public sealed partial class IngressEngine
         return null;
     }
 
-    private void HandleHandshake(IPEndPoint fromEndPoint, byte[] buffer, int headerSize, int length, CancellationToken cancellationToken)
+    private void ProcessHandshake(IPEndPoint fromEndPoint, byte[] buffer, int headerSize, int length, CancellationToken cancellationToken)
     {
         ReadOnlySpan<byte> handshakePayload = buffer.AsSpan(headerSize, length - headerSize);
         ulong signature = _security.ComputeSignature(fromEndPoint, handshakePayload);
@@ -452,7 +452,7 @@ public sealed partial class IngressEngine
 
         // Periodic eviction: keep the replay cache from growing without bound.
         if (Interlocked.Increment(ref _handshakeCounter) % 100 == 0)
-            EvictStaleHandshakeEntries(nowTicks, _config.Connection.TimeoutMilliseconds * TimeSpan.TicksPerMillisecond * 2);
+            RemoveExpiredHandshakeEntries(nowTicks, _config.Connection.TimeoutMilliseconds * TimeSpan.TicksPerMillisecond * 2);
 
         if (_config.SignatureValidator is not null && !_config.SignatureValidator.Validate(fromEndPoint, signature, handshakePayload))
         {
@@ -473,7 +473,7 @@ public sealed partial class IngressEngine
         }
     }
 
-    private void EvictStaleHandshakeEntries(long nowTicks, long staleTicks)
+    private void RemoveExpiredHandshakeEntries(long nowTicks, long staleTicks)
     {
         foreach (KeyValuePair<ulong, long> entry in _seenHandshakes)
         {

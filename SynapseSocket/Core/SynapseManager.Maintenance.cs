@@ -129,7 +129,7 @@ public sealed partial class SynapseManager
                 }
                 else
                 {
-                    _ = _sender.SendRawAsync(new(pendingReliable.Payload, 0, pendingReliable.Length), synapseConnection.RemoteEndPoint, cancellationToken);
+                    _ = _sender.SendRawAsync(new(pendingReliable.Payload, 0, pendingReliable.PacketLength), synapseConnection.RemoteEndPoint, cancellationToken);
                 }
             }
         }

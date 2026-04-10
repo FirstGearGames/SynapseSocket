@@ -29,7 +29,7 @@ public sealed partial class SynapseManager
     // Set before ConnectViaNatServerAsync returns; completed by OnNatPeerReady.
     private TaskCompletionSource<IPEndPoint>? _natPeerSource;
     // Guards _natPeerSource assignment to prevent concurrent callers racing.
-    private readonly object _natGate = new();
+    private readonly object _natPeerSourceLock = new();
 
     // -------------------------------------------------------------------------
     // Public API — Server mode
@@ -43,14 +43,14 @@ public sealed partial class SynapseManager
     /// </summary>
     public async Task<SynapseConnection> ConnectViaNatServerAsync(CancellationToken cancellationToken = default)
     {
-        if (!_started || _sender is null)
+        if (!_isStarted || _sender is null)
             throw new InvalidOperationException("Engine not started.");
         if (Config.NatTraversal.Mode != NatTraversalMode.Server)
             throw new InvalidOperationException("NatTraversal.Mode must be Server to call ConnectViaNatServerAsync.");
         if (Config.NatTraversal.Server.ServerEndPoint is null)
             throw new InvalidOperationException("NatTraversal.Server.ServerEndPoint must be set.");
 
-        lock (_natGate)
+        lock (_natPeerSourceLock)
         {
             if (_natPeerSource is not null && !_natPeerSource.Task.IsCompleted)
                 throw new InvalidOperationException("A NAT rendezvous is already in progress.");
