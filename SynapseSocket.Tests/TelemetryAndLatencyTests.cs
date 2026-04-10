@@ -14,8 +14,8 @@ public class TelemetryAndLatencyTests
     public async Task Telemetry_Counts_Inbound_And_Outbound_Accurately()
     {
         int port = TestHarness.GetFreePort();
-        using SynapseManager server = new(TestHarness.ServerConfig(port));
-        using SynapseManager client = new(TestHarness.ClientConfig());
+        await using SynapseManager server = new(TestHarness.ServerConfig(port));
+        await using SynapseManager client = new(TestHarness.ClientConfig());
 
         await server.StartAsync();
         await client.StartAsync();
@@ -38,8 +38,8 @@ public class TelemetryAndLatencyTests
     public async Task LatencySimulator_Drops_All_Packets_When_Loss_Is_100_Percent()
     {
         int port = TestHarness.GetFreePort();
-        using SynapseManager server = new(TestHarness.ServerConfig(port));
-        using SynapseManager client = new(TestHarness.ClientConfig(c =>
+        await using SynapseManager server = new(TestHarness.ServerConfig(port));
+        await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
             c.LatencySimulator.Enabled = true;
             c.LatencySimulator.PacketLossChance = 1.0; // everything dropped at the sender
@@ -66,8 +66,8 @@ public class TelemetryAndLatencyTests
     public async Task LatencySimulator_Adds_Measurable_Delay()
     {
         int port = TestHarness.GetFreePort();
-        using SynapseManager server = new(TestHarness.ServerConfig(port));
-        using SynapseManager client = new(TestHarness.ClientConfig(c =>
+        await using SynapseManager server = new(TestHarness.ServerConfig(port));
+        await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
             c.LatencySimulator.Enabled = true;
             c.LatencySimulator.BaseLatencyMilliseconds = 200;
@@ -80,7 +80,7 @@ public class TelemetryAndLatencyTests
         await client.StartAsync();
 
         DateTime startTime = DateTime.UtcNow;
-        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port));
+        SynapseConnection _ = await client.ConnectAsync(new(IPAddress.Loopback, port));
         await TestHarness.WaitFor(() => eventRecorder.ConnectionsEstablished >= 1, 3000);
         TimeSpan elapsedTime = DateTime.UtcNow - startTime;
 

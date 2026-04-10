@@ -30,7 +30,7 @@ internal static class Program
             UnreliableSegmentMode = UnreliableSegmentMode.SegmentUnreliable,
         };
 
-        using SynapseManager server = new(serverConfig);
+        await using SynapseManager server = new(serverConfig);
         WireServerEvents(server);
         await server.StartAsync().ConfigureAwait(false);
         Console.WriteLine($"[server] bound on port {Port}");
@@ -44,7 +44,7 @@ internal static class Program
             UnreliableSegmentMode = UnreliableSegmentMode.SegmentUnreliable,
         };
 
-        using SynapseManager client = new(clientConfig);
+        await using SynapseManager client = new(clientConfig);
         TaskCompletionSource<bool> clientConnected = new();
         TaskCompletionSource<string> clientReply = new();
 

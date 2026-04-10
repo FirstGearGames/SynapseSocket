@@ -16,7 +16,7 @@ public class EngineLifecycleTests
     {
         int port = TestHarness.GetFreePort();
         SynapseConfig synapseConfig = TestHarness.ServerConfig(port);
-        using SynapseManager engine = new(synapseConfig);
+        await using SynapseManager engine = new(synapseConfig);
 
         await engine.StartAsync();
 
@@ -27,7 +27,7 @@ public class EngineLifecycleTests
     public async Task Engine_Throws_When_Started_Twice()
     {
         int port = TestHarness.GetFreePort();
-        using SynapseManager engine = new(TestHarness.ServerConfig(port));
+        await using SynapseManager engine = new(TestHarness.ServerConfig(port));
 
         await engine.StartAsync();
 
@@ -82,7 +82,7 @@ public class EngineLifecycleTests
         blockerSocket.Bind(new IPEndPoint(IPAddress.Loopback, port));
 
         SynapseConfig synapseConfig = TestHarness.ServerConfig(port);
-        using SynapseManager engine = new(synapseConfig);
+        await using SynapseManager engine = new(synapseConfig);
 
         ConnectionRejectedReason? connectionRejectedReason = null;
         engine.ConnectionFailed += (connectionFailedEventArgs) => connectionRejectedReason = connectionFailedEventArgs.Reason;

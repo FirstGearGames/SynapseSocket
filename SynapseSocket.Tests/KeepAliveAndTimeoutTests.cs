@@ -15,7 +15,7 @@ public class KeepAliveAndTimeoutTests
     public async Task Idle_Connection_Times_Out_And_Fires_Timeout_Failure()
     {
         int port = TestHarness.GetFreePort();
-        using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
+        await using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
             c.Connection.KeepAliveIntervalMilliseconds = 10_000; // effectively never
             c.Connection.TimeoutMilliseconds = 300;
@@ -41,12 +41,12 @@ public class KeepAliveAndTimeoutTests
     public async Task KeepAlive_Prevents_Timeout()
     {
         int port = TestHarness.GetFreePort();
-        using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
+        await using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
             c.Connection.KeepAliveIntervalMilliseconds = 50;
             c.Connection.TimeoutMilliseconds = 500;
         }));
-        using SynapseManager client = new(TestHarness.ClientConfig(c =>
+        await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
             c.Connection.KeepAliveIntervalMilliseconds = 50;
             c.Connection.TimeoutMilliseconds = 500;

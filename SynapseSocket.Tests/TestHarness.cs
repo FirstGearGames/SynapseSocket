@@ -89,9 +89,9 @@ public static class TestHarness
         public int Failures => Volatile.Read(ref _failures);
         public int Violations => Volatile.Read(ref _violations);
 
-        public ConcurrentBag<byte[]> Payloads { get; } = new();
-        public ConcurrentBag<ConnectionRejectedReason> FailureReasons { get; } = new();
-        public ConcurrentBag<ViolationReason> ViolationReasons { get; } = new();
+        public ConcurrentBag<byte[]> Payloads { get; } = [];
+        public ConcurrentBag<ConnectionRejectedReason> FailureReasons { get; } = [];
+        public ConcurrentBag<ViolationReason> ViolationReasons { get; } = [];
 
         public void Attach(SynapseManager engine)
         {
@@ -100,9 +100,9 @@ public static class TestHarness
                 Interlocked.Increment(ref _packetsReceived);
                 Payloads.Add(packetReceivedEventArgs.Payload.ToArray());
             };
-            engine.PacketSent += (packetSentEventArgs) => Interlocked.Increment(ref _packetsSent);
-            engine.ConnectionEstablished += (connectionEventArgs) => Interlocked.Increment(ref _connectionsEstablished);
-            engine.ConnectionClosed += (connectionEventArgs) => Interlocked.Increment(ref _connectionsClosed);
+            engine.PacketSent += (_) => Interlocked.Increment(ref _packetsSent);
+            engine.ConnectionEstablished += (_) => Interlocked.Increment(ref _connectionsEstablished);
+            engine.ConnectionClosed += (_) => Interlocked.Increment(ref _connectionsClosed);
             engine.ConnectionFailed += (connectionFailedEventArgs) =>
             {
                 Interlocked.Increment(ref _failures);

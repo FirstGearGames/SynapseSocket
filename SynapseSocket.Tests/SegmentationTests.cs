@@ -16,13 +16,13 @@ public class SegmentationTests
     public async Task Large_Unreliable_Payload_Is_Segmented_And_Reassembled()
     {
         int port = TestHarness.GetFreePort();
-        using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
+        await using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
             c.MaximumTransmissionUnit = 200;  // very small MTU to force many segments
             c.MaximumPacketSize = 400;
             c.MaximumSegments = 128;
         }));
-        using SynapseManager client = new(TestHarness.ClientConfig(c =>
+        await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
             c.MaximumTransmissionUnit = 200;
             c.MaximumPacketSize = 400;
@@ -51,8 +51,8 @@ public class SegmentationTests
     public async Task Reliable_Oversized_Payload_Throws_Clearly()
     {
         int port = TestHarness.GetFreePort();
-        using SynapseManager server = new(TestHarness.ServerConfig(port));
-        using SynapseManager client = new(TestHarness.ClientConfig(c =>
+        await using SynapseManager server = new(TestHarness.ServerConfig(port));
+        await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
             c.MaximumTransmissionUnit = 256;
             c.MaximumPacketSize = 512;
@@ -73,7 +73,7 @@ public class SegmentationTests
     public async Task Declared_Segment_Assembly_Exceeding_MaximumReassembledPacketSize_Is_Rejected()
     {
         int port = TestHarness.GetFreePort();
-        using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
+        await using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
             c.MaximumTransmissionUnit = 200;
             c.MaximumSegments = 64;

@@ -45,11 +45,11 @@ public class SignatureValidatorTests
         int port = TestHarness.GetFreePort();
         AcceptAllValidator validator = new();
 
-        using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
+        await using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
             c.SignatureValidator = validator;
         }));
-        using SynapseManager client = new(TestHarness.ClientConfig());
+        await using SynapseManager client = new(TestHarness.ClientConfig());
 
         TestHarness.EventRecorder eventRecorder = new();
         eventRecorder.Attach(server);
@@ -67,11 +67,11 @@ public class SignatureValidatorTests
     {
         int port = TestHarness.GetFreePort();
 
-        using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
+        await using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
             c.SignatureValidator = new RejectAllValidator();
         }));
-        using SynapseManager client = new(TestHarness.ClientConfig());
+        await using SynapseManager client = new(TestHarness.ClientConfig());
 
         TestHarness.EventRecorder eventRecorder = new();
         eventRecorder.Attach(server);
@@ -91,11 +91,11 @@ public class SignatureValidatorTests
         int port = TestHarness.GetFreePort();
         FixedSignatureProvider provider = new(0xCAFEBABEDEADBEEF);
 
-        using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
+        await using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
             c.SignatureProvider = provider;
         }));
-        using SynapseManager client = new(TestHarness.ClientConfig());
+        await using SynapseManager client = new(TestHarness.ClientConfig());
 
         TestHarness.EventRecorder eventRecorder = new();
         eventRecorder.Attach(server);
