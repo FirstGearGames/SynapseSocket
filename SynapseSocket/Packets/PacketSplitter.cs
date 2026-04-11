@@ -13,6 +13,9 @@ namespace SynapseSocket.Packets;
 /// </summary>
 public sealed class PacketSplitter : PacketSegmenter
 {
+    /// <summary>
+    /// Monotonically increasing counter used to assign unique segment IDs to each split operation.
+    /// </summary>
     private int _segmentIdCounter;
 
     /// <summary>

@@ -119,13 +119,33 @@ public sealed class SecurityProvider
         }
     }
 
+    /// <summary>
+    /// Sliding-window rate limiter for a single endpoint signature.
+    /// Resets the packet counter once the current one-second window elapses.
+    /// </summary>
     private sealed class RateBucket
     {
+        /// <summary>
+        /// Tick timestamp of the most recent access, used for stale-entry eviction.
+        /// </summary>
         public long LastAccessTicks;
+        /// <summary>
+        /// Tick timestamp marking the start of the current one-second rate window.
+        /// </summary>
         private long _windowStartTicks;
+        /// <summary>
+        /// Number of packets admitted in the current rate window.
+        /// </summary>
         private uint _packetCount;
+        /// <summary>
+        /// Synchronisation guard for the sliding-window state.
+        /// </summary>
         private readonly object _lock = new();
 
+        /// <summary>
+        /// Returns true if the endpoint may send another packet within the current window,
+        /// incrementing the counter; returns false when the limit has been reached.
+        /// </summary>
         public bool Allow(uint maximumPacketsPerSecond)
         {
             lock (_lock)

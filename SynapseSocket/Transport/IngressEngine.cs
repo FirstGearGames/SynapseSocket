@@ -41,11 +41,29 @@ public sealed partial class IngressEngine
     // from re-establishing connections after the original session ends.
     private readonly ConcurrentDictionary<ulong, long> _seenHandshakes = [];
     private long _lastHandshakeEvictionTicks;
+    /// <summary>
+    /// Raised when a complete payload (unsegmented or fully reassembled) is ready for the application layer.
+    /// </summary>
     public event PayloadDeliveredDelegate? PayloadDelivered;
+    /// <summary>
+    /// Raised when a new connection is established via a successful handshake.
+    /// </summary>
     public event ConnectionDelegate? ConnectionEstablished;
+    /// <summary>
+    /// Raised when a remote peer sends a disconnect packet.
+    /// </summary>
     public event ConnectionDelegate? ConnectionClosed;
+    /// <summary>
+    /// Raised when a connection attempt is rejected before it can be established.
+    /// </summary>
     public event ConnectionFailedCallbackDelegate? ConnectionFailed;
+    /// <summary>
+    /// Raised when a protocol violation is detected on the ingress path.
+    /// </summary>
     public event ViolationCallbackDelegate? ViolationOccurred;
+    /// <summary>
+    /// Raised when an unexpected exception escapes the receive loop.
+    /// </summary>
     public event UnhandledExceptionDelegate? UnhandledException;
 
     /// <summary>
@@ -167,6 +185,10 @@ public sealed partial class IngressEngine
         IsRunning = false;
     }
 
+    /// <summary>
+    /// Parses a single received datagram and routes it to the appropriate handler
+    /// (handshake, data, ack, disconnect, keep-alive, or NAT probe/server).
+    /// </summary>
     private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, CancellationToken cancellationToken, ref bool isBufferHandedOff)
     {
         PacketFlags flags;
@@ -365,6 +387,9 @@ public sealed partial class IngressEngine
         return rented;
     }
 
+    /// <summary>
+    /// Delivers in-order reliable payloads and drains any consecutive buffered packets from the reorder buffer.
+    /// </summary>
     private void DeliverOrdered(SynapseConnection synapseConnection, ushort sequence, ArraySegment<byte> payload, bool isReliable)
     {
         List<ArraySegment<byte>>? toDeliver = null;
@@ -412,15 +437,16 @@ public sealed partial class IngressEngine
         }
     }
 
-    private void RemoveExpiredProbeLimitEntries(long nowTicks, long staleTicks)
-    {
-        foreach (KeyValuePair<IpKey, long> entry in _natProbeLastResponseTicks)
-        {
-            if (nowTicks - entry.Value > staleTicks)
-                _natProbeLastResponseTicks.TryRemove(entry.Key, out _);
-        }
-    }
+    /// <summary>
+    /// Evicts stale entries from the NAT probe response-time dictionary.
+    /// </summary>
+    private void RemoveExpiredProbeLimitEntries(long nowTicks, long staleTicks) =>
+        RemoveExpiredEntries(_natProbeLastResponseTicks, nowTicks, staleTicks);
 
+    /// <summary>
+    /// Parses a NAT server packet body into an <see cref="IPEndPoint"/> (address family byte + address + port).
+    /// Returns null if the body is malformed or too short.
+    /// </summary>
     private static IPEndPoint? TryParsePeerEndPoint(ReadOnlySpan<byte> body)
     {
         if (body.Length < 1)
@@ -429,19 +455,23 @@ public sealed partial class IngressEngine
         ReadOnlySpan<byte> rest = body[1..];
         if (addrFamily == 4 && rest.Length >= 6)
         {
-            IPAddress ip = new(rest[..4].ToArray());
+            IPAddress ip = new(rest[..4]);
             ushort port = (ushort)(rest[4] | (rest[5] << 8));
             return new(ip, port);
         }
         if (addrFamily == 6 && rest.Length >= 18)
         {
-            IPAddress ip = new(rest[..16].ToArray());
+            IPAddress ip = new(rest[..16]);
             ushort port = (ushort)(rest[16] | (rest[17] << 8));
             return new(ip, port);
         }
         return null;
     }
 
+    /// <summary>
+    /// Processes an inbound handshake: checks blacklist, connection cap, replay cache,
+    /// and signature validation. Registers the connection on success and sends a handshake-ack.
+    /// </summary>
     private void ProcessHandshake(IPEndPoint fromEndPoint, byte[] buffer, int headerSize, int length, CancellationToken cancellationToken)
     {
         ReadOnlySpan<byte> handshakePayload = buffer.AsSpan(headerSize, length - headerSize);
@@ -498,17 +528,30 @@ public sealed partial class IngressEngine
         }
     }
 
-    private void RemoveExpiredHandshakeEntries(long nowTicks, long staleTicks)
+    /// <summary>
+    /// Evicts stale entries from the handshake replay cache.
+    /// </summary>
+    private void RemoveExpiredHandshakeEntries(long nowTicks, long staleTicks) =>
+        RemoveExpiredEntries(_seenHandshakes, nowTicks, staleTicks);
+
+    /// <summary>
+    /// Generic helper that removes entries from a <see cref="ConcurrentDictionary{TKey, Long}"/>
+    /// whose tick-valued values are older than <paramref name="staleTicks"/> relative to <paramref name="nowTicks"/>.
+    /// </summary>
+    private static void RemoveExpiredEntries<TKey>(ConcurrentDictionary<TKey, long> dictionary, long nowTicks, long staleTicks)
+        where TKey : notnull
     {
-        foreach (KeyValuePair<ulong, long> entry in _seenHandshakes)
+        foreach (KeyValuePair<TKey, long> entry in dictionary)
         {
             if (nowTicks - entry.Value > staleTicks)
-                _seenHandshakes.TryRemove(entry.Key, out _);
+                dictionary.TryRemove(entry.Key, out _);
         }
     }
 
-    // Zero-allocation dictionary key covering both IPv4 (4 bytes -> lower half of _upper64, _lower64 = 0)
-    // and IPv6 (16 bytes split across _upper64 and _lower64 via stackalloc + MemoryMarshal).
+    /// <summary>
+    /// Zero-allocation dictionary key covering both IPv4 (4 bytes packed into <c>_upper64</c>)
+    /// and IPv6 (16 bytes split across <c>_upper64</c> and <c>_lower64</c> via stackalloc + MemoryMarshal).
+    /// </summary>
     private readonly struct IpKey : IEquatable<IpKey>
     {
         private readonly ulong _upper64;
@@ -520,6 +563,9 @@ public sealed partial class IngressEngine
             _lower64 = lower64;
         }
 
+        /// <summary>
+        /// Creates an <see cref="IpKey"/> from the raw bytes of the given <paramref name="address"/>.
+        /// </summary>
         public static IpKey From(IPAddress address)
         {
             if (address.AddressFamily == AddressFamily.InterNetwork)

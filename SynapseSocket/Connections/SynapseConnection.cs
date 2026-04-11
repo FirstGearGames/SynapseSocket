@@ -80,6 +80,8 @@ public sealed class SynapseConnection
     /// <summary>
     /// Creates a new connection record.
     /// </summary>
+    /// <param name="remoteEndPoint">The peer's remote endpoint.</param>
+    /// <param name="signature">The 64-bit signature that uniquely identifies this peer.</param>
     public SynapseConnection(IPEndPoint remoteEndPoint, ulong signature)
     {
         RemoteEndPoint = remoteEndPoint ?? throw new ArgumentNullException(nameof(remoteEndPoint));

@@ -18,6 +18,9 @@ public sealed class ConnectionManager
     public int Count => _byEndPoint.Count;
     private readonly ConcurrentDictionary<EndPointKey, SynapseConnection> _byEndPoint = [];
 
+    /// <summary>
+    /// Reverse lookup: maps a connection's 64-bit signature to its <see cref="SynapseConnection"/>.
+    /// </summary>
     private readonly ConcurrentDictionary<ulong, SynapseConnection> _bySignature = [];
 
     /// <summary>

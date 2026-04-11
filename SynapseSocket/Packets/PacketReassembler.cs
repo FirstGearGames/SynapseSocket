@@ -128,10 +128,23 @@ public sealed class PacketReassembler : PacketSegmenter
         base.OnReturn();
     }
 
+    /// <summary>
+    /// Tracks the in-progress reassembly of a single segmented payload identified by its segment ID.
+    /// Stores arriving segments by index and produces the final payload once all have arrived.
+    /// </summary>
     private sealed class SegmentAssembly : IPoolResettable
     {
+        /// <summary>
+        /// Expected total number of segments for this payload.
+        /// </summary>
         public int SegmentCount => _segmentCount;
+        /// <summary>
+        /// Tick timestamp of the first segment received, used for assembly timeout eviction.
+        /// </summary>
         public long FirstReceivedTicks;
+        /// <summary>
+        /// Whether this assembly belongs to the reliable channel.
+        /// </summary>
         public bool IsReliable;
 
         // _segments is rented from ListPool on Initialize; each slot is pre-filled with null
@@ -152,7 +165,10 @@ public sealed class PacketReassembler : PacketSegmenter
         /// </summary>
         private int _totalLength;
         public SegmentAssembly() { }
-        
+
+        /// <summary>
+        /// Prepares the assembly for a new segmented payload with the given segment count and reliability flag.
+        /// </summary>
         public void Initialize(byte segmentCount, bool isReliable)
         {
             _segmentCount = segmentCount;
@@ -163,6 +179,10 @@ public sealed class PacketReassembler : PacketSegmenter
                 _segments.Add(null);
         }
 
+        /// <summary>
+        /// Stores a segment at the given index, copying its data into a pooled buffer.
+        /// Duplicate indices are silently ignored.
+        /// </summary>
         public void Add(byte segmentIndex, ReadOnlySpan<byte> segmentData)
         {
             if (_segments![segmentIndex].Array is not null)

@@ -70,6 +70,9 @@ public sealed class Telemetry
         IsEnabled = isEnabled;
     }
 
+    /// <summary>
+    /// Records an inbound packet, incrementing both the byte and packet counters.
+    /// </summary>
     internal void OnReceived(int bytes)
     {
         if (!IsEnabled) return;
@@ -77,6 +80,9 @@ public sealed class Telemetry
         Interlocked.Increment(ref _packetsIn);
     }
 
+    /// <summary>
+    /// Records an outbound packet, incrementing both the byte and packet counters.
+    /// </summary>
     internal void OnSent(int bytes)
     {
         if (!IsEnabled) return;
@@ -84,24 +90,36 @@ public sealed class Telemetry
         Interlocked.Increment(ref _packetsOut);
     }
 
+    /// <summary>
+    /// Records an inbound packet that was dropped by the security filter.
+    /// </summary>
     internal void OnDroppedIn()
     {
         if (!IsEnabled) return;
         Interlocked.Increment(ref _packetsDroppedIn);
     }
 
+    /// <summary>
+    /// Records an outbound packet that was dropped by the latency simulator.
+    /// </summary>
     internal void OnDroppedOut()
     {
         if (!IsEnabled) return;
         Interlocked.Increment(ref _packetsDroppedOut);
     }
 
+    /// <summary>
+    /// Records a reliable-channel retransmission triggered by the maintenance sweep.
+    /// </summary>
     internal void OnReliableResend()
     {
         if (!IsEnabled) return;
         Interlocked.Increment(ref _reliableResends);
     }
 
+    /// <summary>
+    /// Records a packet considered lost after exhausting all reliable retransmission attempts.
+    /// </summary>
     internal void OnLost()
     {
         if (!IsEnabled) return;

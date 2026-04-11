@@ -27,10 +27,12 @@ public sealed class ConnectionEventArgs : EventArgs, IPoolResettable
         Connection = synapseConnection;
     }
 
+    /// <inheritdoc/>
     public void OnReturn()
     {
         Connection = null;
     }
+    /// <inheritdoc/>
     public void OnRent()
     {
     }

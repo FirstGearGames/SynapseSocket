@@ -40,11 +40,13 @@ public sealed class ConnectionFailedEventArgs : EventArgs, IPoolResettable
         Message = message;
     }
 
+    /// <inheritdoc/>
     public void OnReturn()
     {
         EndPoint = null;
         Message = null;
     }
+    /// <inheritdoc/>
     public void OnRent()
     {
     }

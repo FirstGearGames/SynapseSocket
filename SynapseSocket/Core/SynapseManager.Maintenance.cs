@@ -14,6 +14,9 @@ namespace SynapseSocket.Core;
 /// </summary>
 public sealed partial class SynapseManager
 {
+    /// <summary>
+    /// Background loop that periodically runs keep-alive, retransmit, and segment-timeout sweeps.
+    /// </summary>
     private async Task MaintenanceLoopAsync(CancellationToken cancellationToken)
     {
         int maintenanceLoopDelayMilliseconds = 50;

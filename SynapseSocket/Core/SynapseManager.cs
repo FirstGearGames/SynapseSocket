@@ -414,6 +414,9 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             await Task.WhenAny(Task.WhenAll(pendingTasks), Task.Delay(5000)).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Closes and disposes all bound sockets, swallowing any exceptions.
+    /// </summary>
     private void CloseSockets()
     {
         foreach (Socket socket in _sockets)
@@ -433,8 +436,14 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         _sockets.Clear();
     }
 
+    /// <summary>
+    /// Forwards a background-loop exception to the <see cref="UnhandledException"/> event.
+    /// </summary>
     private void OnUnhandledException(Exception exception) => UnhandledException?.Invoke(exception);
 
+    /// <summary>
+    /// Throws <see cref="InvalidOperationException"/> if the engine is not currently running.
+    /// </summary>
     private void EnsureRunning()
     {
         if (!_isStarted || _sender is null || _isDisposed)
@@ -481,6 +490,10 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Atomically detaches and returns the splitter and reassembler on <paramref name="synapseConnection"/>
+    /// to their respective pools. Safe to call even when neither was ever rented.
+    /// </summary>
     private static void ReturnConnectionSegmenters(SynapseConnection synapseConnection)
     {
         PacketSplitter? splitter = Interlocked.Exchange(ref synapseConnection.Splitter, null);
@@ -492,6 +505,10 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             ResettableObjectPool<PacketReassembler>.Return(reassembler);
     }
 
+    /// <summary>
+    /// Ingress callback: wraps the delivered payload in a pooled <see cref="PacketReceivedEventArgs"/>
+    /// and raises <see cref="PacketReceived"/>. Returns the payload buffer to the pool in the finally block.
+    /// </summary>
     private void OnPayloadDelivered(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable)
     {
         PacketReceivedEventArgs packetReceivedEventArgs = ResettableObjectPool<PacketReceivedEventArgs>.Rent();
@@ -509,6 +526,9 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Ingress callback: raises <see cref="ConnectionEstablished"/> via a pooled <see cref="ConnectionEventArgs"/>.
+    /// </summary>
     private void OnConnectionEstablishedInternal(SynapseConnection synapseConnection)
     {
         ConnectionEventArgs connectionEventArgs = ResettableObjectPool<ConnectionEventArgs>.Rent();
@@ -524,6 +544,9 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Ingress callback: raises <see cref="ConnectionClosed"/> via a pooled <see cref="ConnectionEventArgs"/>.
+    /// </summary>
     private void OnConnectionClosedInternal(SynapseConnection synapseConnection)
     {
         ConnectionEventArgs connectionEventArgs = ResettableObjectPool<ConnectionEventArgs>.Rent();
@@ -539,6 +562,9 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Raises <see cref="PacketSent"/> via a pooled <see cref="PacketSentEventArgs"/>.
+    /// </summary>
     private void RaisePacketSent(IPEndPoint endPoint, ArraySegment<byte> payload, bool isReliable)
     {
         PacketSentEventArgs packetSentEventArgs = ResettableObjectPool<PacketSentEventArgs>.Rent();
@@ -554,6 +580,9 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Raises <see cref="ConnectionClosed"/> via a pooled <see cref="ConnectionEventArgs"/>.
+    /// </summary>
     private void RaiseConnectionClosed(SynapseConnection synapseConnection)
     {
         ConnectionEventArgs connectionEventArgs = ResettableObjectPool<ConnectionEventArgs>.Rent();
@@ -569,6 +598,9 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Raises <see cref="ConnectionFailed"/> via a pooled <see cref="ConnectionFailedEventArgs"/>.
+    /// </summary>
     private void RaiseConnectionFailed(IPEndPoint? endPoint, ConnectionRejectedReason connectionRejectedReason, string? message)
     {
         ConnectionFailedEventArgs connectionFailedEventArgs = ResettableObjectPool<ConnectionFailedEventArgs>.Rent();
@@ -584,6 +616,10 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Removes the connection for <paramref name="endPoint"/>, returns pooled resources,
+    /// and optionally blacklists the computed signature.
+    /// </summary>
     private void DisconnectAndBlacklist(IPEndPoint endPoint, bool canBlacklist)
     {
         if (Connections.Remove(endPoint, out SynapseConnection? synapseConnection) && synapseConnection is not null)

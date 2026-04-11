@@ -9,7 +9,13 @@ namespace SynapseSocket.Security;
 /// </summary>
 public sealed class DefaultSignatureProvider : ISignatureProvider
 {
+    /// <summary>
+    /// FNV-1a 64-bit offset basis.
+    /// </summary>
     private const ulong FnvOffset = 14695981039346656037UL;
+    /// <summary>
+    /// FNV-1a 64-bit prime multiplier.
+    /// </summary>
     private const ulong FnvPrime = 1099511628211UL;
 
     /// <inheritdoc/>

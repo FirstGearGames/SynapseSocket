@@ -15,16 +15,26 @@ namespace SynapseSocket.Transport;
 /// </summary>
 public sealed partial class TransmissionEngine
 {
+    /// <summary>
+    /// Sends a NAT registration packet to the rendezvous server for the given session.
+    /// </summary>
     public Task SendNatRegisterAsync(IPEndPoint target, string sessionId, CancellationToken cancellationToken)
     {
         return SendNatServerPacketAsync(target, NatPacketType.Register, sessionId, cancellationToken);
     }
 
+    /// <summary>
+    /// Sends a NAT heartbeat packet to the rendezvous server to keep the session alive.
+    /// </summary>
     public Task SendNatHeartbeatAsync(IPEndPoint target, string sessionId, CancellationToken cancellationToken)
     {
         return SendNatServerPacketAsync(target, NatPacketType.Heartbeat, sessionId, cancellationToken);
     }
 
+    /// <summary>
+    /// Builds and sends a NAT server packet (register or heartbeat) with the session identifier
+    /// encoded as a fixed-length ASCII payload.
+    /// </summary>
     private Task SendNatServerPacketAsync(IPEndPoint target, NatPacketType packetType, string sessionId, CancellationToken cancellationToken)
     {
         const PacketFlags Flags = PacketFlags.Extended;
@@ -39,6 +49,9 @@ public sealed partial class TransmissionEngine
         return SendAndPoolBufferAsync(new(rentedBuffer, 0, totalSize), target, cancellationToken);
     }
 
+    /// <summary>
+    /// Sends a minimal NAT probe (extended header, no body) to open a NAT mapping on the remote side.
+    /// </summary>
     public Task SendNatProbeAsync(IPEndPoint target, CancellationToken cancellationToken)
     {
         const PacketFlags Flags = PacketFlags.Extended;

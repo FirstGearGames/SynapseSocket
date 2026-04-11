@@ -83,11 +83,17 @@ public sealed partial class SynapseManager
     // Internal callbacks — wired by StartAsync
     // -------------------------------------------------------------------------
 
+    /// <summary>
+    /// Completes the pending NAT rendezvous with the peer's external endpoint.
+    /// </summary>
     internal void OnNatPeerReady(IPEndPoint peerEndPoint)
     {
         _natPeerSource?.TrySetResult(peerEndPoint);
     }
 
+    /// <summary>
+    /// Faults the pending NAT rendezvous because the server reported the session is full.
+    /// </summary>
     internal void OnNatSessionFull()
     {
         _natPeerSource?.TrySetException(
@@ -98,6 +104,10 @@ public sealed partial class SynapseManager
     // Background tasks
     // -------------------------------------------------------------------------
 
+    /// <summary>
+    /// Registers with the NAT rendezvous server and sends periodic heartbeats
+    /// until the peer is matched or the operation is cancelled.
+    /// </summary>
     private async Task NatServerRegistrationAsync(CancellationToken cancellationToken)
     {
         IPEndPoint serverEndPoint = Config.NatTraversal.Server.ServerEndPoint!;
@@ -120,6 +130,11 @@ public sealed partial class SynapseManager
         catch (Exception unexpectedException) { UnhandledException?.Invoke(unexpectedException); }
     }
 
+    /// <summary>
+    /// Sends timed probe bursts to open NAT mappings, followed by a handshake on each attempt.
+    /// Raises <see cref="ConnectionFailed"/> with <see cref="ConnectionRejectedReason.NatTraversalFailed"/>
+    /// if all attempts are exhausted without establishing a connection.
+    /// </summary>
     private async Task NatPunchAsync(SynapseConnection synapseConnection, IPEndPoint endPoint, CancellationToken cancellationToken)
     {
         try

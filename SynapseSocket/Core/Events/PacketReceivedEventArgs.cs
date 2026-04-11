@@ -43,11 +43,13 @@ public sealed class PacketReceivedEventArgs : EventArgs, IPoolResettable
         IsReliable = isReliable;
     }
 
+    /// <inheritdoc/>
     public void OnReturn()
     {
         Connection = null;
         Payload = default;
     }
+    /// <inheritdoc/>
     public void OnRent()
     {
     }

@@ -24,6 +24,10 @@ public sealed partial class IngressEngine
     /// </summary>
     public event NatSessionFullDelegate? NatSessionFull;
 
+    /// <summary>
+    /// Handles an inbound NAT probe from an unrecognised endpoint.
+    /// Responds with a probe + handshake, subject to per-IP rate limiting.
+    /// </summary>
     private void ProcessNatProbe(IPEndPoint fromEndPoint, CancellationToken cancellationToken)
     {
         if (_config.NatTraversal.Mode == NatTraversalMode.Disabled)
@@ -61,6 +65,10 @@ public sealed partial class IngressEngine
         _ = _sender.SendHandshakeAsync(fromEndPoint, cancellationToken);
     }
     
+    /// <summary>
+    /// Routes an inbound packet from the configured NAT rendezvous server
+    /// to the appropriate handler (PeerReady, SessionFull, HeartbeatAck).
+    /// </summary>
     private void ProcessNatServerPacket(IPEndPoint fromEndPoint, ReadOnlySpan<byte> payload)
     {
         if (_config.NatTraversal.Mode != NatTraversalMode.Server)

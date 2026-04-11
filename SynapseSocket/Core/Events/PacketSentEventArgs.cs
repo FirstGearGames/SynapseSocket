@@ -41,11 +41,13 @@ public sealed class PacketSentEventArgs : EventArgs, IPoolResettable
         IsReliable = isReliable;
     }
 
+    /// <inheritdoc/>
     public void OnReturn()
     {
         EndPoint = null;
         Payload = default;
     }
 
+    /// <inheritdoc/>
     public void OnRent() { }
 }
