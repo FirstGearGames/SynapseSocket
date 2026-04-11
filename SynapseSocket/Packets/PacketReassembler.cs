@@ -165,9 +165,8 @@ public sealed class PacketReassembler : PacketSegmenter
         /// <summary>
         /// Expected total number of segments for this payload.
         /// </summary>
-        public uint SegmentCount => _segmentCount;
         [PoolResettableMember]
-        private uint _segmentCount;
+        public uint SegmentCount { get; private set; }
         /// <summary>
         /// Tick timestamp of the first segment received, used for assembly timeout eviction.
         /// </summary>
@@ -207,7 +206,7 @@ public sealed class PacketReassembler : PacketSegmenter
         [PoolResettableMethod]
         public void Initialize(byte segmentCount, bool isReliable)
         {
-            _segmentCount = segmentCount;
+            SegmentCount = segmentCount;
             IsReliable = isReliable;
 
             _segments = ListPool<ArraySegment<byte>>.Rent();
@@ -248,7 +247,7 @@ public sealed class PacketReassembler : PacketSegmenter
         public bool TryGetAssembledSegments(out ArraySegment<byte> assembledSegment)
         {
             // Exit if all segments have not been received.
-            if (_receivedCount != _segmentCount)
+            if (_receivedCount != SegmentCount)
             {
                 assembledSegment = default;
                 return false;
@@ -257,7 +256,7 @@ public sealed class PacketReassembler : PacketSegmenter
             byte[] reassembledBytes = ArrayPool<byte>.Shared.Rent((int)_totalLength);
 
             int offset = 0;
-            for (int i = 0; i < _segmentCount; i++)
+            for (int i = 0; i < SegmentCount; i++)
             {
                 int segmentLength = _segments![i].Count;
                 Buffer.BlockCopy(_segments![i].Array!, srcOffset: 0, dst: reassembledBytes, offset, count: segmentLength);
@@ -283,7 +282,7 @@ public sealed class PacketReassembler : PacketSegmenter
                 ListPool<ArraySegment<byte>>.ReturnAndNullifyReference(ref _segments);
             }
 
-            _segmentCount = 0;
+            SegmentCount = 0;
             _receivedCount = 0;
             _totalLength = 0;
             FirstReceivedTicks = 0;
