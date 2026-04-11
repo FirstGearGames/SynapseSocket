@@ -10,16 +10,12 @@
 
 | # | Vulnerability | Severity | File | Category |
 |---|---|---|---|---|
-| 3 | Reorder buffer accepts arbitrarily high sequence numbers | CRITICAL | `IngressEngine.cs` | Resource Exhaustion |
-| 4 | ACK forgery — no validation that sequence was ever sent | HIGH | `IngressEngine.cs` | State Machine |
-| 5 | Handshake replay cache TTL too short (30 s) | HIGH | `IngressEngine.cs` | Replay |
 | 6 | NAT probe sends two responses — amplification vector | HIGH | `IngressEngine.Nat.cs` | Amplification |
 | 7 | Rate limiting counts packets only, not bytes | HIGH | `SecurityProvider.cs` | Resource Exhaustion |
 | 8 | Segment count not validated against actual payload bytes | HIGH | `IngressEngine.cs` | Resource Exhaustion |
 | 9 | Handshake nonce generated but never echoed or validated | MEDIUM | `TransmissionEngine.cs` | Replay |
 | 10 | Default signature ignores port — same-IP collision | MEDIUM | `DefaultSignatureProvider.cs` | Spoofing |
 | 11 | NAT session ID too short (6 chars ≈ 2.1 billion) | MEDIUM | `ServerNatConfig.cs` | Brute-force |
-| 12 | No packet-level authentication (no HMAC / AEAD) | LOW | System-wide | Integrity |
 | 13 | No ACK batching — ACK flood possible | LOW | `IngressEngine.cs` | Flooding |
 | 14 | Keep-alive rate not adaptive | LOW | `SynapseManager.Maintenance.cs` | Efficiency |
 
@@ -47,63 +43,26 @@ This entry has been removed from the active vulnerability list.
 
 ---
 
-### V3 — Reorder Buffer Accepts Arbitrarily High Sequence Numbers (Memory Exhaustion)
+### V3 — Reorder Buffer Unbounded Growth *(Not a valid vulnerability)*
 
-**Severity:** CRITICAL  
-**Files:** `SynapseSocket/Transport/IngressEngine.cs` (lines ~447–494)  
-**Category:** Resource exhaustion / DDoS
-
-**Description:**  
-Out-of-order reliable packets are stored in `ReorderBuffer`. There is no check that the incoming sequence number falls within a sane window ahead of `NextExpectedSequence`. An attacker can send packets with sequence numbers far in the future (e.g., `NextExpectedSequence + 60 000`), filling the buffer and holding memory until the connection times out.
-
-**Exploit:**
-1. Establish a connection (so the engine processes reliable packets).
-2. Send a burst of reliable packets with sequence numbers 1 000, 2 000, 3 000, … (never sending the expected intermediate sequences).
-3. Each packet is stored in the reorder buffer. No gap window is enforced.
-4. Repeat across many connections for a distributed memory-exhaustion attack.
-
-**Suggested fix:**  
-Before buffering, validate `(ushort)(sequence - NextExpectedSequence) <= MAX_REORDER_WINDOW` (e.g., 64 or 128). Packets outside the window should be discarded.
+**Severity:** REMOVED  
+**Reason:** The reorder buffer does not overflow — it simply holds packets waiting for gaps to be filled. `MaximumOutOfOrderReliablePackets = 64` (default) caps it: once the buffer reaches that count the peer is kicked and blacklisted regardless of how wide the sequence gaps are. A window-gap check would only be a minor early-out optimization, not a missing safeguard. On disconnect or timeout, `ReturnReorderBufferToPool` clears all buffered memory. No unbounded growth is possible.
 
 ---
 
 ## High Severity Vulnerabilities
 
-### V4 — ACK Forgery: No Validation That Sequence Was Pending
+### V4 — ACK Forgery *(Not a valid vulnerability)*
 
-**Severity:** HIGH  
-**Files:** `SynapseSocket/Transport/IngressEngine.cs` (lines ~299–304)  
-**Category:** State machine attack
-
-**Description:**  
-When a packet with `PacketFlags.Ack` arrives, the engine calls `PendingReliableQueue.TryRemove(sequence, ...)` and immediately returns. If the ACK's sequence number was never sent by this peer the `TryRemove` simply returns `false` — but critically, no error is raised and all subsequent processing is skipped (the `return` after it). An off-path attacker who can spoof the server's IP can send ACKs for sequences that *are* in the queue, silently removing pending retransmissions and causing the sender to believe delivery was confirmed when it was not.
-
-**Exploit:**
-1. Observe (or guess) active sequence numbers in the reliable queue.
-2. Send a forged ACK from the peer's endpoint with the matching sequence number.
-3. The sender removes the entry and stops retransmitting. The real receiver never gets the data.
-
-**Suggested fix:**  
-This is inherently a UDP spoofing risk. Mitigations: HMAC on all packets (see V12) to make forgery infeasible; rate-limit forged-ACK impact by requiring a session secret in the ACK payload.
+**Severity:** REMOVED  
+**Reason:** `PendingReliableQueue` is scoped to the individual `SynapseConnection`. A peer sending forged ACKs is only suppressing retransmission of their own packets — something they could achieve simply by not sending them. Affecting another peer's queue requires IP spoofing, which is out of scope.
 
 ---
 
-### V5 — Handshake Replay Cache TTL Too Short
+### V5 — Handshake Replay Cache TTL Too Short *(Not a valid vulnerability)*
 
-**Severity:** HIGH  
-**Files:** `SynapseSocket/Transport/IngressEngine.cs` (lines ~561–577)  
-**Category:** Replay attack
-
-**Description:**  
-The handshake replay detection cache expires entries after `2 × TimeoutMilliseconds` (default: 15 000 ms × 2 = 30 seconds). A captured handshake packet can be replayed any time after 30 seconds to force a connection reset or establish a new connection with the old peer credentials.
-
-**Exploit:**
-1. Capture a valid handshake packet.
-2. Wait 31 seconds.
-3. Replay it — the cache entry has expired and the handshake is treated as fresh.
-
-**Suggested fix:**  
-Extend TTL to at minimum 1 hour. Better: embed a monotonic timestamp and a random nonce in the handshake payload; reject handshakes with timestamps older than N seconds regardless of cache state.
+**Severity:** REMOVED  
+**Reason:** The nonce in the handshake payload makes every legitimate handshake's signature unique — a replay of the same bytes produces the same signature and is rejected. The TTL is just cache housekeeping to prevent unbounded growth, not the primary replay defense. Furthermore, line 590 (`isNewConnection || State != Connected`) means a replay against an already-established connection is silently ignored even if a cache entry did expire. The only remaining scenario requires the attacker to receive the server's response, which means controlling the victim's IP — out of scope.
 
 ---
 
@@ -211,20 +170,6 @@ Use at least 12–16 characters (36^12 ≈ 4.7 × 10^18) or switch to UUID v4. A
 
 ## Low Severity / Design Issues
 
-### V12 — No Packet-Level Authentication (No HMAC or AEAD)
-
-**Severity:** LOW (Design-level decision)  
-**Files:** System-wide  
-**Category:** Integrity / confidentiality
-
-**Description:**  
-Packets carry no HMAC, MAC, or AEAD tag. Any on-path or off-path attacker with knowledge of the packet format can forge or mutate packets. All higher-level defenses (ACK validation, sequence windows, etc.) rely on correct packet contents that an attacker can freely manipulate.
-
-**Suggested fix:**  
-For security-sensitive deployments, wrap the transport in DTLS or apply HMAC-SHA256 (or ChaCha20-Poly1305) per packet using a session key established during the handshake.
-
----
-
 ### V13 — No ACK Batching: ACK Flood Possible
 
 **Severity:** LOW  
@@ -257,11 +202,8 @@ Reset the keep-alive timer on any received packet; only send keep-alives during 
 
 | Priority | Item | Reason |
 |---|---|---|
-| 1 | V3 — Reorder buffer window enforcement | Trivial to exploit for memory exhaustion across many connections |
-| 2 | V6 — NAT probe amplification | Easy reflection vector, small code change to fix |
+| 1 | V6 — NAT probe amplification | Easy reflection vector, small code change to fix |
 | 3 | V7 — Byte-rate limiting | Packet-only rate limiting is trivially bypassed |
-| 4 | V5 — Replay cache TTL | 30 seconds is dangerously short for session replay protection |
 | 5 | V8 — Max concurrent assemblies per connection | Prevents low-cost memory exhaustion via fake segment counts |
 | 6 | V10 — Port in signature hash | One-line fix, eliminates same-IP collision |
-| 7 | V4 — ACK forgery | Requires HMAC for full mitigation; document the risk |
 | 8 | V11 — NAT session ID length | Increase to 12+ characters |
