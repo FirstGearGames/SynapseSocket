@@ -10,8 +10,6 @@
 
 | # | Vulnerability | Severity | File | Category |
 |---|---|---|---|---|
-| 1 | Sequence number wrapping (16-bit) — replay after wrap | CRITICAL | `SynapseConnection.cs` | Replay |
-| 2 | Segment ID reuse / wrapping | CRITICAL | `PacketSplitter.cs` | State Machine |
 | 3 | Reorder buffer accepts arbitrarily high sequence numbers | CRITICAL | `IngressEngine.cs` | Resource Exhaustion |
 | 4 | ACK forgery — no validation that sequence was ever sent | HIGH | `IngressEngine.cs` | State Machine |
 | 5 | Handshake replay cache TTL too short (30 s) | HIGH | `IngressEngine.cs` | Replay |
@@ -29,42 +27,23 @@
 
 ## Critical Vulnerabilities
 
-### V1 — Sequence Number Wrapping: Replay After Wrap
+### V1 — Sequence Number Wrapping *(Not a valid vulnerability)*
 
-**Severity:** CRITICAL  
-**Files:** `SynapseSocket/Connections/SynapseConnection.cs` (lines ~43, ~48)  
-**Category:** Replay attack
-
-**Description:**  
-`NextOutgoingSequence` and `NextExpectedSequence` are both `ushort` (16-bit), wrapping at 65 536. There is no detection of wrap-around, so after 65 536 reliable packets the counter resets to 0. Any packet from the very first exchange (sequence = 0, 1, 2, …) becomes valid again.
-
-**Exploit:**
-1. Send 65 536 reliable packets to force the remote counter to wrap back to 0.
-2. Re-transmit a captured packet from the beginning of the session (e.g., sequence = 0).
-3. The receiver's `NextExpectedSequence` is now 0, so it accepts the old packet as a new one.
-
-**Suggested fix:**  
-Extend to `uint` (32-bit) sequence numbers and implement an RFC-793-style acceptance window (`if ((int)(sequence - NextExpectedSequence) < 0 || > WINDOW_SIZE) reject`). A 32-bit counter at 1 000 packets/second wraps in ~49 days — long enough that replay of old packets is impractical.
+**Severity:** REMOVED  
+**Reason:** Sequence numbers and the reorder buffer are per-`SynapseConnection`. Any "attacker" exploiting the wrap can only affect their own session — they are the peer on that connection and can already send arbitrary bytes. Affecting a *different* peer's session would require spoofing that peer's source `IPEndPoint`, which is the V12 (no HMAC) problem, not a sequence-number problem. Removed from the active list.
 
 ---
 
-### V2 — Segment ID Reuse After Integer Wrap
+### V2 — Segment ID Reuse After Wrap *(Not a valid vulnerability)*
 
-**Severity:** CRITICAL  
-**Files:** `SynapseSocket/Packets/PacketSplitter.cs` (lines ~18, ~44)  
-**Category:** State machine / reassembly corruption
+**Severity:** REMOVED  
+**Reason:** The original analysis was incorrect. The `PacketReassembler` removes completed assemblies from `_currentSegments` immediately on success (`_currentSegments.Remove(segmentId)` at line 101). Multiple additional safeguards make an exploitable collision effectively impossible:
 
-**Description:**  
-Segment IDs come from a monotonically incrementing `int` field cast to `ushort`. The cast silently discards the upper bits, so the effective range is 0–65 535. An attacker can force segment-ID reuse by simply sending enough segments, or — because the ID is only 16-bit — by starting a second fragmented message that collides with an already-in-progress reassembly.
+- `_maximumConcurrentAssemblies` caps concurrent in-progress assemblies; an old incomplete assembly would have been evicted by this cap long before 65 536 new segmented sends complete.
+- `RemoveExpiredSegments` timeout eviction clears any assemblies that do linger.
+- Protocol violation detection (lines 85–95) catches a reused ID that arrives with a different `segmentCount` or `isReliable` flag, raising a `ViolationReason.Malformed` event.
 
-**Exploit:**
-1. Begin a large segmented message (segment ID = X, partial — only first segment sent).
-2. After 65 536 more segments, a new message gets segment ID = X again.
-3. The second message's segments are appended to the first message's incomplete `SegmentAssembly`.
-4. When the assembly completes, a corrupted payload is delivered to the application.
-
-**Suggested fix:**  
-Use a `uint` or `ulong` segment ID with documented wrap semantics, and include a per-connection epoch or a timestamp component so recycled IDs are distinguishable.
+This entry has been removed from the active vulnerability list.
 
 ---
 
@@ -281,10 +260,8 @@ Reset the keep-alive timer on any received packet; only send keep-alives during 
 | 1 | V3 — Reorder buffer window enforcement | Trivial to exploit for memory exhaustion across many connections |
 | 2 | V6 — NAT probe amplification | Easy reflection vector, small code change to fix |
 | 3 | V7 — Byte-rate limiting | Packet-only rate limiting is trivially bypassed |
-| 4 | V1 — Sequence number wrapping | Foundational reliability and replay protection gap |
-| 5 | V5 — Replay cache TTL | 30 seconds is dangerously short for session replay protection |
-| 6 | V8 — Max concurrent assemblies per connection | Prevents low-cost memory exhaustion via fake segment counts |
-| 7 | V10 — Port in signature hash | One-line fix, eliminates same-IP collision |
-| 8 | V4 — ACK forgery | Requires HMAC for full mitigation; document the risk |
-| 9 | V11 — NAT session ID length | Increase to 12+ characters |
-| 10 | V2 — Segment ID wrap | Extend to 32-bit with per-connection epoch |
+| 4 | V5 — Replay cache TTL | 30 seconds is dangerously short for session replay protection |
+| 5 | V8 — Max concurrent assemblies per connection | Prevents low-cost memory exhaustion via fake segment counts |
+| 6 | V10 — Port in signature hash | One-line fix, eliminates same-IP collision |
+| 7 | V4 — ACK forgery | Requires HMAC for full mitigation; document the risk |
+| 8 | V11 — NAT session ID length | Increase to 12+ characters |
