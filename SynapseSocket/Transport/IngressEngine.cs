@@ -103,6 +103,10 @@ public sealed partial class IngressEngine
     /// </summary>
     public event UnhandledExceptionDelegate? UnhandledException;
 
+    private const string ViolationSegmentAssemblyOversized = "Declared segment assembly size exceeds MaximumReassembledPacketSize.";
+    private const string ViolationSegmentMismatch = "Segment resent with mismatched segment count or reliability flag.";
+    private const string ViolationReorderBufferExceeded = "Reorder buffer capacity exceeded.";
+
     /// <summary>
     /// Creates a new ingress engine bound to the provided socket.
     /// </summary>
@@ -313,7 +317,7 @@ public sealed partial class IngressEngine
 
             case PacketType.Ack:
                 if (synapseConnection.PendingReliableQueue.TryRemove(sequence, out SynapseConnection.PendingReliable? acked))
-                    SynapseConnection.ReturnPendingReliableBuffers(acked);
+                    SynapseConnection.ReleasePendingReliable(acked);
                 return;
         }
 
@@ -333,7 +337,7 @@ public sealed partial class IngressEngine
                 _telemetry.OnDroppedIn();
                 ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature,
                     ViolationReason.Oversized, length,
-                    $"Declared segment assembly ({segmentCount} * {_config.MaximumTransmissionUnit} bytes) exceeds MaximumReassembledPacketSize",
+                    ViolationSegmentAssemblyOversized,
                     ViolationAction.KickAndBlacklist);
                 return;
             }
@@ -370,7 +374,7 @@ public sealed partial class IngressEngine
                         _telemetry.OnDroppedIn();
                         ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature,
                             ViolationReason.Malformed, length,
-                            $"Segment {segmentId} resent with mismatched segmentCount/reliability",
+                            ViolationSegmentMismatch,
                             ViolationAction.KickAndBlacklist);
                         ArrayPool<byte>.Shared.Return(payloadBuffer);
                         return;
@@ -399,7 +403,7 @@ public sealed partial class IngressEngine
                         _telemetry.OnDroppedIn();
                         ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature,
                             ViolationReason.Malformed, length,
-                            $"Segment {segmentId} resent with mismatched segmentCount/reliability",
+                            ViolationSegmentMismatch,
                             ViolationAction.KickAndBlacklist);
                         ArrayPool<byte>.Shared.Return(segmentPayloadBuffer);
                         return;
@@ -494,7 +498,7 @@ public sealed partial class IngressEngine
                         synapseConnection.Signature,
                         ViolationReason.Oversized,
                         0,
-                        $"Reorder buffer cap ({_config.MaximumOutOfOrderReliablePackets}) exceeded",
+                        ViolationReorderBufferExceeded,
                         ViolationAction.KickAndBlacklist);
                     return;
                 }

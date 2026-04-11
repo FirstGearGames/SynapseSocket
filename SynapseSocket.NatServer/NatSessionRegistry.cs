@@ -1,14 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
-using System.Text;
 using SynapseSocket.Core.Configuration;
 
 namespace SynapseSocket.NatServer;
 
 /// <summary>
-/// Tracks pending NAT rendezvous sessions keyed by a server-assigned alphanumeric session ID.
+/// Tracks pending NAT rendezvous sessions keyed by a server-assigned 6-digit numeric session ID.
 /// Sessions are created when a host sends <c>NatRequestSession</c> and remain open until the host
 /// explicitly closes them via <c>NatCloseSession</c> or the session times out.
 /// Multiple joiners may register against the same session ID; each is matched directly to the host.
@@ -42,7 +42,6 @@ internal sealed class NatSessionRegistry
         }
     }
 
-    private const string AlphaNumericChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     private const int SessionIdLength = ServerNatConfig.SessionIdLength;
 
     private readonly Dictionary<string, Entry> _sessions = new(StringComparer.Ordinal);
@@ -168,13 +167,10 @@ internal sealed class NatSessionRegistry
 
     private static string GenerateId()
     {
-        Span<byte> bytes = stackalloc byte[SessionIdLength];
+        Span<byte> bytes = stackalloc byte[4];
         RandomNumberGenerator.Fill(bytes);
-        StringBuilder stringBuilder = new(SessionIdLength);
-
-        foreach (byte b in bytes)
-            stringBuilder.Append(AlphaNumericChars[b % AlphaNumericChars.Length]);
-
-        return stringBuilder.ToString();
+        uint raw = MemoryMarshal.Read<uint>(bytes);
+        int id = (int)(raw % 900_000u) + 100_000;
+        return id.ToString();
     }
 }

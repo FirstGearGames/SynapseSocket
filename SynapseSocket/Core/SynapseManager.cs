@@ -287,6 +287,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
 
         ReturnConnectionSegmenters(synapseConnection);
         ReturnReorderBufferToPool(synapseConnection);
+        SynapseConnection.DrainPendingReliableQueue(synapseConnection);
         synapseConnection.State = ConnectionState.Disconnected;
         Connections.Remove(synapseConnection.RemoteEndPoint, out _);
 
@@ -640,6 +641,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         {
             ReturnConnectionSegmenters(synapseConnection);
             ReturnReorderBufferToPool(synapseConnection);
+            SynapseConnection.DrainPendingReliableQueue(synapseConnection);
             synapseConnection.State = ConnectionState.Disconnected;
             RaiseConnectionClosed(synapseConnection);
         }

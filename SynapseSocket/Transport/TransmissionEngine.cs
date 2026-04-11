@@ -5,6 +5,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using CodeBoost.Performance;
 using SynapseSocket.Connections;
 using SynapseSocket.Diagnostics;
 using SynapseSocket.Packets;
@@ -112,17 +113,15 @@ public sealed partial class TransmissionEngine
         const PacketType Type = PacketType.Reliable;
         int totalLength = PacketHeader.ComputeHeaderSize(Type) + payload.Count;
 
-        byte[] packetBuffer = new byte[totalLength];
+        byte[] packetBuffer = ArrayPool<byte>.Shared.Rent(totalLength);
         int written = PacketHeader.BuildPacket(packetBuffer.AsSpan(), Type, sequence, 0, 0, 0, payload.AsSpan());
 
-        SynapseConnection.PendingReliable pendingReliable = new()
-        {
-            Sequence = sequence,
-            Payload = packetBuffer,
-            PacketLength = written,
-            SentTicks = DateTime.UtcNow.Ticks,
-            Retries = 0
-        };
+        SynapseConnection.PendingReliable pendingReliable = ResettableObjectPool<SynapseConnection.PendingReliable>.Rent();
+        pendingReliable.Sequence = sequence;
+        pendingReliable.Payload = packetBuffer;
+        pendingReliable.PacketLength = written;
+        pendingReliable.SentTicks = DateTime.UtcNow.Ticks;
+        pendingReliable.Retries = 0;
         synapseConnection.PendingReliableQueue[sequence] = pendingReliable;
 
         await SendRawAsync(new(packetBuffer, 0, written), synapseConnection.RemoteEndPoint, cancellationToken).ConfigureAwait(false);
@@ -156,14 +155,12 @@ public sealed partial class TransmissionEngine
 
         if (isReliable)
         {
-            SynapseConnection.PendingReliable pendingReliable = new()
-            {
-                Sequence = sequence,
-                Segments = segments,
-                SegmentCount = segmentCount,
-                SentTicks = DateTime.UtcNow.Ticks,
-                Retries = 0
-            };
+            SynapseConnection.PendingReliable pendingReliable = ResettableObjectPool<SynapseConnection.PendingReliable>.Rent();
+            pendingReliable.Sequence = sequence;
+            pendingReliable.Segments = segments;
+            pendingReliable.SegmentCount = segmentCount;
+            pendingReliable.SentTicks = DateTime.UtcNow.Ticks;
+            pendingReliable.Retries = 0;
             synapseConnection.PendingReliableQueue[sequence] = pendingReliable;
 
             // Segments are now owned by PendingReliable; do NOT return them here.

@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
@@ -24,6 +25,21 @@ namespace SynapseSocket.NatServer;
 public sealed class NatServer : IDisposable
 {
     private static readonly int SessionIdBytes = ServerNatConfig.SessionIdLength;
+
+    /// <summary>
+    /// Immutable single-byte payload for <see cref="PacketType.NatHeartbeatAck"/>. Shared across all sends.
+    /// </summary>
+    private static readonly byte[] HeartbeatAckPacket = [(byte)PacketType.NatHeartbeatAck];
+
+    /// <summary>
+    /// Immutable single-byte payload for <see cref="PacketType.NatSessionFull"/>. Shared across all sends.
+    /// </summary>
+    private static readonly byte[] SessionFullPacket = [(byte)PacketType.NatSessionFull];
+
+    /// <summary>
+    /// Immutable single-byte payload for <see cref="PacketType.NatSessionUnavailable"/>. Shared across all sends.
+    /// </summary>
+    private static readonly byte[] SessionUnavailablePacket = [(byte)PacketType.NatSessionUnavailable];
 
     private readonly UdpClient _socket;
     private readonly NatSessionRegistry _registry;
@@ -182,10 +198,11 @@ public sealed class NatServer : IDisposable
     /// </summary>
     private void SendNatSessionCreated(IPEndPoint to, string sessionId)
     {
-        byte[] packet = new byte[1 + SessionIdBytes];
+        int size = 1 + SessionIdBytes;
+        byte[] packet = ArrayPool<byte>.Shared.Rent(size);
         packet[0] = (byte)PacketType.NatSessionCreated;
         System.Text.Encoding.ASCII.GetBytes(sessionId, 0, SessionIdBytes, packet, 1);
-        _ = _socket.SendAsync(packet, packet.Length, to);
+        _ = SendAndReturnAsync(packet, size, to);
     }
 
     /// <summary>
@@ -193,38 +210,41 @@ public sealed class NatServer : IDisposable
     /// </summary>
     private void SendPeerReady(IPEndPoint to, IPEndPoint peer)
     {
-        byte[] peerBytes = peer.Address.GetAddressBytes();
-        byte addrFamily = peerBytes.Length == 4 ? (byte)4 : (byte)6;
-        byte[] packet = new byte[1 + 1 + peerBytes.Length + 2];
+        // Maximum packet size: type (1) + address family (1) + IPv6 address (16) + port (2) = 20 bytes.
+        byte[] packet = ArrayPool<byte>.Shared.Rent(20);
         int offset = 0;
         packet[offset++] = (byte)PacketType.NatPeerReady;
-        packet[offset++] = addrFamily;
-        peerBytes.CopyTo(packet, offset);
-        offset += peerBytes.Length;
+
+        int addressFamilyOffset = offset++;
+
+        if (!peer.Address.TryWriteBytes(packet.AsSpan(offset), out int addressLength))
+        {
+            ArrayPool<byte>.Shared.Return(packet);
+            return;
+        }
+
+        packet[addressFamilyOffset] = addressLength == 4 ? (byte)4 : (byte)6;
+        offset += addressLength;
         packet[offset++] = (byte)(peer.Port & 0xFF);
-        packet[offset]   = (byte)((peer.Port >> 8) & 0xFF);
-        _ = _socket.SendAsync(packet, packet.Length, to);
+        packet[offset++] = (byte)((peer.Port >> 8) & 0xFF);
+
+        _ = SendAndReturnAsync(packet, offset, to);
     }
 
     /// <summary>
-    /// Sends a <see cref="PacketType.NatHeartbeatAck"/> packet.
+    /// Sends a <see cref="PacketType.NatHeartbeatAck"/> packet using the shared immutable buffer.
     /// </summary>
     private void SendHeartbeatAck(IPEndPoint to)
     {
-        byte[] packet = [(byte)PacketType.NatHeartbeatAck];
-        _ = _socket.SendAsync(packet, packet.Length, to);
+        _ = _socket.SendAsync(HeartbeatAckPacket, HeartbeatAckPacket.Length, to);
     }
 
-    /// <summary>
-    /// Sends a <see cref="PacketType.NatSessionFull"/> packet indicating the session was not found or is already full.
-    /// </summary>
     /// <summary>
     /// Sends a <see cref="PacketType.NatSessionFull"/> packet indicating the session was not found or is already full.
     /// </summary>
     private void SendSessionFull(IPEndPoint to)
     {
-        byte[] packet = [(byte)PacketType.NatSessionFull];
-        _ = _socket.SendAsync(packet, packet.Length, to);
+        _ = _socket.SendAsync(SessionFullPacket, SessionFullPacket.Length, to);
     }
 
     /// <summary>
@@ -232,8 +252,22 @@ public sealed class NatServer : IDisposable
     /// </summary>
     private void SendSessionUnavailable(IPEndPoint to)
     {
-        byte[] packet = [(byte)PacketType.NatSessionUnavailable];
-        _ = _socket.SendAsync(packet, packet.Length, to);
+        _ = _socket.SendAsync(SessionUnavailablePacket, SessionUnavailablePacket.Length, to);
+    }
+
+    /// <summary>
+    /// Sends a rented buffer to the target and returns it to <see cref="ArrayPool{T}.Shared"/> once the send completes.
+    /// </summary>
+    private async Task SendAndReturnAsync(byte[] packet, int length, IPEndPoint to)
+    {
+        try
+        {
+            await _socket.SendAsync(packet, length, to).ConfigureAwait(false);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(packet);
+        }
     }
 
     public void Dispose()

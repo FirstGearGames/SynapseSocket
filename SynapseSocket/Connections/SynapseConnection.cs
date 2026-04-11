@@ -3,6 +3,7 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
+using CodeBoost.Performance;
 using SynapseSocket.Packets;
 
 namespace SynapseSocket.Connections;
@@ -16,66 +17,54 @@ public sealed class SynapseConnection
     /// Remote endpoint of this connection.
     /// </summary>
     public IPEndPoint RemoteEndPoint { get; }
-
     /// <summary>
     /// The computed signature binding this connection to a physical identity.
     /// </summary>
     public ulong Signature { get; }
-
     /// <summary>
     /// Current lifecycle state.
     /// </summary>
     public ConnectionState State { get; internal set; }
-
     /// <summary>
     /// UTC ticks of the last received packet from this peer.
     /// </summary>
     public long LastReceivedTicks { get; internal set; }
-
     /// <summary>
     /// UTC ticks of the last sent keep-alive to this peer.
     /// </summary>
     public long LastKeepAliveSentTicks { get; internal set; }
-
     /// <summary>
     /// Number of consecutive keep-alives sent since the last received packet.
     /// Used to compute exponential backoff on the keep-alive send interval.
     /// Reset to zero whenever any inbound packet is received from this peer.
     /// </summary>
     internal int UnansweredKeepAlives;
-
     /// <summary>
     /// Next outbound reliable sequence number.
     /// </summary>
     internal ushort NextOutgoingSequence;
-
     /// <summary>
     /// Next expected inbound reliable sequence number (for ordered delivery).
     /// </summary>
     internal ushort NextExpectedSequence;
-
     /// <summary>
     /// Pending unacked reliable packets keyed by sequence.
     /// </summary>
     internal readonly ConcurrentDictionary<ushort, PendingReliable> PendingReliableQueue = [];
-
     /// <summary>
     /// Out-of-order reliable packets awaiting delivery.
     /// </summary>
     internal readonly Dictionary<ushort, ArraySegment<byte>> ReorderBuffer = [];
-
     /// <summary>
     /// Gate for reorder buffer and sequence manipulation.
     /// </summary>
     internal readonly object ReliableLock = new();
-
     /// <summary>
     /// Send-side splitter, rented from <see cref="CodeBoost.Performance.ResettableObjectPool{T}"/>
     /// on the first segmented send and returned to the pool on disconnect.
     /// Null until the first segmented send is issued on this connection.
     /// </summary>
     internal PacketSplitter? Splitter;
-
     /// <summary>
     /// Receive-side reassembler, rented from <see cref="CodeBoost.Performance.ResettableObjectPool{T}"/>
     /// on the first segmented receive and returned to the pool on disconnect.
@@ -98,47 +87,73 @@ public sealed class SynapseConnection
 
     /// <summary>
     /// A reliable packet that has been sent but not yet acknowledged.
+    /// Instances are managed by <see cref="ResettableObjectPool{T}"/>; rent via
+    /// <see cref="ResettableObjectPool{T}.Rent"/> and return via <see cref="ReleasePendingReliable"/>
+    /// so both the payload buffers and the <see cref="PendingReliable"/> object itself are recycled.
     /// For segmented sends, <see cref="Segments"/> holds rented <see cref="ArraySegment{T}"/>s whose backing arrays must be returned to <see cref="ArrayPool{T}.Shared"/> on ACK or eviction.
     /// <see cref="SegmentCount"/> is the logical count — <see cref="Segments"/> may be a larger rented array.
     /// </summary>
-    internal sealed class PendingReliable
+    internal sealed class PendingReliable : IPoolResettable
     {
         /// <summary>
         /// Sequence number of the pending packet.
         /// </summary>
         public ushort Sequence;
+
         /// <summary>
-        /// Raw packet bytes, including the header. Not used for segmented sends.
+        /// Rented packet buffer (header + payload) for unsegmented reliable sends. Null for segmented sends.
+        /// Returned to <see cref="ArrayPool{T}.Shared"/> by <see cref="ReleasePendingReliable"/>.
         /// </summary>
-        public byte[] Payload = [];
+        public byte[]? Payload;
+
         /// <summary>
-        /// Total wire length of the packet.
+        /// Total wire length of the packet, or of each segment when segmented.
         /// </summary>
         public int PacketLength;
+
         /// <summary>
         /// Per-segment buffers for segmented sends. Null for unsegmented packets.
         /// </summary>
         public ArraySegment<byte>[]? Segments;
+
         /// <summary>
         /// Logical number of valid entries in <see cref="Segments"/>. May be less than the array length.
         /// </summary>
         public int SegmentCount;
+
         /// <summary>
         /// UTC ticks when this packet was last sent or retransmitted.
         /// </summary>
         public long SentTicks;
+
         /// <summary>
         /// Number of retransmission attempts so far.
         /// </summary>
         public int Retries;
+
+        /// <inheritdoc/>
+        public void OnRent() { }
+
+        /// <inheritdoc/>
+        public void OnReturn()
+        {
+            Sequence = 0;
+            Payload = null;
+            PacketLength = 0;
+            Segments = null;
+            SegmentCount = 0;
+            SentTicks = 0;
+            Retries = 0;
+        }
     }
 
     /// <summary>
-    /// Returns all pooled memory held by <paramref name="pendingReliable"/> back to <see cref="ArrayPool{T}.Shared"/>.
+    /// Returns all pooled memory held by <paramref name="pendingReliable"/> back to <see cref="ArrayPool{T}.Shared"/>
+    /// and returns the <see cref="PendingReliable"/> instance itself to its <see cref="ResettableObjectPool{T}"/>.
     /// For segmented sends, returns each segment's backing array and the outer segments array.
     /// Safe to call from any context (ingress ACK path, maintenance sweep, or on kick).
     /// </summary>
-    internal static void ReturnPendingReliableBuffers(PendingReliable pendingReliable)
+    internal static void ReleasePendingReliable(PendingReliable pendingReliable)
     {
         if (pendingReliable.Segments is not null)
         {
@@ -147,7 +162,25 @@ public sealed class SynapseConnection
                 ArrayPool<byte>.Shared.Return(pendingReliable.Segments[0].Array!);
 
             ArrayPool<ArraySegment<byte>>.Shared.Return(pendingReliable.Segments);
-            pendingReliable.Segments = null;
         }
+        else if (pendingReliable.Payload is not null)
+        {
+            ArrayPool<byte>.Shared.Return(pendingReliable.Payload);
+        }
+
+        ResettableObjectPool<PendingReliable>.Return(pendingReliable);
+    }
+
+    /// <summary>
+    /// Drains the pending reliable queue of <paramref name="synapseConnection"/>, releasing every entry's
+    /// pooled buffers and returning each <see cref="PendingReliable"/> to its pool.
+    /// Call on connection teardown to avoid leaking rented buffers.
+    /// </summary>
+    internal static void DrainPendingReliableQueue(SynapseConnection synapseConnection)
+    {
+        foreach (KeyValuePair<ushort, PendingReliable> entry in synapseConnection.PendingReliableQueue)
+            ReleasePendingReliable(entry.Value);
+
+        synapseConnection.PendingReliableQueue.Clear();
     }
 }

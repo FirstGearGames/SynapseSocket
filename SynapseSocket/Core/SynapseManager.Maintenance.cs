@@ -14,6 +14,8 @@ namespace SynapseSocket.Core;
 /// </summary>
 public sealed partial class SynapseManager
 {
+    private const string ViolationReliableExhausted = "Connection exceeded the maximum reliable packet retry limit.";
+
     /// <summary>
     /// UTC ticks of the last ACK batch flush. Used by <see cref="AckBatchFlushSweep"/> to enforce the configured interval.
     /// </summary>
@@ -86,6 +88,7 @@ public sealed partial class SynapseManager
                 synapseConnection.State = ConnectionState.Disconnected;
                 Connections.Remove(synapseConnection.RemoteEndPoint, out _);
                 ReturnReorderBufferToPool(synapseConnection);
+                SynapseConnection.DrainPendingReliableQueue(synapseConnection);
                 RaiseConnectionClosed(synapseConnection);
                 HandleViolation(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.Timeout, 0, null, ViolationAction.Kick);
                 continue;
@@ -160,9 +163,9 @@ public sealed partial class SynapseManager
                 if (pendingReliable.Retries >= Config.Reliable.MaximumRetries)
                 {
                     synapseConnection.PendingReliableQueue.TryRemove(keyValuePair.Key, out _);
-                    SynapseConnection.ReturnPendingReliableBuffers(pendingReliable);
+                    SynapseConnection.ReleasePendingReliable(pendingReliable);
                     Telemetry.OnLost();
-                    HandleViolation(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.ReliableExhausted, 0, $"seq={pendingReliable.Sequence}", ViolationAction.Kick);
+                    HandleViolation(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.ReliableExhausted, 0, ViolationReliableExhausted, ViolationAction.Kick);
                     continue;
                 }
 
