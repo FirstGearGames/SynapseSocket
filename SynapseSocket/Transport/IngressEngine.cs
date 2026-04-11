@@ -308,8 +308,8 @@ public sealed partial class IngressEngine
             }
         }
 
-        // Reliable payload: deliver in order.
-        // Segmented reliable messages delay the ACK until all segments are reassembled so
+        // isReliable payload: deliver in order.
+        // Segmented isReliable messages delay the ACK until all segments are reassembled so
         // the sender retransmits the full set if any segment goes missing.
         if ((flags & PacketFlags.Reliable) != 0)
         {
@@ -322,7 +322,7 @@ public sealed partial class IngressEngine
                 if (_config.MaximumSegments != SynapseConfig.DisabledMaximumSegments)
                 {
                     PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
-                    if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, payload, reliable: true, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
+                    if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, payload, isReliable: true, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
                     {
                         _ = _sender.SendAckAsync(synapseConnection, sequence, cancellationToken);
                         DeliverOrdered(synapseConnection, sequence, assembledPayload, isReliable: true);
@@ -355,7 +355,7 @@ public sealed partial class IngressEngine
                 byte[] segmentPayloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
                 Buffer.BlockCopy(buffer, headerSize, segmentPayloadBuffer, 0, payloadLength);
                 PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
-                if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, new(segmentPayloadBuffer, 0, payloadLength), reliable: false, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
+                if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, new(segmentPayloadBuffer, 0, payloadLength), isReliable: false, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
                 {
                     PayloadDelivered?.Invoke(synapseConnection, assembledPayload, false);
                 }
@@ -379,7 +379,7 @@ public sealed partial class IngressEngine
         // copy the payload into a fresh pool buffer (safe for immediate caller reuse).
         // When handing off, isBufferHandedOff signals the receive loop not to return rentedBuffer —
         // ownership passes to the PayloadDelivered subscriber, which returns it after callbacks.
-        if (!_config.CopyReceivedUnreliablePayload)
+        if (!_config.CopyUnreliablePayload)
         {
             isBufferHandedOff = true;
             PayloadDelivered?.Invoke(synapseConnection, new(buffer, headerSize, payloadLength), false);
@@ -416,13 +416,13 @@ public sealed partial class IngressEngine
     }
 
     /// <summary>
-    /// Delivers in-order reliable payloads and drains any consecutive buffered packets from the reorder buffer.
+    /// Delivers in-order isReliable payloads and drains any consecutive buffered packets from the reorder buffer.
     /// </summary>
     private void DeliverOrdered(SynapseConnection synapseConnection, ushort sequence, ArraySegment<byte> payload, bool isReliable)
     {
         List<ArraySegment<byte>>? toDeliver = null;
 
-        lock (synapseConnection.ReliableGate)
+        lock (synapseConnection.ReliableLock)
         {
             if (sequence == synapseConnection.NextExpectedSequence)
             {
