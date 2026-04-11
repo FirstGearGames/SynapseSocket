@@ -107,7 +107,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         ISignatureProvider signatureProvider = Config.SignatureProvider ?? new DefaultSignatureProvider();
         Security = new(signatureProvider, Config.MaximumPacketsPerSecond, Config.MaximumPacketSize);
         Connections = new();
-        Telemetry = new(Config.IsTelemetryEnabled);
+        Telemetry = new(Config.EnableTelemetry);
         _latencySimulator = new(Config.LatencySimulator);
         _isSegmentingEnabled = Config.MaximumSegments != SynapseConfig.DisabledMaximumSegments;
         /* Unreliable requires a couple bytes less for segmenting when being sent out
