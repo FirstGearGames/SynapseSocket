@@ -104,6 +104,11 @@ public sealed class ConnectionManager
     private readonly struct EndPointKey : IEquatable<EndPointKey>
     {
         /// <summary>
+        /// The wrapped remote endpoint.
+        /// </summary>
+        private readonly IPEndPoint _endPoint;
+
+        /// <summary>
         /// Initializes a new <see cref="EndPointKey"/> wrapping the given endpoint.
         /// </summary>
         /// <param name="endPoint">The remote endpoint to wrap.</param>
@@ -133,10 +138,5 @@ public sealed class ConnectionManager
         /// </summary>
         /// <returns>A 32-bit signed integer hash code.</returns>
         public override int GetHashCode() => _endPoint is null ? 0 : unchecked(_endPoint.Address.GetHashCode() * 397) ^ _endPoint.Port;
-
-        /// <summary>
-        /// The wrapped remote endpoint.
-        /// </summary>
-        private readonly IPEndPoint _endPoint;
     }
 }
