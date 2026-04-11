@@ -25,21 +25,49 @@ namespace SynapseSocket.Transport;
 public sealed partial class IngressEngine
 {
     /// <summary>
-    /// True when the ingress loop is running.
+    /// True when the ingress receive loop is running.
     /// </summary>
     public bool IsRunning { get; private set; }
+    /// <summary>
+    /// The UDP socket this engine receives from.
+    /// </summary>
     private readonly Socket _socket;
+    /// <summary>
+    /// Engine configuration snapshot.
+    /// </summary>
     private readonly SynapseConfig _config;
+    /// <summary>
+    /// Security provider for signature computation, blacklist, and rate limiting.
+    /// </summary>
     private readonly SecurityProvider _security;
+    /// <summary>
+    /// Active connection table.
+    /// </summary>
     private readonly ConnectionManager _connections;
+    /// <summary>
+    /// Transmission engine used to send acknowledgements and handshake responses.
+    /// </summary>
     private readonly TransmissionEngine _sender;
+    /// <summary>
+    /// Telemetry counters for this engine.
+    /// </summary>
     private readonly Telemetry _telemetry;
-    // Tracks the last probe-response ticks per source IP; limits outbound amplification.
+    /// <summary>
+    /// Tracks the last probe-response tick per source IP to enforce the per-address rate limit.
+    /// </summary>
     private readonly ConcurrentDictionary<IpKey, long> _natProbeLastResponseTicks = [];
+    /// <summary>
+    /// UTC ticks of the last stale-entry eviction pass for <see cref="_natProbeLastResponseTicks"/>.
+    /// </summary>
     private long _lastProbeEvictionTicks;
-    // Replay cache: maps handshake signature → first-seen ticks. Prevents replayed handshakes
-    // from re-establishing connections after the original session ends.
+    /// <summary>
+    /// Replay cache mapping handshake signature to first-seen UTC ticks.
+    /// Prevents replayed handshakes from re-establishing connections after the original session ends.
+    /// </summary>
     private readonly ConcurrentDictionary<ulong, long> _seenHandshakes = [];
+    /// <summary>
+    /// UTC ticks of the last stale-entry eviction pass for <see cref="_seenHandshakes"/>.
+    /// </summary>
     private long _lastHandshakeEvictionTicks;
     /// <summary>
     /// Raised when a complete payload (unsegmented or fully reassembled) is ready for the application layer.
@@ -176,7 +204,7 @@ public sealed partial class IngressEngine
             }
             finally
             {
-                // When IsUnreliablePayloadCopied is false, ownership of rentedBuffer is transferred to
+                // When CopyReceivedUnreliablePayload is false, ownership of rentedBuffer is transferred to
                 // the PayloadDelivered subscriber (via OnPayloadDelivered), which returns it to the pool.
                 if (!isBufferHandedOff)
                     ArrayPool<byte>.Shared.Return(rentedBuffer, clearArray: false);
@@ -294,7 +322,7 @@ public sealed partial class IngressEngine
                 if (_config.MaximumSegments != SynapseConfig.DisabledMaximumSegments)
                 {
                     PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
-                    if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, payload, isReliable: true, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
+                    if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, payload, reliable: true, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
                     {
                         _ = _sender.SendAckAsync(synapseConnection, sequence, cancellationToken);
                         DeliverOrdered(synapseConnection, sequence, assembledPayload, isReliable: true);
@@ -327,7 +355,7 @@ public sealed partial class IngressEngine
                 byte[] segmentPayloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
                 Buffer.BlockCopy(buffer, headerSize, segmentPayloadBuffer, 0, payloadLength);
                 PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
-                if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, new(segmentPayloadBuffer, 0, payloadLength), isReliable: false, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
+                if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, new(segmentPayloadBuffer, 0, payloadLength), reliable: false, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
                 {
                     PayloadDelivered?.Invoke(synapseConnection, assembledPayload, false);
                 }
@@ -349,9 +377,9 @@ public sealed partial class IngressEngine
 
         // Unreliable non-segmented: either pass the ingress buffer directly (zero-copy) or
         // copy the payload into a fresh pool buffer (safe for immediate caller reuse).
-        // When handing off, bufferHandedOff signals the receive loop not to return rentedBuffer —
+        // When handing off, isBufferHandedOff signals the receive loop not to return rentedBuffer —
         // ownership passes to the PayloadDelivered subscriber, which returns it after callbacks.
-        if (!_config.IsUnreliablePayloadCopied)
+        if (!_config.CopyReceivedUnreliablePayload)
         {
             isBufferHandedOff = true;
             PayloadDelivered?.Invoke(synapseConnection, new(buffer, headerSize, payloadLength), false);
@@ -375,7 +403,7 @@ public sealed partial class IngressEngine
             return synapseConnection.Reassembler;
 
         PacketReassembler rented = ResettableObjectPool<PacketReassembler>.Rent();
-        rented.Initialize(_config.MaximumTransmissionUnit, _config.MaximumSegments, _config.MaximumConcurrentSegmentAssembliesPerConnection);
+        rented.Initialize(_config.MaximumTransmissionUnit, _config.MaximumSegments);
 
         PacketReassembler? existing = Interlocked.CompareExchange(ref synapseConnection.Reassembler, rented, null);
         if (existing is not null)
@@ -393,8 +421,8 @@ public sealed partial class IngressEngine
     private void DeliverOrdered(SynapseConnection synapseConnection, ushort sequence, ArraySegment<byte> payload, bool isReliable)
     {
         List<ArraySegment<byte>>? toDeliver = null;
-        
-        lock (synapseConnection.ReliableLock)
+
+        lock (synapseConnection.ReliableGate)
         {
             if (sequence == synapseConnection.NextExpectedSequence)
             {
@@ -494,7 +522,7 @@ public sealed partial class IngressEngine
         }
 
         // Replay check: the nonce embedded in handshakePayload makes each legitimate handshake's
-        // signature unique. A replayed packet carries the same bytes → same signature → reject.
+        // signature unique. A replayed packet carries the same bytes -> same signature -> reject.
         long nowTicks = DateTime.UtcNow.Ticks;
         if (!_seenHandshakes.TryAdd(signature, nowTicks))
         {
@@ -578,4 +606,12 @@ public sealed partial class IngressEngine
             {
                 Span<byte> b = stackalloc byte[16];
                 address.TryWriteBytes(b, out _);
-                return new(MemoryMarshal.Read<ulong>(b), MemoryMarshal.Rea
+                return new(MemoryMarshal.Read<ulong>(b), MemoryMarshal.Read<ulong>(b.Slice(8)));
+            }
+        }
+
+        public bool Equals(IpKey other) => _upper64 == other._upper64 && _lower64 == other._lower64;
+        public override bool Equals(object? obj) => obj is IpKey other && Equals(other);
+        public override int GetHashCode() => HashCode.Combine(_upper64, _lower64);
+    }
+}
