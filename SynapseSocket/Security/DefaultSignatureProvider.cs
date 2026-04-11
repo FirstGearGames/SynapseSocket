@@ -4,8 +4,8 @@ using System.Net;
 namespace SynapseSocket.Security;
 
 /// <summary>
-/// Default signature provider: hashes the remote IP address (without port) using an FNV-1a 64-bit hash.
-/// This binds the signature to the physical device at the IP level while tolerating ephemeral port changes.
+/// Default signature provider: hashes the remote IP address and port using an FNV-1a 64-bit hash.
+/// This binds the signature to the full endpoint, distinguishing multiple clients behind the same NAT address.
 /// </summary>
 public sealed class DefaultSignatureProvider : ISignatureProvider
 {
@@ -42,6 +42,9 @@ public sealed class DefaultSignatureProvider : ISignatureProvider
             hash ^= addressBytes[i];
             hash *= FnvPrime;
         }
+
+        hash ^= (ulong)endPoint.Port;
+        hash *= FnvPrime;
 
         signature = hash;
         return true;

@@ -30,6 +30,16 @@ public delegate void ViolationCallbackDelegate(IPEndPoint endPoint, ulong signat
 public delegate void NatPeerReadyDelegate(IPEndPoint peerEndPoint);
 
 /// <summary>
-/// Internal callback: a NAT rendezvous server rejected the registration because the session is full.
+/// Internal callback: a NAT rendezvous server rejected the registration because the session is full or was not found.
 /// </summary>
 public delegate void NatSessionFullDelegate();
+
+/// <summary>
+/// Internal callback: a NAT rendezvous server assigned a new session ID in response to a session request.
+/// </summary>
+public delegate void NatSessionCreatedDelegate(string sessionId);
+
+/// <summary>
+/// Internal callback: a NAT rendezvous server rejected a session-creation request because its concurrent session limit has been reached.
+/// </summary>
+public delegate void NatSessionUnavailableDelegate();

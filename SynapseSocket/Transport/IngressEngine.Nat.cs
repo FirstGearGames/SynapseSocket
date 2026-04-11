@@ -24,9 +24,19 @@ public sealed partial class IngressEngine
     public event NatPeerReadyDelegate? NatPeerReady;
 
     /// <summary>
-    /// Raised when a NAT rendezvous server rejects the session because it is already full.
+    /// Raised when a NAT rendezvous server rejects the session because it is full or was not found.
     /// </summary>
     public event NatSessionFullDelegate? NatSessionFull;
+
+    /// <summary>
+    /// Raised when a NAT rendezvous server responds with the server-assigned session ID.
+    /// </summary>
+    public event NatSessionCreatedDelegate? NatSessionCreated;
+
+    /// <summary>
+    /// Raised when a NAT rendezvous server rejects a session-creation request because its concurrent session limit has been reached.
+    /// </summary>
+    public event NatSessionUnavailableDelegate? NatSessionUnavailable;
 
     /// <summary>
     /// Size of the HMAC-SHA256 token truncated to this many bytes for NAT challenge packets.
@@ -146,6 +156,16 @@ public sealed partial class IngressEngine
                 NatSessionFull?.Invoke();
                 break;
 
+            case PacketType.NatSessionCreated:
+                string? sessionId = ParseNatSessionId(payload);
+                if (sessionId is not null)
+                    NatSessionCreated?.Invoke(sessionId);
+                break;
+
+            case PacketType.NatSessionUnavailable:
+                NatSessionUnavailable?.Invoke();
+                break;
+
             case PacketType.NatHeartbeatAck:
                 break;
         }
@@ -198,6 +218,18 @@ public sealed partial class IngressEngine
     /// </summary>
     private void RemoveExpiredProbeLimitEntries(long nowTicks, long staleTicks) =>
         RemoveExpiredEntries(_natProbeLastResponseTicks, nowTicks, staleTicks);
+
+    /// <summary>
+    /// Parses a fixed-length ASCII session ID from a <see cref="PacketType.NatSessionCreated"/> payload.
+    /// Returns null if the payload is too short.
+    /// </summary>
+    private static string? ParseNatSessionId(ReadOnlySpan<byte> payload)
+    {
+        if (payload.Length < ServerNatConfig.SessionIdLength)
+            return null;
+
+        return System.Text.Encoding.ASCII.GetString(payload[..ServerNatConfig.SessionIdLength]);
+    }
 
     /// <summary>
     /// Parses a NAT server packet body into an <see cref="IPEndPoint"/>.

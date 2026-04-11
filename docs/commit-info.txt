@@ -1,0 +1,22 @@
+Redesign NAT session flow: server-assigned IDs, multi-peer sessions, close/unavailable support
+
+- PacketType: add NatRequestSession (15), NatSessionCreated (16), NatCloseSession (17), NatSessionUnavailable (18).
+- NatSessionRegistry: replace client-generated IDs with server-assigned TryCreateSession; add maxConcurrentSessions
+  cap; sessions persist across multiple joiners (List<IPEndPoint> Joiners replaces single Second); add CloseSession
+  (host-only); Register is now join-only (notFound returned instead of auto-create).
+- NatServer: handle NatRequestSession (create + respond), NatCloseSession (evict); HandleRegister sends PeerReady
+  to both sides without removing session; SendSessionUnavailable when cap reached; default timeout 30s -> 300s.
+- ServerNatConfig: remove SessionId field and GenerateSessionId (server now owns ID generation); SessionIdLength
+  constant retained.
+- TransmissionEngine.Nat: add SendNatRequestSessionAsync, SendNatCloseSessionAsync.
+- IngressEngine.Nat: add NatSessionCreated, NatSessionFull, NatSessionUnavailable events; handle
+  NatSessionCreated and NatSessionUnavailable packets in ProcessNatServerPacket; add ParseNatSessionId helper.
+- IngressCallbackDelegates: add NatSessionCreatedDelegate, NatSessionUnavailableDelegate.
+- NatHostSession: new public class returned by HostViaNatServerAsync; exposes SessionId, CloseAsync,
+  DisposeAsync; cancels heartbeat CTS on close and sends NatCloseSession to server.
+- SynapseManager.NatTraversal: replace ConnectViaNatServerAsync with HostViaNatServerAsync (returns
+  NatHostSession, multi-peer, indefinite lifetime) and JoinViaNatServerAsync(string sessionId); replace
+  _natPeerSource with _natHostPeerHandler (Action, fires per peer) and _natJoinSource (TCS, single-use);
+  add OnNatSessionCreated, OnNatSessionUnavailable callbacks; add CloseNatHostSessionAsync internal method.
+- SynapseManager: wire NatSessionCreated, NatSessionUnavailable ingress events.
+- SECURITY_VULNERABILITIES: mark V11 resolved (server-generated IDs narrow brute-force window).

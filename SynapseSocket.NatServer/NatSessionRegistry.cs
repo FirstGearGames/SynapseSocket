@@ -1,77 +1,119 @@
 using System;
 using System.Collections.Generic;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
+using SynapseSocket.Core.Configuration;
 
 namespace SynapseSocket.NatServer;
 
 /// <summary>
-/// Tracks pending NAT rendezvous sessions keyed by a 6-character alphanumeric session ID.
-/// Once both peer endpoints are registered the session is removed and the caller sends
-/// <c>PeerReady</c> to each side. Sessions that receive no heartbeat within
-/// <see cref="SessionTimeoutMilliseconds"/> are evicted automatically.
+/// Tracks pending NAT rendezvous sessions keyed by a server-assigned alphanumeric session ID.
+/// Sessions are created when a host sends <c>NatRequestSession</c> and remain open until the host
+/// explicitly closes them via <c>NatCloseSession</c> or the session times out.
+/// Multiple joiners may register against the same session ID; each is matched directly to the host.
 /// </summary>
 internal sealed class NatSessionRegistry
 {
     private sealed class Entry
     {
-        internal IPEndPoint First;
-        internal IPEndPoint? Second;
+        internal readonly IPEndPoint Host;
+        internal readonly List<IPEndPoint> Joiners = new();
         internal long LastHeartbeatTicks;
 
-        internal Entry(IPEndPoint first)
+        internal Entry(IPEndPoint host)
         {
-            First = first;
+            Host = host;
             LastHeartbeatTicks = DateTime.UtcNow.Ticks;
         }
     }
 
+    private const string AlphaNumericChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    private const int SessionIdLength = ServerNatConfig.SessionIdLength;
+
     private readonly Dictionary<string, Entry> _sessions = new(StringComparer.Ordinal);
     private readonly long _timeoutTicks;
+    private readonly int _maxConcurrentSessions;
 
     internal uint SessionTimeoutMilliseconds { get; }
 
-    internal NatSessionRegistry(uint sessionTimeoutMilliseconds = 30_000)
+    /// <summary>
+    /// Initialises the registry.
+    /// </summary>
+    /// <param name="sessionTimeoutMilliseconds">Milliseconds of heartbeat silence before a session is evicted.</param>
+    /// <param name="maxConcurrentSessions">Maximum number of sessions that may be open simultaneously. 0 = unlimited.</param>
+    internal NatSessionRegistry(uint sessionTimeoutMilliseconds = 300_000, int maxConcurrentSessions = 0)
     {
         SessionTimeoutMilliseconds = sessionTimeoutMilliseconds;
         _timeoutTicks = TimeSpan.FromMilliseconds(sessionTimeoutMilliseconds).Ticks;
+        _maxConcurrentSessions = maxConcurrentSessions;
     }
 
     /// <summary>
-    /// Registers <paramref name="endpoint"/> for <paramref name="sessionId"/>.
-    /// Returns <c>(matched: true, first, second)</c> when a second peer arrives,
-    /// <c>(matched: false, null, null)</c> while still waiting, or
-    /// <c>(matched: false, null, null)</c> when the session is already full (caller sends SessionFull).
+    /// Attempts to create a new session for <paramref name="host"/>.
+    /// Returns false if the concurrent session limit has been reached.
+    /// On success, <paramref name="sessionId"/> is set to the server-assigned ID.
     /// </summary>
-    internal (bool matched, bool full, IPEndPoint? first, IPEndPoint? second) Register(string sessionId, IPEndPoint endpoint)
+    internal bool TryCreateSession(IPEndPoint host, out string sessionId)
     {
-        if (_sessions.TryGetValue(sessionId, out Entry? entry))
+        if (_maxConcurrentSessions > 0 && _sessions.Count >= _maxConcurrentSessions)
         {
-            if (entry.Second is not null)
-                return (matched: false, full: true, null, null);
-
-            if (entry.First.Equals(endpoint))
-            {
-                entry.LastHeartbeatTicks = DateTime.UtcNow.Ticks;
-                return (matched: false, full: false, null, null);
-            }
-
-            entry.Second = endpoint;
-            _sessions.Remove(sessionId);
-            return (matched: true, full: false, entry.First, endpoint);
+            sessionId = string.Empty;
+            return false;
         }
 
-        _sessions[sessionId] = new(endpoint);
-        return (matched: false, full: false, null, null);
+        string id;
+
+        do
+        {
+            id = GenerateId();
+        } while (_sessions.ContainsKey(id));
+
+        _sessions[id] = new(host);
+        sessionId = id;
+        return true;
     }
 
     /// <summary>
-    /// Refreshes the heartbeat timestamp for an existing single-peer session.
+    /// Registers <paramref name="endpoint"/> as a new joiner for an existing session.
+    /// Returns <c>(matched: true, host, joiner)</c> when the joiner is accepted,
+    /// <c>(matched: false, notFound: true, ...)</c> when the session ID does not exist or has expired, or
+    /// <c>(matched: false, notFound: false, ...)</c> when the host re-registers (heartbeat refresh).
+    /// </summary>
+    internal (bool matched, bool notFound, IPEndPoint? host, IPEndPoint? joiner) Register(string sessionId, IPEndPoint endpoint)
+    {
+        if (!_sessions.TryGetValue(sessionId, out Entry? entry))
+            return (matched: false, notFound: true, null, null);
+
+        if (entry.Host.Equals(endpoint))
+        {
+            entry.LastHeartbeatTicks = DateTime.UtcNow.Ticks;
+            return (matched: false, notFound: false, null, null);
+        }
+
+        entry.Joiners.Add(endpoint);
+        return (matched: true, notFound: false, entry.Host, endpoint);
+    }
+
+    /// <summary>
+    /// Refreshes the heartbeat timestamp for the host of an existing session.
     /// </summary>
     internal void Heartbeat(string sessionId, IPEndPoint endpoint)
     {
-        if (_sessions.TryGetValue(sessionId, out Entry? entry) && entry.First.Equals(endpoint))
+        if (_sessions.TryGetValue(sessionId, out Entry? entry) && entry.Host.Equals(endpoint))
             entry.LastHeartbeatTicks = DateTime.UtcNow.Ticks;
+    }
+
+    /// <summary>
+    /// Closes a session, preventing further joiners. Only accepted if <paramref name="endpoint"/> is the session host.
+    /// </summary>
+    internal bool CloseSession(string sessionId, IPEndPoint endpoint)
+    {
+        if (!_sessions.TryGetValue(sessionId, out Entry? entry) || !entry.Host.Equals(endpoint))
+            return false;
+
+        _sessions.Remove(sessionId);
+        return true;
     }
 
     /// <summary>
@@ -81,6 +123,7 @@ internal sealed class NatSessionRegistry
     {
         long cutoff = DateTime.UtcNow.Ticks - _timeoutTicks;
         List<string>? toRemove = null;
+
         foreach (KeyValuePair<string, Entry> kv in _sessions)
         {
             if (kv.Value.LastHeartbeatTicks < cutoff)
@@ -89,7 +132,10 @@ internal sealed class NatSessionRegistry
                 toRemove.Add(kv.Key);
             }
         }
-        if (toRemove is null) return;
+
+        if (toRemove is null)
+            return;
+
         foreach (string id in toRemove)
             _sessions.Remove(id);
     }
@@ -100,7 +146,21 @@ internal sealed class NatSessionRegistry
     /// </summary>
     internal static string? ParseSessionId(byte[] data, int offset, int length)
     {
-        if (data.Length < offset + length) return null;
+        if (data.Length < offset + length)
+            return null;
+
         return Encoding.ASCII.GetString(data, offset, length);
+    }
+
+    private static string GenerateId()
+    {
+        Span<byte> bytes = stackalloc byte[SessionIdLength];
+        RandomNumberGenerator.Fill(bytes);
+        StringBuilder stringBuilder = new(SessionIdLength);
+
+        foreach (byte b in bytes)
+            stringBuilder.Append(AlphaNumericChars[b % AlphaNumericChars.Length]);
+
+        return stringBuilder.ToString();
     }
 }

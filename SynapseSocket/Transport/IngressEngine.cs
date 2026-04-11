@@ -536,10 +536,14 @@ public sealed partial class IngressEngine
             return;
         }
 
-        // Replay check: the nonce embedded in handshakePayload makes each legitimate handshake's signature unique. A replayed packet carries the same bytes -> same signature -> reject.
+        // Replay check: mix the handshake nonce into the cache key independently of the connection signature.
+        // The connection signature is IP-based (stable across reconnects) so blacklisting survives reconnects.
+        // The replay key adds the nonce so each handshake is unique — reconnections from the same IP are
+        // not incorrectly rejected, and the nonce is meaningfully consumed.
         long nowTicks = DateTime.UtcNow.Ticks;
+        ulong replayKey = MixHandshakeNonce(signature, handshakePayload);
 
-        if (!_seenHandshakes.TryAdd(signature, nowTicks))
+        if (!_seenHandshakes.TryAdd(replayKey, nowTicks))
         {
             // Exact same bytes received again - replay.
             ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.SignatureRejected, "Handshake replay detected");
@@ -581,6 +585,26 @@ public sealed partial class IngressEngine
     /// <param name="staleTicks">Age in ticks beyond which a cached handshake signature is considered expired.</param>
     private void RemoveExpiredHandshakeEntries(long nowTicks, long staleTicks) =>
         RemoveExpiredEntries(_seenHandshakes, nowTicks, staleTicks);
+
+    /// <summary>
+    /// Mixes <paramref name="payload"/> into <paramref name="signature"/> using FNV-1a to produce a per-handshake replay cache key.
+    /// The connection signature remains IP-based (stable across reconnects) for blacklisting; this key adds the nonce
+    /// so that each handshake produces a distinct cache entry and the nonce is meaningfully consumed.
+    /// Returns <paramref name="signature"/> unchanged when <paramref name="payload"/> is empty.
+    /// </summary>
+    private static ulong MixHandshakeNonce(ulong signature, ReadOnlySpan<byte> payload)
+    {
+        const ulong FnvPrime = 1099511628211UL;
+        ulong key = signature;
+
+        foreach (byte b in payload)
+        {
+            key ^= b;
+            key *= FnvPrime;
+        }
+
+        return key;
+    }
 
     /// <summary>
     /// Generic helper that removes entries from a <see cref="ConcurrentDictionary{TKey, Long}"/>

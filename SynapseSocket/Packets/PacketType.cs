@@ -55,6 +55,18 @@ public enum PacketType : byte
     /// <summary>Rendezvous server reports the peer's external endpoint. Payload: address family byte + IP bytes + port (2 bytes LE).</summary>
     NatPeerReady = 13,
 
-    /// <summary>Rendezvous server rejects a registration because the session is full. No payload.</summary>
+    /// <summary>Rendezvous server rejects a registration because the session is full or was not found. No payload.</summary>
     NatSessionFull = 14,
+
+    /// <summary>Client requests the rendezvous server to create and assign a new session ID. No payload.</summary>
+    NatRequestSession = 15,
+
+    /// <summary>Rendezvous server responds with the newly created session ID. Payload is the ASCII session ID.</summary>
+    NatSessionCreated = 16,
+
+    /// <summary>Host requests the rendezvous server to close a session and stop accepting new joiners. Payload is the ASCII session ID.</summary>
+    NatCloseSession = 17,
+
+    /// <summary>Rendezvous server rejects a session-creation request because its concurrent session limit has been reached. No payload.</summary>
+    NatSessionUnavailable = 18,
 }

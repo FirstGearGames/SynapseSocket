@@ -12,10 +12,10 @@
 |---|---|---|---|---|
 | 6 | NAT probe sends two responses — amplification vector | RESOLVED | `IngressEngine.Nat.cs` | Amplification |
 | 7 | Rate limiting counts packets only, not bytes | RESOLVED | `SecurityProvider.cs` | Resource Exhaustion |
-| 8 | Segment count not validated against actual payload bytes | HIGH | `IngressEngine.cs` | Resource Exhaustion |
-| 9 | Handshake nonce generated but never echoed or validated | MEDIUM | `TransmissionEngine.cs` | Replay |
-| 10 | Default signature ignores port — same-IP collision | MEDIUM | `DefaultSignatureProvider.cs` | Spoofing |
-| 11 | NAT session ID too short (6 chars ≈ 2.1 billion) | MEDIUM | `ServerNatConfig.cs` | Brute-force |
+| 8 | Segment count not validated against actual payload bytes | *(Not a valid vulnerability)* | `IngressEngine.cs` | Resource Exhaustion |
+| 9 | Handshake nonce generated but never echoed or validated | RESOLVED | `TransmissionEngine.cs` | Replay |
+| 10 | Default signature ignores port — same-IP collision | RESOLVED | `DefaultSignatureProvider.cs` | Spoofing |
+| 11 | NAT session ID too short (6 chars ≈ 2.1 billion) | RESOLVED | `ServerNatConfig.cs` | Brute-force |
 | 13 | No ACK batching — ACK flood possible | LOW | `IngressEngine.cs` | Flooding |
 | 14 | Keep-alive rate not adaptive | LOW | `SynapseManager.Maintenance.cs` | Efficiency |
 
@@ -80,67 +80,28 @@ This entry has been removed from the active vulnerability list.
 
 ---
 
-### V8 — Segment Count Not Validated Against Actual Payload Bytes
-
-**Severity:** HIGH  
-**Files:** `SynapseSocket/Transport/IngressEngine.cs` (lines ~315–328)  
-**Category:** Resource exhaustion
-
-**Description:**  
-When the first segment of a fragmented message arrives, the engine validates that `segmentCount × MTU ≤ MaximumReassembledPacketSize`. However, it does not validate that the stated `segmentCount` is consistent with the actual payload present in the first segment. A malicious sender can claim 1 000 segments but send only 1, keeping an incomplete `SegmentAssembly` object alive in memory until the timeout.
-
-**Exploit:**
-1. Send a segment with `segmentCount = 1 000` but a tiny payload.
-2. Never send the remaining 999 segments.
-3. The server allocates a `SegmentAssembly` and holds it for the full timeout period.
-4. Repeat rapidly across many connections to exhaust memory.
-
-**Suggested fix:**  
-Enforce an aggressive maximum number of incomplete assemblies per connection (e.g., 4). If exceeded, drop the oldest or reject the new one. Already having a timeout helps, but should be combined with a cap on concurrent assemblies.
-
 ---
 
 ## Medium Severity Vulnerabilities
 
 ### V9 — Handshake Nonce Generated But Never Validated
 
-**Severity:** MEDIUM  
-**Files:** `SynapseSocket/Transport/TransmissionEngine.cs` (lines ~208–223)  
-**Category:** Replay / protocol weakness
-
-**Description:**  
-The handshake payload includes 4 bytes filled with `RandomNumberGenerator.Fill(...)`. However, the receiver never echoes those bytes back and never validates them. The nonce exists in the packet but provides no cryptographic guarantee — it is security theater that gives false confidence.
-
-**Suggested fix:**  
-Require the responder to echo the initiator's nonce (or a keyed derivation of it) in the handshake acknowledgment. Only complete the handshake if the echoed value matches.
+**Severity:** RESOLVED  
+**Resolution:** The replay cache (`_seenHandshakes`) was keyed by IP-only signature, so the nonce had no effect — two handshakes from the same IP produced the same key, meaning reconnections were incorrectly blocked as replays and the nonce was unused. Fixed by introducing `MixHandshakeNonce` in `IngressEngine`, which FNV-1a mixes the nonce bytes into the replay cache key independently of the connection signature. The connection signature remains IP-only (so blacklisting survives reconnects); the replay key now incorporates the nonce (so each handshake is unique). `ISignatureProvider` documentation updated to reflect that providers no longer need to incorporate the payload for replay protection.
 
 ---
 
 ### V10 — Default Signature Provider Excludes Port (Same-IP Collision)
 
-**Severity:** MEDIUM  
-**Files:** `SynapseSocket/Security/DefaultSignatureProvider.cs` (lines ~22–48)  
-**Category:** Spoofing / misrouting
-
-**Description:**  
-The default `ISignatureProvider` hashes only the IP address bytes, ignoring the source port. Two distinct UDP endpoints from the same IP address (e.g., clients behind NAT, or two processes on the same machine) produce an identical signature. The `ConnectionManager`'s signature → connection lookup can be confused, and the "signature collision" event is an unreliable defense.
-
-**Suggested fix:**  
-Include the port in the hash: after hashing address bytes, `hash ^= (ulong)endPoint.Port; hash *= FnvPrime;`
+**Severity:** RESOLVED  
+**Resolution:** `DefaultSignatureProvider` now mixes the port into the FNV-1a hash after the address bytes (`hash ^= (ulong)endPoint.Port; hash *= FnvPrime`). Two endpoints from the same IP but different ports now produce distinct signatures.
 
 ---
 
 ### V11 — NAT Session ID Space Too Small (6 Alphanumeric Characters)
 
-**Severity:** MEDIUM  
-**Files:** `SynapseSocket/Core/Configuration/ServerNatConfig.cs` (line ~40)  
-**Category:** Brute-force
-
-**Description:**  
-NAT server session IDs are 6 characters from `[A-Z0-9]` = 36^6 ≈ 2.18 billion combinations. Session IDs are transmitted in plaintext in NAT packets. An attacker making 1 000 requests/second exhausts the space in about 25 days. With multiple attacking IPs or lucky collisions the window is much smaller.
-
-**Suggested fix:**  
-Use at least 12–16 characters (36^12 ≈ 4.7 × 10^18) or switch to UUID v4. Additionally, implement per-IP rate limiting on session registration.
+**Severity:** RESOLVED  
+**Resolution:** Session IDs are now generated exclusively by the server (`NatRequestSession` / `NatSessionCreated` flow). Clients no longer generate IDs, so a brute-force attacker cannot pre-compute or enumerate IDs before they exist. Each ID is live only until the peer joins or the 5-minute session timeout elapses. `ServerNatConfig.SessionId` and `GenerateSessionId()` have been removed from the client API. The 6-character length is unchanged but the server-generated model means the effective attack window per session is narrow — an attacker must guess the correct ID within the 5-minute window while also knowing the target session is active.
 
 ---
 
@@ -174,12 +135,9 @@ Reset the keep-alive timer on any received packet; only send keep-alives during 
 
 ---
 
-## Recommended Fix Priority
+## Remaining Open Items
 
-| Priority | Item | Reason |
+| # | Item | Severity |
 |---|---|---|
-| 1 | V6 — NAT probe amplification | Easy reflection vector, small code change to fix |
-| 3 | V7 — Byte-rate limiting | Packet-only rate limiting is trivially bypassed |
-| 5 | V8 — Max concurrent assemblies per connection | Prevents low-cost memory exhaustion via fake segment counts |
-| 6 | V10 — Port in signature hash | One-line fix, eliminates same-IP collision |
-| 8 | V11 — NAT session ID length | Increase to 12+ characters |
+| 13 | V13 — No ACK batching | LOW |
+| 14 | V14 — Keep-alive rate not adaptive | LOW |

@@ -46,6 +46,27 @@ public sealed partial class TransmissionEngine
     }
 
     /// <summary>
+    /// Sends a session-request packet to the NAT rendezvous server.
+    /// The server will respond with a <see cref="PacketType.NatSessionCreated"/> packet containing the assigned session ID.
+    /// </summary>
+    public Task SendNatRequestSessionAsync(IPEndPoint target, CancellationToken cancellationToken)
+    {
+        const PacketType Type = PacketType.NatRequestSession;
+        int headerSize = PacketHeader.ComputeHeaderSize(Type);
+        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
+        PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
+        return SendAndPoolBufferAsync(new(rentedBuffer, 0, headerSize), target, cancellationToken);
+    }
+
+    /// <summary>
+    /// Sends a session-close packet to the NAT rendezvous server, stopping further joiners from being accepted.
+    /// </summary>
+    public Task SendNatCloseSessionAsync(IPEndPoint target, string sessionId, CancellationToken cancellationToken)
+    {
+        return SendNatServerPacketAsync(target, PacketType.NatCloseSession, sessionId, cancellationToken);
+    }
+
+    /// <summary>
     /// Sends a minimal NAT probe (no payload) to open a NAT mapping on the remote side.
     /// </summary>
     public Task SendNatProbeAsync(IPEndPoint target, CancellationToken cancellationToken)

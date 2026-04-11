@@ -175,6 +175,8 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             ingressEngine.UnhandledException += OnUnhandledException;
             ingressEngine.NatPeerReady += OnNatPeerReady;
             ingressEngine.NatSessionFull += OnNatSessionFull;
+            ingressEngine.NatSessionCreated += OnNatSessionCreated;
+            ingressEngine.NatSessionUnavailable += OnNatSessionUnavailable;
             _ingressTasks.Add(ingressEngine.StartAsync(_cancellationTokenSource.Token));
         }
 
