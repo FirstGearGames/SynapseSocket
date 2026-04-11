@@ -91,12 +91,27 @@ public sealed partial class SynapseManager
                 continue;
             }
 
-            // Keep-alive
-            if (nowTicks - synapseConnection.LastKeepAliveSentTicks > keepAliveTicks)
+            // Keep-alive: skip when traffic is already flowing; reset backoff when active.
+            if (nowTicks - synapseConnection.LastReceivedTicks < keepAliveTicks)
             {
-                synapseConnection.LastKeepAliveSentTicks = nowTicks;
-                _ = _sender.SendKeepAliveAsync(synapseConnection, cancellationToken);
+                synapseConnection.UnansweredKeepAlives = 0;
+                continue;
             }
+
+            // Exponential backoff: double the interval for each consecutive unanswered keep-alive, capped at 8×.
+            long effectiveIntervalTicks = keepAliveTicks << Math.Min(synapseConnection.UnansweredKeepAlives, 3);
+
+            if (nowTicks - synapseConnection.LastKeepAliveSentTicks < effectiveIntervalTicks)
+                continue;
+
+            // Track whether the previous keep-alive was answered.
+            if (synapseConnection.LastKeepAliveSentTicks > 0 && synapseConnection.LastReceivedTicks < synapseConnection.LastKeepAliveSentTicks)
+                synapseConnection.UnansweredKeepAlives++;
+            else
+                synapseConnection.UnansweredKeepAlives = 0;
+
+            synapseConnection.LastKeepAliveSentTicks = nowTicks;
+            _ = _sender.SendKeepAliveAsync(synapseConnection, cancellationToken);
         }
     }
 

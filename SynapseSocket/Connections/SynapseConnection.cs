@@ -38,6 +38,13 @@ public sealed class SynapseConnection
     public long LastKeepAliveSentTicks { get; internal set; }
 
     /// <summary>
+    /// Number of consecutive keep-alives sent since the last received packet.
+    /// Used to compute exponential backoff on the keep-alive send interval.
+    /// Reset to zero whenever any inbound packet is received from this peer.
+    /// </summary>
+    internal int UnansweredKeepAlives;
+
+    /// <summary>
     /// Next outbound reliable sequence number.
     /// </summary>
     internal ushort NextOutgoingSequence;

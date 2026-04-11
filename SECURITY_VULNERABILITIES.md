@@ -116,15 +116,8 @@ This entry has been removed from the active vulnerability list.
 
 ### V14 — Keep-Alive Rate Not Adaptive
 
-**Severity:** LOW  
-**Files:** `SynapseSocket/Core/SynapseManager.Maintenance.cs` (lines ~86–92)  
-**Category:** Efficiency / minor flooding
-
-**Description:**  
-Keep-alive packets are sent at a fixed 5-second interval regardless of connection health or peer responsiveness. If a peer is already sending traffic, keep-alives are redundant. If a peer is unresponsive, fixed-interval keep-alives generate unnecessary traffic.
-
-**Suggested fix:**  
-Reset the keep-alive timer on any received packet; only send keep-alives during genuine silence periods. Apply exponential backoff when keep-alives go unacknowledged.
+**Severity:** RESOLVED  
+**Resolution:** `ProgressiveKeepAliveSweep` now skips sending a keep-alive if any packet has been received within the keep-alive interval (`LastReceivedTicks`), and resets the backoff counter when traffic is flowing. When silence persists, exponential backoff doubles the effective send interval for each consecutive unanswered keep-alive, capped at 8× (`UnansweredKeepAlives` field on `SynapseConnection`, shift capped at 3). The backoff counter resets to zero the moment any inbound packet is received or a keep-alive is answered.
 
 ---
 
