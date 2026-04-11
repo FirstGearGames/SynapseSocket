@@ -10,7 +10,7 @@
 
 | # | Vulnerability | Severity | File | Category |
 |---|---|---|---|---|
-| 6 | NAT probe sends two responses — amplification vector | HIGH | `IngressEngine.Nat.cs` | Amplification |
+| 6 | NAT probe sends two responses — amplification vector | RESOLVED | `IngressEngine.Nat.cs` | Amplification |
 | 7 | Rate limiting counts packets only, not bytes | HIGH | `SecurityProvider.cs` | Resource Exhaustion |
 | 8 | Segment count not validated against actual payload bytes | HIGH | `IngressEngine.cs` | Resource Exhaustion |
 | 9 | Handshake nonce generated but never echoed or validated | MEDIUM | `TransmissionEngine.cs` | Replay |
@@ -68,20 +68,8 @@ This entry has been removed from the active vulnerability list.
 
 ### V6 — NAT Probe Sends Two Response Packets (Amplification)
 
-**Severity:** HIGH  
-**Files:** `SynapseSocket/Transport/IngressEngine.Nat.cs` (lines ~33–72)  
-**Category:** Reflection / amplification DDoS
-
-**Description:**  
-On receiving a NAT probe, the engine calls both `SendNatProbeAsync` **and** `SendHandshakeAsync` to the source address. An attacker who spoofs the victim's IP as the source will cause the server to send two UDP packets to the victim for every one probe sent by the attacker.
-
-**Exploit:**
-1. Attacker forges UDP NAT probe packets with victim's IP as the source.
-2. Server responds with probe + handshake to the victim.
-3. The rate limiter (200 ms cooldown per address key) limits this to ~5 response-pairs per second per source IP — but across many source IPs or many servers the victim receives a significant flood.
-
-**Suggested fix:**  
-Send only **one** response packet (the probe response). Do not send an unsolicited handshake until the remote peer has demonstrated bidirectional reachability (i.e., completed a full round-trip).
+**Severity:** RESOLVED  
+**Resolution:** Replaced with stateless HMAC challenge-response. The server now issues a signed token on probe receipt and only sends a handshake after the peer echoes the token back, proving bidirectional reachability. A spoofed-source attacker never receives the token and cannot complete the exchange.
 
 ---
 

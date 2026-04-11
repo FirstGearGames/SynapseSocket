@@ -114,7 +114,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
          * of order, which would require different maximum payload sizes between reliable
          * and unreliable segmented. Rather than add additional complexity and branching
          * the rare byte cost is consumed. */
-        _maximumUnsegmentedPayload = (int)Config.MaximumTransmissionUnit - PacketHeader.FlagSize - PacketHeader.SequenceSize;
+        _maximumUnsegmentedPayload = (int)Config.MaximumTransmissionUnit - PacketHeader.TypeSize - PacketHeader.SequenceSize;
     }
 
     /// <summary>

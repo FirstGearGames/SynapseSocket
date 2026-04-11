@@ -70,6 +70,10 @@ public sealed partial class IngressEngine
     /// </summary>
     private long _lastHandshakeEvictionTicks;
     /// <summary>
+    /// Server secret used to sign NAT challenge tokens. Generated once at construction and never transmitted.
+    /// </summary>
+    private readonly byte[] _natChallengeSecret = new byte[32];
+    /// <summary>
     /// Raised when a complete payload (unsegmented or fully reassembled) is ready for the application layer.
     /// </summary>
     public event PayloadDeliveredDelegate? PayloadDelivered;
@@ -111,6 +115,7 @@ public sealed partial class IngressEngine
         _connections = connections;
         _sender = sender;
         _telemetry = telemetry;
+        System.Security.Cryptography.RandomNumberGenerator.Fill(_natChallengeSecret);
     }
 
     /// <summary>
@@ -238,7 +243,7 @@ public sealed partial class IngressEngine
     /// </param>
     private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, CancellationToken cancellationToken, ref bool isPayloadCopied)
     {
-        PacketFlags flags;
+        PacketType type;
         ushort sequence;
         ushort segmentId;
         byte segmentIndex;
@@ -247,7 +252,7 @@ public sealed partial class IngressEngine
 
         try
         {
-            headerSize = PacketHeader.Read(buffer.AsSpan(0, length), out flags, out sequence, out segmentId, out segmentIndex, out segmentCount);
+            headerSize = PacketHeader.Read(buffer.AsSpan(0, length), out type, out sequence, out segmentId, out segmentIndex, out segmentCount);
         }
         catch
         {
@@ -257,50 +262,54 @@ public sealed partial class IngressEngine
             return;
         }
 
-        // Handshake from a new peer.
-        if ((flags & PacketFlags.Handshake) != 0)
+        // Connection-less packet types — handled before any connection lookup.
+        switch (type)
         {
-            ProcessHandshake(fromEndPoint, buffer, headerSize, length, cancellationToken);
-            return;
-        }
+            case PacketType.Handshake:
+                ProcessHandshake(fromEndPoint, buffer, headerSize, length, cancellationToken);
+                return;
 
-        // Extended flag only — NAT probe (no payload) or rendezvous-server message (has payload).
-        if (flags == PacketFlags.Extended)
-        {
-            if (length > headerSize)
-                ProcessNatServerPacket(fromEndPoint, buffer.AsSpan(headerSize, length - headerSize));
-            else
+            case PacketType.NatProbe:
                 ProcessNatProbe(fromEndPoint, cancellationToken);
-            return;
+                return;
+
+            case PacketType.NatChallenge:
+                ProcessNatChallengeExchange(fromEndPoint, buffer.AsSpan(headerSize, length - headerSize), cancellationToken);
+                return;
+
+            case PacketType.NatRegister:
+            case PacketType.NatHeartbeat:
+            case PacketType.NatHeartbeatAck:
+            case PacketType.NatPeerReady:
+            case PacketType.NatSessionFull:
+                ProcessNatServerPacket(fromEndPoint, type, buffer.AsSpan(headerSize, length - headerSize));
+                return;
         }
 
         if (!_connections.TryGet(fromEndPoint, out SynapseConnection? synapseConnection) || synapseConnection is null)
         {
-            // Not yet established - drop silently.
             _telemetry.OnDroppedIn();
             return;
         }
 
         synapseConnection.LastReceivedTicks = DateTime.UtcNow.Ticks;
 
-        if ((flags & PacketFlags.Disconnect) != 0)
+        switch (type)
         {
-            synapseConnection.State = ConnectionState.Disconnected;
-            _connections.Remove(fromEndPoint, out _);
-            ConnectionClosed?.Invoke(synapseConnection);
-            // PeerDisconnect is a polite-cause violation: surface it on ViolationDetected with an Ignore default (we already removed/closed the connection above, so there is nothing further to kick or blacklist).
-            ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.PeerDisconnect, 0, null, ViolationAction.Ignore);
-            return;
-        }
+            case PacketType.Disconnect:
+                synapseConnection.State = ConnectionState.Disconnected;
+                _connections.Remove(fromEndPoint, out _);
+                ConnectionClosed?.Invoke(synapseConnection);
+                ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.PeerDisconnect, 0, null, ViolationAction.Ignore);
+                return;
 
-        if ((flags & PacketFlags.KeepAlive) != 0)
-            return;
+            case PacketType.KeepAlive:
+                return;
 
-        if ((flags & PacketFlags.Ack) != 0)
-        {
-            if (synapseConnection.PendingReliableQueue.TryRemove(sequence, out SynapseConnection.PendingReliable? acked))
-                SynapseConnection.ReturnPendingReliableBuffers(acked);
-            return;
+            case PacketType.Ack:
+                if (synapseConnection.PendingReliableQueue.TryRemove(sequence, out SynapseConnection.PendingReliable? acked))
+                    SynapseConnection.ReturnPendingReliableBuffers(acked);
+                return;
         }
 
         int payloadLength = length - headerSize;
@@ -312,9 +321,7 @@ public sealed partial class IngressEngine
             return;
         }
 
-        // Validate the declared segment assembly size before allocating anything.
-        // A malicious client could claim a large segmentCount to force a large reassembly.
-        if ((flags & PacketFlags.Segmented) != 0 && _config.MaximumReassembledPacketSize > 0)
+        if ((type == PacketType.Segmented || type == PacketType.ReliableSegmented) && _config.MaximumReassembledPacketSize > 0)
         {
             if (segmentCount * _config.MaximumTransmissionUnit > _config.MaximumReassembledPacketSize)
             {
@@ -327,18 +334,25 @@ public sealed partial class IngressEngine
             }
         }
 
-        // isReliable payload: deliver in order.
-        // Segmented isReliable messages delay the ACK until all segments are reassembled so the sender retransmits the full set if any segment goes missing.
-        if ((flags & PacketFlags.Reliable) != 0)
+        switch (type)
         {
-            byte[] payloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
-            Buffer.BlockCopy(buffer, headerSize, payloadBuffer, 0, payloadLength);
-            ArraySegment<byte> payload = new(payloadBuffer, 0, payloadLength);
+            case PacketType.Reliable:
+            {
+                byte[] payloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
+                Buffer.BlockCopy(buffer, headerSize, payloadBuffer, 0, payloadLength);
+                ArraySegment<byte> payload = new(payloadBuffer, 0, payloadLength);
+                _ = _sender.SendAckAsync(synapseConnection, sequence, cancellationToken);
+                DeliverOrdered(synapseConnection, sequence, payload, isReliable: true);
+                return;
+            }
 
-            if ((flags & PacketFlags.Segmented) != 0)
+            case PacketType.ReliableSegmented:
             {
                 if (_config.MaximumSegments is not SynapseConfig.DisabledMaximumSegments)
                 {
+                    byte[] payloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
+                    Buffer.BlockCopy(buffer, headerSize, payloadBuffer, 0, payloadLength);
+                    ArraySegment<byte> payload = new(payloadBuffer, 0, payloadLength);
                     PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
 
                     if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, payload, isReliable: true, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
@@ -356,59 +370,58 @@ public sealed partial class IngressEngine
                         ArrayPool<byte>.Shared.Return(payloadBuffer);
                         return;
                     }
+
+                    ArrayPool<byte>.Shared.Return(payloadBuffer);
                 }
 
-                ArrayPool<byte>.Shared.Return(payloadBuffer);
                 return;
             }
 
-            _ = _sender.SendAckAsync(synapseConnection, sequence, cancellationToken);
-            DeliverOrdered(synapseConnection, sequence, payload, isReliable: true);
-            return;
-        }
-
-        // Unreliable.
-        if ((flags & PacketFlags.Segmented) != 0)
-        {
-            if (_config.MaximumSegments != SynapseConfig.DisabledMaximumSegments)
+            case PacketType.Segmented:
             {
-                byte[] segmentPayloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
-                Buffer.BlockCopy(buffer, headerSize, segmentPayloadBuffer, 0, payloadLength);
-                PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
+                if (_config.MaximumSegments != SynapseConfig.DisabledMaximumSegments)
+                {
+                    byte[] segmentPayloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
+                    Buffer.BlockCopy(buffer, headerSize, segmentPayloadBuffer, 0, payloadLength);
+                    PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
 
-                if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, new(segmentPayloadBuffer, 0, payloadLength), isReliable: false, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
-                {
-                    PayloadDelivered?.Invoke(synapseConnection, assembledPayload, false);
-                }
-                else if (isProtocolViolation)
-                {
-                    _telemetry.OnDroppedIn();
-                    ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature,
-                        ViolationReason.Malformed, length,
-                        $"Segment {segmentId} resent with mismatched segmentCount/reliability",
-                        ViolationAction.KickAndBlacklist);
+                    if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, new(segmentPayloadBuffer, 0, payloadLength), isReliable: false, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
+                    {
+                        PayloadDelivered?.Invoke(synapseConnection, assembledPayload, false);
+                    }
+                    else if (isProtocolViolation)
+                    {
+                        _telemetry.OnDroppedIn();
+                        ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature,
+                            ViolationReason.Malformed, length,
+                            $"Segment {segmentId} resent with mismatched segmentCount/reliability",
+                            ViolationAction.KickAndBlacklist);
+                        ArrayPool<byte>.Shared.Return(segmentPayloadBuffer);
+                        return;
+                    }
+
                     ArrayPool<byte>.Shared.Return(segmentPayloadBuffer);
-                    return;
                 }
 
-                ArrayPool<byte>.Shared.Return(segmentPayloadBuffer);
+                return;
             }
-            // Segmented but segmentation disabled - drop silently.
-            return;
-        }
 
-        // Unreliable non-segmented: either pass the ingress buffer directly (zero-copy) or copy the payload into a fresh pool buffer.
-        // When handing off, isPayloadCopied = false signals the receive loop not to return rentedBuffer — ownership passes to the PayloadDelivered subscriber, which returns it after callbacks.
-        if (!_config.CopyReceivedPayloads)
-        {
-            isPayloadCopied = false;
-            PayloadDelivered?.Invoke(synapseConnection, new(buffer, headerSize, payloadLength), false);
-        }
-        else
-        {
-            byte[] payloadCopyBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
-            Buffer.BlockCopy(buffer, headerSize, payloadCopyBuffer, 0, payloadLength);
-            PayloadDelivered?.Invoke(synapseConnection, new(payloadCopyBuffer, 0, payloadLength), false);
+            case PacketType.None:
+            {
+                if (!_config.CopyReceivedPayloads)
+                {
+                    isPayloadCopied = false;
+                    PayloadDelivered?.Invoke(synapseConnection, new(buffer, headerSize, payloadLength), false);
+                }
+                else
+                {
+                    byte[] payloadCopyBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
+                    Buffer.BlockCopy(buffer, headerSize, payloadCopyBuffer, 0, payloadLength);
+                    PayloadDelivered?.Invoke(synapseConnection, new(payloadCopyBuffer, 0, payloadLength), false);
+                }
+
+                return;
+            }
         }
     }
 
@@ -491,41 +504,6 @@ public sealed partial class IngressEngine
             foreach (ArraySegment<byte> deliverPayload in toDeliver)
                 PayloadDelivered?.Invoke(synapseConnection, deliverPayload, isReliable);
         }
-    }
-
-    /// <summary>
-    /// Evicts stale entries from the NAT probe response-time dictionary.
-    /// </summary>
-    /// <param name="nowTicks">The current UTC tick count.</param>
-    /// <param name="staleTicks">Age in ticks beyond which an entry is considered stale.</param>
-    private void RemoveExpiredProbeLimitEntries(long nowTicks, long staleTicks) =>
-        RemoveExpiredEntries(_natProbeLastResponseTicks, nowTicks, staleTicks);
-
-    /// <summary>
-    /// Parses a NAT server packet body into an <see cref="IPEndPoint"/> (address family byte + address + port).
-    /// Returns null if the body is malformed or too short.
-    /// </summary>
-    /// <param name="body">The raw body bytes following the NAT packet-type byte.</param>
-    /// <returns>The parsed <see cref="IPEndPoint"/>, or null if the body is too short or uses an unrecognised address family.</returns>
-    private static IPEndPoint? TryParsePeerEndPoint(ReadOnlySpan<byte> body)
-    {
-        if (body.Length < 1)
-            return null;
-        byte addrFamily = body[0];
-        ReadOnlySpan<byte> rest = body[1..];
-        if (addrFamily == 4 && rest.Length >= 6)
-        {
-            IPAddress ip = new(rest[..4]);
-            ushort port = (ushort)(rest[4] | (rest[5] << 8));
-            return new(ip, port);
-        }
-        if (addrFamily == 6 && rest.Length >= 18)
-        {
-            IPAddress ip = new(rest[..16]);
-            ushort port = (ushort)(rest[16] | (rest[17] << 8));
-            return new(ip, port);
-        }
-        return null;
     }
 
     /// <summary>

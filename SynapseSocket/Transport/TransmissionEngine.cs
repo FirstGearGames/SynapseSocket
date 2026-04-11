@@ -77,12 +77,12 @@ public sealed partial class TransmissionEngine
     /// <param name="cancellationToken">Token to cancel the send operation.</param>
     internal async Task SendUnreliableUnsegmentedAsync(SynapseConnection synapseConnection, ArraySegment<byte> payload, CancellationToken cancellationToken)
     {
-        const PacketFlags Flags = PacketFlags.None;
-        int totalLength = PacketHeader.ComputeHeaderSize(Flags) + payload.Count;
+        const PacketType Type = PacketType.None;
+        int totalLength = PacketHeader.ComputeHeaderSize(Type) + payload.Count;
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(totalLength);
         try
         {
-            int written = PacketHeader.BuildPacket(rentedBuffer.AsSpan(), Flags, 0, 0, 0, 0, payload.AsSpan());
+            int written = PacketHeader.BuildPacket(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0, payload.AsSpan());
             await SendRawAsync(new(rentedBuffer, 0, written), synapseConnection.RemoteEndPoint, cancellationToken).ConfigureAwait(false);
         }
         finally
@@ -109,11 +109,11 @@ public sealed partial class TransmissionEngine
         lock (synapseConnection.ReliableLock)
             sequence = synapseConnection.NextOutgoingSequence++;
 
-        const PacketFlags Flags = PacketFlags.Reliable;
-        int totalLength = PacketHeader.ComputeHeaderSize(Flags) + payload.Count;
+        const PacketType Type = PacketType.Reliable;
+        int totalLength = PacketHeader.ComputeHeaderSize(Type) + payload.Count;
 
         byte[] packetBuffer = new byte[totalLength];
-        int written = PacketHeader.BuildPacket(packetBuffer.AsSpan(), Flags, sequence, 0, 0, 0, payload.AsSpan());
+        int written = PacketHeader.BuildPacket(packetBuffer.AsSpan(), Type, sequence, 0, 0, 0, payload.AsSpan());
 
         SynapseConnection.PendingReliable pendingReliable = new()
         {
@@ -197,10 +197,10 @@ public sealed partial class TransmissionEngine
     /// <returns>A task that completes when the ACK packet has been handed to the socket.</returns>
     public Task SendAckAsync(SynapseConnection synapseConnection, ushort sequence, CancellationToken cancellationToken)
     {
-        const PacketFlags Flags = PacketFlags.Ack;
-        int headerSize = PacketHeader.ComputeHeaderSize(Flags);
+        const PacketType Type = PacketType.Ack;
+        int headerSize = PacketHeader.ComputeHeaderSize(Type);
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
-        PacketHeader.Write(rentedBuffer.AsSpan(), Flags, sequence, 0, 0, 0);
+        PacketHeader.Write(rentedBuffer.AsSpan(), Type, sequence, 0, 0, 0);
         return SendAndPoolBufferAsync(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint, cancellationToken);
     }
 
@@ -212,12 +212,12 @@ public sealed partial class TransmissionEngine
     /// <returns>A task that completes when the handshake packet has been handed to the socket.</returns>
     public Task SendHandshakeAsync(IPEndPoint target, CancellationToken cancellationToken)
     {
-        const PacketFlags Flags = PacketFlags.Handshake;
+        const PacketType Type = PacketType.Handshake;
         const int NonceSize = 4;
-        int headerSize = PacketHeader.ComputeHeaderSize(Flags);
+        int headerSize = PacketHeader.ComputeHeaderSize(Type);
         int totalSize = headerSize + NonceSize;
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(totalSize);
-        PacketHeader.Write(rentedBuffer.AsSpan(), Flags, 0, 0, 0, 0);
+        PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
         RandomNumberGenerator.Fill(rentedBuffer.AsSpan(headerSize, NonceSize));
         return SendAndPoolBufferAsync(new(rentedBuffer, 0, totalSize), target, cancellationToken);
     }
@@ -230,10 +230,10 @@ public sealed partial class TransmissionEngine
     /// <returns>A task that completes when the keep-alive packet has been handed to the socket.</returns>
     public Task SendKeepAliveAsync(SynapseConnection synapseConnection, CancellationToken cancellationToken)
     {
-        const PacketFlags Flags = PacketFlags.KeepAlive;
-        int headerSize = PacketHeader.ComputeHeaderSize(Flags);
+        const PacketType Type = PacketType.KeepAlive;
+        int headerSize = PacketHeader.ComputeHeaderSize(Type);
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
-        PacketHeader.Write(rentedBuffer.AsSpan(), Flags, 0, 0, 0, 0);
+        PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
         return SendAndPoolBufferAsync(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint, cancellationToken);
     }
 
@@ -245,10 +245,10 @@ public sealed partial class TransmissionEngine
     /// <returns>A task that completes when the disconnect packet has been handed to the socket.</returns>
     public Task SendDisconnectAsync(SynapseConnection synapseConnection, CancellationToken cancellationToken)
     {
-        const PacketFlags Flags = PacketFlags.Disconnect;
-        int headerSize = PacketHeader.ComputeHeaderSize(Flags);
+        const PacketType Type = PacketType.Disconnect;
+        int headerSize = PacketHeader.ComputeHeaderSize(Type);
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
-        PacketHeader.Write(rentedBuffer.AsSpan(), Flags, 0, 0, 0, 0);
+        PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
         return SendAndPoolBufferAsync(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint, cancellationToken);
     }
 

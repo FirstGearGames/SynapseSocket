@@ -1,5 +1,8 @@
 using System;
+using System.Buffers;
+using System.Collections.Concurrent;
 using System.Net;
+using System.Security.Cryptography;
 using System.Threading;
 using SynapseSocket.Connections;
 using SynapseSocket.Packets;
@@ -19,17 +22,26 @@ public sealed partial class IngressEngine
     /// Raised when a NAT rendezvous server reports the peer's external endpoint.
     /// </summary>
     public event NatPeerReadyDelegate? NatPeerReady;
+
     /// <summary>
     /// Raised when a NAT rendezvous server rejects the session because it is already full.
     /// </summary>
     public event NatSessionFullDelegate? NatSessionFull;
 
     /// <summary>
-    /// Handles an inbound NAT probe from an unrecognised endpoint.
-    /// Responds with a probe + handshake, subject to per-IP rate limiting.
+    /// Size of the HMAC-SHA256 token truncated to this many bytes for NAT challenge packets.
     /// </summary>
-    /// <param name="fromEndPoint">The source endpoint that sent the NAT probe.</param>
-    /// <param name="cancellationToken">Token forwarded to outbound send helpers.</param>
+    private const int NatTokenSize = 8;
+
+    /// <summary>
+    /// Duration of a single time bucket in ticks. Tokens are valid for the current bucket and the previous one (~60 seconds total).
+    /// </summary>
+    private const long NatTokenTimeBucketTicks = 30 * TimeSpan.TicksPerSecond;
+
+    /// <summary>
+    /// Handles an inbound NAT probe from an unrecognised endpoint.
+    /// Responds with a challenge token instead of a handshake, subject to per-IP rate limiting.
+    /// </summary>
     private void ProcessNatProbe(IPEndPoint fromEndPoint, CancellationToken cancellationToken)
     {
         if (_config.NatTraversal.Mode == NatTraversalMode.Disabled)
@@ -45,13 +57,11 @@ public sealed partial class IngressEngine
         if (_connections.TryGet(fromEndPoint, out SynapseConnection? _))
             return;
 
-        // Rate-limit outbound probe responses per source IP to mitigate amplification abuse.
-        // A spoofed-source probe would cause us to send one probe + one handshake to the spoofed address, but no more than once per IntervalMilliseconds — bounding the amplification factor to 2 packets at the configured interval regardless of inbound flood rate.
+        // Rate-limit outbound challenge responses per source IP.
         long nowTicks = DateTime.UtcNow.Ticks;
         long minIntervalTicks = _config.NatTraversal.IntervalMilliseconds * TimeSpan.TicksPerMillisecond;
         IpKey addressKey = IpKey.From(fromEndPoint.Address);
 
-        // Periodic eviction: bound dictionary growth without relying on traffic volume.
         long lastProbeEvict = Volatile.Read(ref _lastProbeEvictionTicks);
 
         if (nowTicks - lastProbeEvict > TimeSpan.TicksPerMinute)
@@ -67,16 +77,53 @@ public sealed partial class IngressEngine
 
         _natProbeLastResponseTicks[addressKey] = nowTicks;
 
-        _ = _sender.SendNatProbeAsync(fromEndPoint, cancellationToken);
-        _ = _sender.SendHandshakeAsync(fromEndPoint, cancellationToken);
+        Span<byte> token = stackalloc byte[NatTokenSize];
+        ComputeNatToken(fromEndPoint, nowTicks / NatTokenTimeBucketTicks, token);
+        _ = _sender.SendNatChallengeAsync(fromEndPoint, token, cancellationToken);
     }
-    
+
     /// <summary>
-    /// Routes an inbound packet from the configured NAT rendezvous server to the appropriate handler (PeerReady, SessionFull, HeartbeatAck).
+    /// Handles an inbound NatChallenge packet from an unrecognised endpoint.
+    /// If the payload matches a token this engine issued, sends a handshake (completing the probe exchange).
+    /// Otherwise echoes the token back — this is the initiator side of a simultaneous P2P probe.
     /// </summary>
-    /// <param name="fromEndPoint">The source endpoint the packet arrived from.</param>
-    /// <param name="payload">The packet bytes following the wire header.</param>
-    private void ProcessNatServerPacket(IPEndPoint fromEndPoint, ReadOnlySpan<byte> payload)
+    private void ProcessNatChallengeExchange(IPEndPoint fromEndPoint, ReadOnlySpan<byte> payload, CancellationToken cancellationToken)
+    {
+        if (payload.Length != NatTokenSize)
+            return;
+
+        if (_config.NatTraversal.Mode == NatTraversalMode.Disabled)
+            return;
+
+        ulong signature = _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
+
+        if (_security.IsBlacklisted(signature))
+            return;
+
+        if (_connections.TryGet(fromEndPoint, out SynapseConnection? _))
+            return;
+
+        long nowTicks = DateTime.UtcNow.Ticks;
+        long minIntervalTicks = _config.NatTraversal.IntervalMilliseconds * TimeSpan.TicksPerMillisecond;
+        IpKey addressKey = IpKey.From(fromEndPoint.Address);
+
+        long lastTicks = _natProbeLastResponseTicks.GetOrAdd(addressKey, 0L);
+
+        if (nowTicks - lastTicks < minIntervalTicks)
+            return;
+
+        _natProbeLastResponseTicks[addressKey] = nowTicks;
+
+        if (VerifyNatToken(fromEndPoint, payload))
+            _ = _sender.SendHandshakeAsync(fromEndPoint, cancellationToken);
+        else
+            _ = _sender.SendNatChallengeAsync(fromEndPoint, payload, cancellationToken);
+    }
+
+    /// <summary>
+    /// Routes an inbound packet from the configured NAT rendezvous server to the appropriate handler.
+    /// </summary>
+    private void ProcessNatServerPacket(IPEndPoint fromEndPoint, PacketType packetType, ReadOnlySpan<byte> payload)
     {
         if (_config.NatTraversal.Mode != NatTraversalMode.Server)
             return;
@@ -87,27 +134,97 @@ public sealed partial class IngressEngine
         if (!fromEndPoint.Equals(_config.NatTraversal.Server.ServerEndPoint))
             return;
 
-        if (payload.Length < 1)
-            return;
-
-        NatPacketType packetType = (NatPacketType)payload[0];
-        ReadOnlySpan<byte> body = payload[1..];
-
         switch (packetType)
         {
-            case NatPacketType.PeerReady:
-                IPEndPoint? peerEndPoint = TryParsePeerEndPoint(body);
+            case PacketType.NatPeerReady:
+                IPEndPoint? peerEndPoint = TryParsePeerEndPoint(payload);
                 if (peerEndPoint is not null)
                     NatPeerReady?.Invoke(peerEndPoint);
                 break;
 
-            case NatPacketType.SessionFull:
+            case PacketType.NatSessionFull:
                 NatSessionFull?.Invoke();
                 break;
 
-            case NatPacketType.HeartbeatAck:
+            case PacketType.NatHeartbeatAck:
                 break;
         }
     }
 
+    /// <summary>
+    /// Computes a truncated HMAC-SHA256 token bound to <paramref name="endPoint"/> and <paramref name="timeBucket"/>.
+    /// Writes exactly <see cref="NatTokenSize"/> bytes into <paramref name="destination"/>.
+    /// </summary>
+    private void ComputeNatToken(IPEndPoint endPoint, long timeBucket, Span<byte> destination)
+    {
+        Span<byte> addressBytes = stackalloc byte[16];
+        endPoint.Address.TryWriteBytes(addressBytes, out int addressLength);
+
+        int inputLength = addressLength + 2 + 8;
+        Span<byte> input = stackalloc byte[inputLength];
+        addressBytes[..addressLength].CopyTo(input);
+
+        int offset = addressLength;
+        input[offset++] = (byte)(endPoint.Port & 0xFF);
+        input[offset++] = (byte)((endPoint.Port >> 8) & 0xFF);
+
+        for (int i = 0; i < 8; i++)
+            input[offset++] = (byte)((timeBucket >> (i * 8)) & 0xFF);
+
+        Span<byte> hashBuffer = stackalloc byte[32];
+        using HMACSHA256 hmac = new(_natChallengeSecret);
+        hmac.TryComputeHash(input, hashBuffer, out _);
+        hashBuffer[..NatTokenSize].CopyTo(destination);
+    }
+
+    /// <summary>
+    /// Returns true if <paramref name="token"/> matches the expected token for the current or previous time bucket.
+    /// </summary>
+    private bool VerifyNatToken(IPEndPoint endPoint, ReadOnlySpan<byte> token)
+    {
+        long bucket = DateTime.UtcNow.Ticks / NatTokenTimeBucketTicks;
+        Span<byte> expected = stackalloc byte[NatTokenSize];
+
+        ComputeNatToken(endPoint, bucket, expected);
+        if (token.SequenceEqual(expected))
+            return true;
+
+        ComputeNatToken(endPoint, bucket - 1, expected);
+        return token.SequenceEqual(expected);
+    }
+
+    /// <summary>
+    /// Evicts stale entries from the NAT probe response-time dictionary.
+    /// </summary>
+    private void RemoveExpiredProbeLimitEntries(long nowTicks, long staleTicks) =>
+        RemoveExpiredEntries(_natProbeLastResponseTicks, nowTicks, staleTicks);
+
+    /// <summary>
+    /// Parses a NAT server packet body into an <see cref="IPEndPoint"/>.
+    /// Returns null if the body is malformed or too short.
+    /// </summary>
+    private static IPEndPoint? TryParsePeerEndPoint(ReadOnlySpan<byte> body)
+    {
+        if (body.Length < 1)
+            return null;
+
+        byte addrFamily = body[0];
+        ReadOnlySpan<byte> rest = body[1..];
+
+        if (addrFamily == 4 && rest.Length >= 6)
+        {
+            IPAddress ip = new(rest[..4]);
+            ushort port = (ushort)(rest[4] | (rest[5] << 8));
+            return new(ip, port);
+        }
+
+        if (addrFamily == 6 && rest.Length >= 18)
+        {
+            IPAddress ip = new(rest[..16]);
+            ushort port = (ushort)(rest[16] | (rest[17] << 8));
+            return new(ip, port);
+        }
+
+        return null;
+    }
 }

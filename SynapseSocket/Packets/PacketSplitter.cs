@@ -30,7 +30,8 @@ public sealed class PacketSplitter : PacketSegmenter
     /// <returns>A rented array of <see cref="ArraySegment{T}"/> values, each representing one wire-ready segment packet.</returns>
     public ArraySegment<byte>[] Split(ReadOnlySpan<byte> payload, bool isReliable, out int segmentCount, ushort sequence = 0)
     {
-        int segmentPayloadSize = (int)MaximumTransmissionUnit - PacketHeader.FlagSize - PacketHeader.SegmentSize - (isReliable ? PacketHeader.SequenceSize : 0);
+        PacketType type = isReliable ? PacketType.ReliableSegmented : PacketType.Segmented;
+        int segmentPayloadSize = (int)MaximumTransmissionUnit - PacketHeader.ComputeHeaderSize(type);
 
         if (segmentPayloadSize <= 0)
             throw new InvalidOperationException("MTU too small for segmentation headers.");
@@ -42,8 +43,7 @@ public sealed class PacketSplitter : PacketSegmenter
 
         segmentCount = totalSegments;
         ushort segmentId = (ushort)Interlocked.Increment(ref _segmentIdCounter);
-        PacketFlags flags = PacketFlags.Segmented | (isReliable ? PacketFlags.Reliable : PacketFlags.None);
-        int headerSize = PacketHeader.ComputeHeaderSize(flags);
+        int headerSize = PacketHeader.ComputeHeaderSize(type);
 
         // Single backing buffer: all N segment packets packed contiguously.
         // N * headerSize is a slight over-estimate because the last segment payload may be smaller, but renting a touch more is cheaper than computing the exact size.
@@ -57,7 +57,7 @@ public sealed class PacketSplitter : PacketSegmenter
         {
             int segmentStartOffset = i * segmentPayloadSize;
             int segmentLength = Math.Min(segmentPayloadSize, payload.Length - segmentStartOffset);
-            int written = PacketHeader.BuildPacket(backingBuffer.AsSpan(bufferOffset), flags, sequence, segmentId, (byte)i, (byte)totalSegments, payload.Slice(segmentStartOffset, segmentLength));
+            int written = PacketHeader.BuildPacket(backingBuffer.AsSpan(bufferOffset), type, sequence, segmentId, (byte)i, (byte)totalSegments, payload.Slice(segmentStartOffset, segmentLength));
             segments[i] = new(backingBuffer, bufferOffset, written);
             bufferOffset += written;
         }

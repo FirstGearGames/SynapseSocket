@@ -18,61 +18,57 @@ public sealed partial class TransmissionEngine
     /// <summary>
     /// Sends a NAT registration packet to the rendezvous server for the given session.
     /// </summary>
-    /// <param name="target">The rendezvous server endpoint to register with.</param>
-    /// <param name="sessionId">The session identifier to register.</param>
-    /// <param name="cancellationToken">Token to cancel the send operation.</param>
-    /// <returns>A task that completes when the registration packet has been handed to the socket.</returns>
     public Task SendNatRegisterAsync(IPEndPoint target, string sessionId, CancellationToken cancellationToken)
     {
-        return SendNatServerPacketAsync(target, NatPacketType.Register, sessionId, cancellationToken);
+        return SendNatServerPacketAsync(target, PacketType.NatRegister, sessionId, cancellationToken);
     }
 
     /// <summary>
     /// Sends a NAT heartbeat packet to the rendezvous server to keep the session alive.
     /// </summary>
-    /// <param name="target">The rendezvous server endpoint.</param>
-    /// <param name="sessionId">The session identifier associated with this client.</param>
-    /// <param name="cancellationToken">Token to cancel the send operation.</param>
-    /// <returns>A task that completes when the heartbeat packet has been handed to the socket.</returns>
     public Task SendNatHeartbeatAsync(IPEndPoint target, string sessionId, CancellationToken cancellationToken)
     {
-        return SendNatServerPacketAsync(target, NatPacketType.Heartbeat, sessionId, cancellationToken);
+        return SendNatServerPacketAsync(target, PacketType.NatHeartbeat, sessionId, cancellationToken);
     }
 
     /// <summary>
-    /// Builds and sends a NAT server packet (register or heartbeat) with the session identifier encoded as a fixed-length ASCII payload.
+    /// Builds and sends a NAT server packet with the session identifier encoded as a fixed-length ASCII payload.
     /// </summary>
-    /// <param name="target">The rendezvous server endpoint.</param>
-    /// <param name="packetType">The NAT packet type byte written at the start of the payload.</param>
-    /// <param name="sessionId">The session identifier to encode in the packet.</param>
-    /// <param name="cancellationToken">Token to cancel the send operation.</param>
-    /// <returns>A task that completes when the packet has been handed to the socket.</returns>
-    private Task SendNatServerPacketAsync(IPEndPoint target, NatPacketType packetType, string sessionId, CancellationToken cancellationToken)
+    private Task SendNatServerPacketAsync(IPEndPoint target, PacketType packetType, string sessionId, CancellationToken cancellationToken)
     {
-        const PacketFlags Flags = PacketFlags.Extended;
         const int SessionIdBytes = ServerNatConfig.SessionIdLength;
-        const int PayloadSize = 1 + SessionIdBytes;
-        int headerSize = PacketHeader.ComputeHeaderSize(Flags);
-        int totalSize = headerSize + PayloadSize;
+        int headerSize = PacketHeader.ComputeHeaderSize(packetType);
+        int totalSize = headerSize + SessionIdBytes;
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(totalSize);
-        int offset = PacketHeader.Write(rentedBuffer.AsSpan(), Flags, 0, 0, 0, 0);
-        rentedBuffer[offset++] = (byte)packetType;
+        int offset = PacketHeader.Write(rentedBuffer.AsSpan(), packetType, 0, 0, 0, 0);
         System.Text.Encoding.ASCII.GetBytes(sessionId, 0, SessionIdBytes, rentedBuffer, offset);
         return SendAndPoolBufferAsync(new(rentedBuffer, 0, totalSize), target, cancellationToken);
     }
 
     /// <summary>
-    /// Sends a minimal NAT probe (extended header, no body) to open a NAT mapping on the remote side.
+    /// Sends a minimal NAT probe (no payload) to open a NAT mapping on the remote side.
     /// </summary>
-    /// <param name="target">The remote endpoint to probe.</param>
-    /// <param name="cancellationToken">Token to cancel the send operation.</param>
-    /// <returns>A task that completes when the probe packet has been handed to the socket.</returns>
     public Task SendNatProbeAsync(IPEndPoint target, CancellationToken cancellationToken)
     {
-        const PacketFlags Flags = PacketFlags.Extended;
-        int headerSize = PacketHeader.ComputeHeaderSize(Flags);
+        const PacketType Type = PacketType.NatProbe;
+        int headerSize = PacketHeader.ComputeHeaderSize(Type);
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
-        PacketHeader.Write(rentedBuffer.AsSpan(), Flags, 0, 0, 0, 0);
+        PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
         return SendAndPoolBufferAsync(new(rentedBuffer, 0, headerSize), target, cancellationToken);
+    }
+
+    /// <summary>
+    /// Sends a NAT challenge or challenge echo containing the provided token.
+    /// Used both when issuing a challenge (server → initiator) and when echoing one (initiator → server).
+    /// </summary>
+    public Task SendNatChallengeAsync(IPEndPoint target, ReadOnlySpan<byte> token, CancellationToken cancellationToken)
+    {
+        const PacketType Type = PacketType.NatChallenge;
+        int headerSize = PacketHeader.ComputeHeaderSize(Type);
+        int totalSize = headerSize + token.Length;
+        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(totalSize);
+        PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
+        token.CopyTo(rentedBuffer.AsSpan(headerSize));
+        return SendAndPoolBufferAsync(new(rentedBuffer, 0, totalSize), target, cancellationToken);
     }
 }
