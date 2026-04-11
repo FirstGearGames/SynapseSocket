@@ -56,11 +56,13 @@ public sealed class LatencySimulator
 
         double lossRoll;
         int delayMilliseconds;
+
         lock (_lock)
         {
             lossRoll = _random.NextDouble();
             int jitter = _config.JitterMilliseconds > 0 ? _random.Next(0, (int)_config.JitterMilliseconds) : 0;
             delayMilliseconds = (int)_config.BaseLatencyMilliseconds + jitter;
+
             if (_random.NextDouble() < _config.ReorderChance)
                 delayMilliseconds += _random.Next(0, 50);
         }
@@ -85,6 +87,7 @@ public sealed class LatencySimulator
     {
         if (delayMilliseconds > 0)
             await Task.Delay(delayMilliseconds, cancellationToken).ConfigureAwait(false);
+
         await sender(buffer, length, target).ConfigureAwait(false);
     }
 }

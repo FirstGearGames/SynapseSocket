@@ -89,10 +89,8 @@ public sealed class SecurityProvider
     /// <summary>
     /// Lowest-level filter for packets from an already-established connection.
     /// Checks packet size and the per-endpoint rate limit using the connection's cached signature.
-    /// Signature computation and blacklist lookup are intentionally omitted here: they apply only
-    /// during the initial handshake path (<see cref="InspectNew"/>). Once a connection is established,
-    /// a kick+blacklist action removes it from the connection table, so the next packet from that
-    /// peer falls through to <see cref="InspectNew"/> automatically.
+    /// Signature computation and blacklist lookup are intentionally omitted here: they apply only during the initial handshake path (<see cref="InspectNew"/>).
+    /// Once a connection is established, a kick+blacklist action removes it from the connection table, so the next packet from that peer falls through to <see cref="InspectNew"/> automatically.
     /// </summary>
     /// <param name="packetLength">Length of the received packet in bytes.</param>
     /// <param name="cachedSignature">The pre-computed signature stored on the connection.</param>
@@ -111,9 +109,7 @@ public sealed class SecurityProvider
 
     /// <summary>
     /// Lowest-level filter for packets from an unknown or not-yet-established sender.
-    /// Computes the signature (so violation reports carry the correct peer identity even for
-    /// rejected packets), checks the blacklist, then delegates to <see cref="InspectEstablished"/>
-    /// for size and rate-limit enforcement.
+    /// Computes the signature (so violation reports carry the correct peer identity even for rejected packets), checks the blacklist, then delegates to <see cref="InspectEstablished"/> for size and rate-limit enforcement.
     /// </summary>
     /// <param name="endPoint">The remote endpoint the packet arrived from.</param>
     /// <param name="packetLength">Length of the received packet in bytes.</param>
@@ -122,8 +118,7 @@ public sealed class SecurityProvider
     public FilterResult InspectNew(IPEndPoint endPoint, int packetLength, out ulong signature)
     {
         // Reject immediately if the signature cannot be computed or resolves to the unset sentinel.
-        // Without a valid identity we cannot rate-limit, blacklist, or attribute a violation correctly,
-        // so there is nothing useful we can do with the packet.
+        // Without a valid identity we cannot rate-limit, blacklist, or attribute a violation correctly, so there is nothing useful we can do with the packet.
         if (!SignatureProvider.TryCompute(endPoint, ReadOnlySpan<byte>.Empty, out signature) || signature == UnsetSignature)
         {
             signature = UnsetSignature;
@@ -175,8 +170,7 @@ public sealed class SecurityProvider
         private readonly object _lock = new();
 
         /// <summary>
-        /// Returns true if the endpoint may send another packet within the current window,
-        /// incrementing the counter; returns false when the limit has been reached.
+        /// Returns true if the endpoint may send another packet within the current window, incrementing the counter; returns false when the limit has been reached.
         /// </summary>
         /// <param name="maximumPacketsPerSecond">The maximum number of packets allowed per second.</param>
         /// <returns>True if the packet is within the rate limit; false if the limit has been exceeded.</returns>
@@ -187,13 +181,16 @@ public sealed class SecurityProvider
                 long nowTicks = DateTime.UtcNow.Ticks;
                 LastAccessTicks = nowTicks;
                 long windowTicks = TimeSpan.TicksPerSecond;
+
                 if (nowTicks - _windowStartTicks >= windowTicks)
                 {
                     _windowStartTicks = nowTicks;
                     _packetCount = 0;
                 }
+
                 if (_packetCount >= maximumPacketsPerSecond)
                     return false;
+
                 _packetCount++;
                 return true;
             }

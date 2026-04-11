@@ -37,8 +37,10 @@ public abstract class PacketSegmenter : IPoolResettable
     {
         if (maximumTransmissionUnit == 0 || maximumTransmissionUnit <= PacketHeader.MaxHeaderSize)
             throw new ArgumentOutOfRangeException(nameof(maximumTransmissionUnit));
+
         if (maximumSegments == 0 || maximumSegments > 255)
             throw new ArgumentOutOfRangeException(nameof(maximumSegments));
+
         MaximumTransmissionUnit = maximumTransmissionUnit;
         MaximumSegments = maximumSegments;
     }

@@ -40,8 +40,7 @@ public sealed partial class TransmissionEngine
     }
 
     /// <summary>
-    /// Builds and sends a NAT server packet (register or heartbeat) with the session identifier
-    /// encoded as a fixed-length ASCII payload.
+    /// Builds and sends a NAT server packet (register or heartbeat) with the session identifier encoded as a fixed-length ASCII payload.
     /// </summary>
     /// <param name="target">The rendezvous server endpoint.</param>
     /// <param name="packetType">The NAT packet type byte written at the start of the payload.</param>

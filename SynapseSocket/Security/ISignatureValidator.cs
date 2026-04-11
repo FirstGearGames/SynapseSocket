@@ -4,13 +4,9 @@ using System.Net;
 namespace SynapseSocket.Security;
 
 /// <summary>
-/// Optional interface for custom handshake validation. When supplied on
-/// <c>SynapseConfig.SignatureValidator</c>, the engine calls this for
-/// every incoming handshake and rejects the peer (raising
-/// <c>ConnectionFailed(SignatureRejected)</c>) if the validator returns
-/// false. Use this to enforce allow-lists, token schemes, or any
-/// application-specific identity check layered on top of the raw
-/// <see cref="ISignatureProvider"/> signature.
+/// Optional interface for custom handshake validation.
+/// When supplied on <c>SynapseConfig.SignatureValidator</c>, the engine calls this for every incoming handshake and rejects the peer (raising <c>ConnectionFailed(SignatureRejected)</c>) if the validator returns false.
+/// Use this to enforce allow-lists, token schemes, or any application-specific identity check layered on top of the raw <see cref="ISignatureProvider"/> signature.
 /// </summary>
 public interface ISignatureValidator
 {

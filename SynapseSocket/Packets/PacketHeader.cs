@@ -12,9 +12,8 @@ namespace SynapseSocket.Packets;
 ///   [5]      : Segment Index (Byte) - only when Segmented
 ///   [6]      : Segment Count (Byte) - only when Segmented
 ///   [...]    : Payload
-/// All fields after the flag byte are optional and appear in the order above,
-/// only if their corresponding flag is present. Explicit little-endian ordering
-/// is used for cross-platform consistency.
+/// All fields after the flag byte are optional and appear in the order above, only if their corresponding flag is present.
+/// Explicit little-endian ordering is used for cross-platform consistency.
 /// </summary>
 public static class PacketHeader
 {
@@ -131,6 +130,7 @@ public static class PacketHeader
         if ((flags & (PacketFlags.Reliable | PacketFlags.Ack)) != 0)
         {
             if (buffer.Length < offset + SequenceSize) throw new ArgumentException("Buffer too small for sequence.");
+
             sequence = (ushort)(buffer[offset] | (buffer[offset + 1] << 8));
             offset += 2;
         }
@@ -138,6 +138,7 @@ public static class PacketHeader
         if ((flags & PacketFlags.Segmented) != 0)
         {
             if (buffer.Length < offset + SegmentSize) throw new ArgumentException("Buffer too small for segment info.");
+
             segmentId = (ushort)(buffer[offset] | (buffer[offset + 1] << 8));
             segmentIndex = buffer[offset + 2];
             segmentCount = buffer[offset + 3];

@@ -28,6 +28,7 @@ public sealed class DefaultSignatureProvider : ISignatureProvider
         }
 
         Span<byte> addressBytes = stackalloc byte[16];
+
         if (!endPoint.Address.TryWriteBytes(addressBytes, out int writtenByteCount))
         {
             signature = SecurityProvider.UnsetSignature;
@@ -35,6 +36,7 @@ public sealed class DefaultSignatureProvider : ISignatureProvider
         }
 
         ulong hash = FnvOffset;
+
         for (int i = 0; i < writtenByteCount; i++)
         {
             hash ^= addressBytes[i];

@@ -16,6 +16,13 @@ public sealed class ConnectionManager
     /// Current live connection count.
     /// </summary>
     public int Count => _byEndPoint.Count;
+
+    /// <summary>
+    /// Raised when two connections produce the same 64-bit signature (birthday-bound collision).
+    /// The newer connection wins the reverse-lookup slot. Subscribe for telemetry; no corrective action is taken automatically.
+    /// </summary>
+    public event SignatureCollisionDelegate? SignatureCollisionDetected;
+
     private readonly ConcurrentDictionary<EndPointKey, SynapseConnection> _byEndPoint = [];
 
     /// <summary>
@@ -44,13 +51,6 @@ public sealed class ConnectionManager
         => _bySignature.TryGetValue(signature, out connection);
 
     /// <summary>
-    /// Raised when two connections produce the same 64-bit signature (birthday-bound collision).
-    /// The newer connection wins the reverse-lookup slot. Subscribe for telemetry;
-    /// no corrective action is taken automatically.
-    /// </summary>
-    public event SignatureCollisionDelegate? SignatureCollisionDetected;
-
-    /// <summary>
     /// Registers a new connection.
     /// Returns the existing one if already present.
     /// </summary>
@@ -62,6 +62,7 @@ public sealed class ConnectionManager
     {
         EndPointKey endPointKey = new(endPoint);
         SynapseConnection synapseConnection = _byEndPoint.GetOrAdd(endPointKey, _ => factory(endPoint, signature));
+
         if (!_bySignature.TryAdd(signature, synapseConnection))
         {
             // Two distinct endpoints produced the same 64-bit signature.
@@ -81,6 +82,7 @@ public sealed class ConnectionManager
     public bool Remove(IPEndPoint endPoint, out SynapseConnection? removedSynapseConnection)
     {
         bool isRemoved = _byEndPoint.TryRemove(new(endPoint), out removedSynapseConnection);
+
         if (isRemoved && removedSynapseConnection is not null) _bySignature.TryRemove(removedSynapseConnection.Signature, out _);
         return isRemoved;
     }
@@ -115,6 +117,7 @@ public sealed class ConnectionManager
         public bool Equals(EndPointKey other)
         {
             if (_endPoint is null || other._endPoint is null) return ReferenceEquals(_endPoint, other._endPoint);
+
             return _endPoint.Port == other._endPoint.Port && _endPoint.Address.Equals(other._endPoint.Address);
         }
 

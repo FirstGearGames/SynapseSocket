@@ -133,14 +133,14 @@ public sealed partial class IngressEngine
     {
         EndPoint anyEndPoint = _socket.AddressFamily == AddressFamily.InterNetworkV6 ? new(IPAddress.IPv6Any, 0) : new IPEndPoint(IPAddress.Any, 0);
 
-        // Always receive into a max-UDP-sized buffer so that oversized datagrams are not silently
-        // truncated by the kernel - we want to see them so the security layer can raise an Oversized violation.
+        // Always receive into a max-UDP-sized buffer so that oversized datagrams are not silently truncated by the kernel — we want to see them so the security layer can raise an Oversized violation.
         const int MaximumUdpDatagramSize = 65535;
 
         while (!cancellationToken.IsCancellationRequested)
         {
             byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
             bool isBufferHandedOff = false;
+
             try
             {
                 SocketReceiveFromResult socketReceiveResult;
@@ -168,13 +168,13 @@ public sealed partial class IngressEngine
                 int receivedLength = socketReceiveResult.ReceivedBytes;
 
                 // Lowest-level mitigation first, before any copy.
-                // Established connections skip signature recomputation and blacklist lookup - those
-                // only apply at handshake time. Size and rate-limit checks still run for all senders.
+                // Established connections skip signature recomputation and blacklist lookup — those only apply at handshake time. Size and rate-limit checks still run for all senders.
                 FilterResult filterResult;
                 ulong signature;
-                if (_connections.TryGet(fromEndPoint, out SynapseConnection? inspectedConnection) && inspectedConnection is not null)
+
+                if (_connections.TryGet(fromEndPoint, out SynapseConnection? synapseConnection) && synapseConnection is not null)
                 {
-                    signature = inspectedConnection.Signature;
+                    signature = synapseConnection.Signature;
                     filterResult = _security.InspectEstablished(receivedLength, signature);
                 }
                 else
@@ -183,6 +183,7 @@ public sealed partial class IngressEngine
                 if (filterResult != FilterResult.Allowed)
                 {
                     _telemetry.OnDroppedIn();
+
                     if (filterResult == FilterResult.Blacklisted)
                     {
                         // Blacklisted = REJECTION, not a per-packet violation.
@@ -200,6 +201,7 @@ public sealed partial class IngressEngine
                     ViolationOccurred?.Invoke(fromEndPoint, signature, violationReason, receivedLength, filterResult.ToString(), ViolationAction.KickAndBlacklist);
                     continue;
                 }
+
                 _telemetry.OnReceived(receivedLength);
 
                 ProcessPacket(rentedBuffer, receivedLength, fromEndPoint, cancellationToken, ref isBufferHandedOff);
@@ -211,14 +213,12 @@ public sealed partial class IngressEngine
             }
             catch (Exception unexpectedException)
             {
-                // Unexpected bug in the processing path. Surface it and keep the loop alive
-                // so a single bad packet cannot silently kill the receive loop.
+                // Unexpected bug in the processing path. Surface it and keep the loop alive so a single bad packet cannot silently kill the receive loop.
                 UnhandledException?.Invoke(unexpectedException);
             }
             finally
             {
-                // When CopyReceivedUnreliablePayload is false, ownership of rentedBuffer is transferred to
-                // the PayloadDelivered subscriber (via OnPayloadDelivered), which returns it to the pool.
+                // When CopyReceivedUnreliablePayload is false, ownership of rentedBuffer is transferred to the PayloadDelivered subscriber (via OnPayloadDelivered), which returns it to the pool.
                 if (!isBufferHandedOff)
                     ArrayPool<byte>.Shared.Return(rentedBuffer, clearArray: false);
             }
@@ -227,16 +227,14 @@ public sealed partial class IngressEngine
     }
 
     /// <summary>
-    /// Parses a single received datagram and routes it to the appropriate handler
-    /// (handshake, data, ack, disconnect, keep-alive, or NAT probe/server).
+    /// Parses a single received datagram and routes it to the appropriate handler (handshake, data, ack, disconnect, keep-alive, or NAT probe/server).
     /// </summary>
     /// <param name="buffer">The raw receive buffer containing the datagram.</param>
     /// <param name="length">Number of valid bytes in <paramref name="buffer"/>.</param>
     /// <param name="fromEndPoint">The source endpoint of the datagram.</param>
     /// <param name="cancellationToken">Token forwarded to async send helpers.</param>
     /// <param name="isBufferHandedOff">
-    /// Set to true when ownership of <paramref name="buffer"/> is transferred to a
-    /// <see cref="PayloadDelivered"/> subscriber so the receive loop does not return it to the pool.
+    /// Set to true when ownership of <paramref name="buffer"/> is transferred to a <see cref="PayloadDelivered"/> subscriber so the receive loop does not return it to the pool.
     /// </param>
     private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, CancellationToken cancellationToken, ref bool isBufferHandedOff)
     {
@@ -290,8 +288,7 @@ public sealed partial class IngressEngine
             synapseConnection.State = ConnectionState.Disconnected;
             _connections.Remove(fromEndPoint, out _);
             ConnectionClosed?.Invoke(synapseConnection);
-            // PeerDisconnect is a polite-cause violation: surface it on ViolationDetected with an Ignore default
-            // (we already removed/closed the connection above, so there is nothing further to kick or blacklist).
+            // PeerDisconnect is a polite-cause violation: surface it on ViolationDetected with an Ignore default (we already removed/closed the connection above, so there is nothing further to kick or blacklist).
             ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.PeerDisconnect, 0, null, ViolationAction.Ignore);
             return;
         }
@@ -307,6 +304,7 @@ public sealed partial class IngressEngine
         }
 
         int payloadLength = length - headerSize;
+
         if (payloadLength < 0)
         {
             _telemetry.OnDroppedIn();
@@ -330,8 +328,7 @@ public sealed partial class IngressEngine
         }
 
         // isReliable payload: deliver in order.
-        // Segmented isReliable messages delay the ACK until all segments are reassembled so
-        // the sender retransmits the full set if any segment goes missing.
+        // Segmented isReliable messages delay the ACK until all segments are reassembled so the sender retransmits the full set if any segment goes missing.
         if ((flags & PacketFlags.Reliable) != 0)
         {
             byte[] payloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
@@ -343,6 +340,7 @@ public sealed partial class IngressEngine
                 if (_config.MaximumSegments != SynapseConfig.DisabledMaximumSegments)
                 {
                     PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
+
                     if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, payload, isReliable: true, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
                     {
                         _ = _sender.SendAckAsync(synapseConnection, sequence, cancellationToken);
@@ -359,6 +357,7 @@ public sealed partial class IngressEngine
                         return;
                     }
                 }
+
                 ArrayPool<byte>.Shared.Return(payloadBuffer);
                 return;
             }
@@ -376,6 +375,7 @@ public sealed partial class IngressEngine
                 byte[] segmentPayloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
                 Buffer.BlockCopy(buffer, headerSize, segmentPayloadBuffer, 0, payloadLength);
                 PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
+
                 if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, new(segmentPayloadBuffer, 0, payloadLength), isReliable: false, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
                 {
                     PayloadDelivered?.Invoke(synapseConnection, assembledPayload, false);
@@ -390,16 +390,15 @@ public sealed partial class IngressEngine
                     ArrayPool<byte>.Shared.Return(segmentPayloadBuffer);
                     return;
                 }
+
                 ArrayPool<byte>.Shared.Return(segmentPayloadBuffer);
             }
             // Segmented but segmentation disabled - drop silently.
             return;
         }
 
-        // Unreliable non-segmented: either pass the ingress buffer directly (zero-copy) or
-        // copy the payload into a fresh pool buffer (safe for immediate caller reuse).
-        // When handing off, isBufferHandedOff signals the receive loop not to return rentedBuffer —
-        // ownership passes to the PayloadDelivered subscriber, which returns it after callbacks.
+        // Unreliable non-segmented: either pass the ingress buffer directly (zero-copy) or copy the payload into a fresh pool buffer (safe for immediate caller reuse).
+        // When handing off, isBufferHandedOff signals the receive loop not to return rentedBuffer — ownership passes to the PayloadDelivered subscriber, which returns it after callbacks.
         if (!_config.CopyUnreliablePayload)
         {
             isBufferHandedOff = true;
@@ -414,9 +413,8 @@ public sealed partial class IngressEngine
     }
 
     /// <summary>
-    /// Returns the existing reassembler for <paramref name="synapseConnection"/>, or rents a fresh one
-    /// from the pool and atomically assigns it. If two threads race, the loser's instance is returned
-    /// to the pool and the winner's instance is used.
+    /// Returns the existing reassembler for <paramref name="synapseConnection"/>, or rents a fresh one from the pool and atomically assigns it.
+    /// If two threads race, the loser's instance is returned to the pool and the winner's instance is used.
     /// </summary>
     /// <param name="synapseConnection">The connection whose reassembler is needed.</param>
     /// <returns>The initialised <see cref="PacketReassembler"/> assigned to the connection.</returns>
@@ -429,6 +427,7 @@ public sealed partial class IngressEngine
         rented.Initialize(_config.MaximumTransmissionUnit, _config.MaximumSegments);
 
         PacketReassembler? existing = Interlocked.CompareExchange(ref synapseConnection.Reassembler, rented, null);
+
         if (existing is not null)
         {
             ResettableObjectPool<PacketReassembler>.Return(rented);
@@ -455,6 +454,7 @@ public sealed partial class IngressEngine
             {
                 synapseConnection.NextExpectedSequence++;
                 toDeliver = [payload];
+
                 while (synapseConnection.ReorderBuffer.TryGetValue(synapseConnection.NextExpectedSequence, out ArraySegment<byte> nextPayload))
                 {
                     synapseConnection.ReorderBuffer.Remove(synapseConnection.NextExpectedSequence);
@@ -470,6 +470,7 @@ public sealed partial class IngressEngine
                 {
                     if (payload.Array is not null)
                         ArrayPool<byte>.Shared.Return(payload.Array);
+
                     ViolationOccurred?.Invoke(
                         synapseConnection.RemoteEndPoint,
                         synapseConnection.Signature,
@@ -479,12 +480,12 @@ public sealed partial class IngressEngine
                         ViolationAction.KickAndBlacklist);
                     return;
                 }
+
                 synapseConnection.ReorderBuffer.TryAdd(sequence, payload);
             }
         }
 
-        // Callbacks happen OUTSIDE the lock so user handlers are free
-        // to call back into the engine (e.g., SendReliableAsync) safely.
+        // Callbacks happen OUTSIDE the lock so user handlers are free to call back into the engine (e.g., SendReliableAsync) safely.
         if (toDeliver is not null)
         {
             foreach (ArraySegment<byte> deliverPayload in toDeliver)
@@ -528,8 +529,8 @@ public sealed partial class IngressEngine
     }
 
     /// <summary>
-    /// Processes an inbound handshake: checks blacklist, connection cap, replay cache,
-    /// and signature validation. Registers the connection on success and sends a handshake-ack.
+    /// Processes an inbound handshake: checks blacklist, connection cap, replay cache, and signature validation.
+    /// Registers the connection on success and sends a handshake-ack.
     /// </summary>
     /// <param name="fromEndPoint">The source endpoint of the handshake datagram.</param>
     /// <param name="buffer">The raw receive buffer.</param>
@@ -557,9 +558,9 @@ public sealed partial class IngressEngine
             return;
         }
 
-        // Replay check: the nonce embedded in handshakePayload makes each legitimate handshake's
-        // signature unique. A replayed packet carries the same bytes -> same signature -> reject.
+        // Replay check: the nonce embedded in handshakePayload makes each legitimate handshake's signature unique. A replayed packet carries the same bytes -> same signature -> reject.
         long nowTicks = DateTime.UtcNow.Ticks;
+
         if (!_seenHandshakes.TryAdd(signature, nowTicks))
         {
             // Exact same bytes received again - replay.
@@ -569,9 +570,12 @@ public sealed partial class IngressEngine
 
         // Periodic eviction: keep the replay cache from growing without bound.
         long lastHandshakeEvict = Volatile.Read(ref _lastHandshakeEvictionTicks);
+
         if (nowTicks - lastHandshakeEvict > TimeSpan.TicksPerMinute)
+        {
             if (Interlocked.CompareExchange(ref _lastHandshakeEvictionTicks, nowTicks, lastHandshakeEvict) == lastHandshakeEvict)
                 RemoveExpiredHandshakeEntries(nowTicks, _config.Connection.TimeoutMilliseconds * TimeSpan.TicksPerMillisecond * 2);
+        }
 
         if (_config.SignatureValidator is not null && !_config.SignatureValidator.Validate(fromEndPoint, signature, handshakePayload))
         {

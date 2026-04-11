@@ -1,8 +1,7 @@
 namespace SynapseSocket.Packets;
 
 /// <summary>
-/// Sub-type byte carried in the payload of an <see cref="PacketFlags.Extended"/> packet
-/// exchanged between an engine and a NAT rendezvous server.
+/// Sub-type byte carried in the payload of an <see cref="PacketFlags.Extended"/> packet exchanged between an engine and a NAT rendezvous server.
 /// The first byte after the <see cref="PacketFlags"/> header identifies the operation.
 /// </summary>
 public enum NatPacketType : byte

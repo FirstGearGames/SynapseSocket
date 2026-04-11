@@ -6,18 +6,10 @@ namespace SynapseSocket.Core.Configuration;
 
 /// <summary>
 /// Settings specific to <see cref="NatTraversalMode.Server"/> rendezvous-assisted hole punching.
-/// Both peers register with the same <see cref="ServerEndPoint"/> using the same <see cref="SessionId"/>;
-/// the server exchanges their external endpoints and hole-punching proceeds automatically.
+/// Both peers register with the same <see cref="ServerEndPoint"/> using the same <see cref="SessionId"/>; the server exchanges their external endpoints and hole-punching proceeds automatically.
 /// </summary>
 public sealed class ServerNatConfig
 {
-    private const string AlphaNumericChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-
-    /// <summary>
-    /// Length of a session ID in characters.
-    /// </summary>
-    public const int SessionIdLength = 6;
-
     /// <summary>
     /// Endpoint of the publicly reachable NAT rendezvous server.
     /// Must be set before calling <see cref="SynapseSocket.Core.SynapseManager.ConnectViaNatServerAsync"/>.
@@ -43,17 +35,25 @@ public sealed class ServerNatConfig
     public uint HeartbeatIntervalMilliseconds = 3000;
 
     /// <summary>
-    /// Generates a random <see cref="SessionIdLength"/>-character uppercase alphanumeric session ID
-    /// suitable for display and manual entry (e.g., <c>"A3X7KQ"</c>).
+    /// Length of a session ID in characters.
+    /// </summary>
+    public const int SessionIdLength = 6;
+
+    private const string AlphaNumericChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+    /// <summary>
+    /// Generates a random <see cref="SessionIdLength"/>-character uppercase alphanumeric session ID suitable for display and manual entry (e.g., <c>"A3X7KQ"</c>).
     /// </summary>
     /// <returns>A randomly generated uppercase alphanumeric session ID string.</returns>
     public static string GenerateSessionId()
     {
         byte[] randomBytes = new byte[SessionIdLength];
         RandomNumberGenerator.Fill(randomBytes);
-        StringBuilder sb = new(SessionIdLength);
+        StringBuilder stringBuilder = new(SessionIdLength);
+
         foreach (byte b in randomBytes)
-            sb.Append(AlphaNumericChars[b % AlphaNumericChars.Length]);
-        return sb.ToString();
+            stringBuilder.Append(AlphaNumericChars[b % AlphaNumericChars.Length]);
+
+        return stringBuilder.ToString();
     }
 }

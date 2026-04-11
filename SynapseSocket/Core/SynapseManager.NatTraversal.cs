@@ -13,15 +13,11 @@ namespace SynapseSocket.Core;
 /// NAT traversal support for <see cref="SynapseManager"/>.
 /// <para>
 /// <b>FullCone mode:</b> both peers already know each other''s external endpoint.
-/// <see cref="ConnectAsync"/> first waits <see cref="FullConeNatConfig.DirectAttemptMilliseconds"/>
-/// for a direct connection; if the connection is still pending it falls back to timed probe bursts
-/// that open NAT mappings on both sides simultaneously.
+/// <see cref="ConnectAsync"/> first waits <see cref="FullConeNatConfig.DirectAttemptMilliseconds"/> for a direct connection; if the connection is still pending it falls back to timed probe bursts that open NAT mappings on both sides simultaneously.
 /// </para>
 /// <para>
 /// <b>Server mode:</b> call <see cref="ConnectViaNatServerAsync"/> instead of <see cref="ConnectAsync"/>.
-/// Both peers register with the same <see cref="ServerNatConfig.ServerEndPoint"/> using the same
-/// <see cref="ServerNatConfig.SessionId"/>; once the server reports the peer''s endpoint the engine
-/// falls through to the same probe-burst logic used by FullCone.
+/// Both peers register with the same <see cref="ServerNatConfig.ServerEndPoint"/> using the same <see cref="ServerNatConfig.SessionId"/>; once the server reports the peer''s endpoint the engine falls through to the same probe-burst logic used by FullCone.
 /// </para>
 /// </summary>
 public sealed partial class SynapseManager
@@ -40,17 +36,17 @@ public sealed partial class SynapseManager
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// Registers with the configured NAT rendezvous server, waits for the peer''s external endpoint,
-    /// then initiates a hole-punched connection.
-    /// Requires <see cref="NatTraversalConfig.Mode"/> == <see cref="NatTraversalMode.Server"/>,
-    /// <see cref="ServerNatConfig.ServerEndPoint"/> set, and a shared <see cref="ServerNatConfig.SessionId"/>.
+    /// Registers with the configured NAT rendezvous server, waits for the peer''s external endpoint, then initiates a hole-punched connection.
+    /// Requires <see cref="NatTraversalConfig.Mode"/> == <see cref="NatTraversalMode.Server"/>, <see cref="ServerNatConfig.ServerEndPoint"/> set, and a shared <see cref="ServerNatConfig.SessionId"/>.
     /// </summary>
     public async Task<SynapseConnection> ConnectViaNatServerAsync(CancellationToken cancellationToken = default)
     {
         if (!_isStarted || _sender is null)
             throw new InvalidOperationException("Engine not started.");
+
         if (Config.NatTraversal.Mode != NatTraversalMode.Server)
             throw new InvalidOperationException("NatTraversal.Mode must be Server to call ConnectViaNatServerAsync.");
+
         if (Config.NatTraversal.Server.ServerEndPoint is null)
             throw new InvalidOperationException("NatTraversal.Server.ServerEndPoint must be set.");
 
@@ -58,6 +54,7 @@ public sealed partial class SynapseManager
         {
             if (_natPeerSource is not null && !_natPeerSource.Task.IsCompleted)
                 throw new InvalidOperationException("A NAT rendezvous is already in progress.");
+
             _natPeerSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
         }
 
@@ -68,16 +65,18 @@ public sealed partial class SynapseManager
         Task<IPEndPoint> peerTask = _natPeerSource.Task;
         Task timeoutTask = Task.Delay((int)Config.NatTraversal.Server.RegistrationTimeoutMilliseconds, cancellationToken);
         Task completedTask = await Task.WhenAny(peerTask, timeoutTask).ConfigureAwait(false);
+
         if (completedTask != peerTask)
         {
             _natPeerSource?.TrySetCanceled();
             throw new TimeoutException("NAT rendezvous timed out: no peer registered within the allotted window.");
         }
+
         IPEndPoint peerEndPoint = await peerTask.ConfigureAwait(false);
 
         // From here the flow is identical to ConnectAsync + FullCone hole-punch.
         ulong signature = Security.ComputeSignature(peerEndPoint, ReadOnlySpan<byte>.Empty);
-        SynapseConnection synapseConnection = Connections.GetOrAdd(peerEndPoint, signature, (ep, sig) => new(ep, sig));
+        SynapseConnection synapseConnection = Connections.GetOrAdd(peerEndPoint, signature, (endPoint, remoteSignature) => new(endPoint, remoteSignature));
         await _sender.SendHandshakeAsync(peerEndPoint, cancellationToken).ConfigureAwait(false);
         _ = Task.Run(() => NatPunchAsync(synapseConnection, peerEndPoint, cancellationToken), cancellationToken);
         return synapseConnection;
@@ -109,13 +108,13 @@ public sealed partial class SynapseManager
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// Registers with the NAT rendezvous server and sends periodic heartbeats
-    /// until the peer is matched or the operation is cancelled.
+    /// Registers with the NAT rendezvous server and sends periodic heartbeats until the peer is matched or the operation is cancelled.
     /// </summary>
     private async Task NatServerRegistrationAsync(CancellationToken cancellationToken)
     {
         IPEndPoint serverEndPoint = Config.NatTraversal.Server.ServerEndPoint!;
         string sessionId = Config.NatTraversal.Server.SessionId;
+
         try
         {
             await _sender!.SendNatRegisterAsync(serverEndPoint, sessionId, cancellationToken).ConfigureAwait(false);
@@ -124,6 +123,7 @@ public sealed partial class SynapseManager
                    _natPeerSource is not null && !_natPeerSource.Task.IsCompleted)
             {
                 await Task.Delay((int)Config.NatTraversal.Server.HeartbeatIntervalMilliseconds, cancellationToken).ConfigureAwait(false);
+
                 if (_natPeerSource is not null && !_natPeerSource.Task.IsCompleted)
                     await _sender!.SendNatHeartbeatAsync(serverEndPoint, sessionId, cancellationToken).ConfigureAwait(false);
             }
@@ -147,6 +147,7 @@ public sealed partial class SynapseManager
             if (Config.NatTraversal.Mode == NatTraversalMode.FullCone)
             {
                 await Task.Delay((int)Config.NatTraversal.FullCone.DirectAttemptMilliseconds, cancellationToken).ConfigureAwait(false);
+
                 if (synapseConnection.State != ConnectionState.Pending)
                     return;
             }

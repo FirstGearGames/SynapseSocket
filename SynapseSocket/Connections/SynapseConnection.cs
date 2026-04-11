@@ -8,8 +8,7 @@ using SynapseSocket.Packets;
 namespace SynapseSocket.Connections;
 
 /// <summary>
-/// Represents the state of a single remote peer session, including reliable send/receive windows,
-/// keep-alive timestamps, and signature binding.
+/// Represents the state of a single remote peer session, including reliable send/receive windows, keep-alive timestamps, and signature binding.
 /// </summary>
 public sealed class SynapseConnection
 {
@@ -92,8 +91,7 @@ public sealed class SynapseConnection
 
     /// <summary>
     /// A reliable packet that has been sent but not yet acknowledged.
-    /// For segmented sends, <see cref="Segments"/> holds rented <see cref="ArraySegment{T}"/>s
-    /// whose backing arrays must be returned to <see cref="ArrayPool{T}.Shared"/> on ACK or eviction.
+    /// For segmented sends, <see cref="Segments"/> holds rented <see cref="ArraySegment{T}"/>s whose backing arrays must be returned to <see cref="ArrayPool{T}.Shared"/> on ACK or eviction.
     /// <see cref="SegmentCount"/> is the logical count — <see cref="Segments"/> may be a larger rented array.
     /// </summary>
     internal sealed class PendingReliable
@@ -119,6 +117,7 @@ public sealed class SynapseConnection
             // All segments share a single backing buffer; returning segments[0].Array is sufficient.
             if (pendingReliable.SegmentCount > 0 && pendingReliable.Segments[0].Array is not null)
                 ArrayPool<byte>.Shared.Return(pendingReliable.Segments[0].Array!);
+
             ArrayPool<ArraySegment<byte>>.Shared.Return(pendingReliable.Segments);
             pendingReliable.Segments = null;
         }

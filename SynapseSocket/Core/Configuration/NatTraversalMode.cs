@@ -12,14 +12,13 @@ public enum NatTraversalMode
     Disabled,
 
     /// <summary>
-    /// Full-cone UDP hole punching. Both peers must have this mode enabled and must already
-    /// know each other's external endpoint. Works for full-cone and address-restricted-cone NAT.
+    /// Full-cone UDP hole punching. Both peers must have this mode enabled and must already know each other's external endpoint.
+    /// Works for full-cone and address-restricted-cone NAT.
     /// </summary>
     FullCone,
 
     /// <summary>
-    /// Rendezvous-server-assisted hole punching. A shared <see cref="ServerNatConfig.ServerEndPoint"/>
-    /// is contacted to exchange external endpoints; hole punching then proceeds as in <see cref="FullCone"/>.
+    /// Rendezvous-server-assisted hole punching. A shared <see cref="ServerNatConfig.ServerEndPoint"/> is contacted to exchange external endpoints; hole punching then proceeds as in <see cref="FullCone"/>.
     /// </summary>
     Server
 }

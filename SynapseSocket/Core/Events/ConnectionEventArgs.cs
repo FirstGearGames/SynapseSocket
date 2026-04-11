@@ -35,6 +35,7 @@ public sealed class ConnectionEventArgs : EventArgs, IPoolResettable
     {
         Connection = null;
     }
+
     /// <inheritdoc/>
     public void OnRent()
     {

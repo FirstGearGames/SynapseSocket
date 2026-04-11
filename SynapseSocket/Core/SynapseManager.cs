@@ -18,8 +18,7 @@ namespace SynapseSocket.Core;
 
 /// <summary>
 /// The main entry point for the SynapseSocket UDP Transport Engine.
-/// This is a partial class; the core API lives here, and the background maintenance loops
-/// (keep-alive, reliable retransmission) live in <c>SynapseManager.Maintenance.cs</c>.
+/// This is a partial class; the core API lives here, and the background maintenance loops (keep-alive, reliable retransmission) live in <c>SynapseManager.Maintenance.cs</c>.
 /// </summary>
 public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
 {
@@ -49,8 +48,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// When no handler is subscribed, the default action (<see cref="ViolationAction.KickAndBlacklist"/>) is applied.
     /// <para>
     /// <b>Warning:</b> do not unconditionally downgrade <see cref="ViolationEventArgs.Action"/> inside a handler.
-    /// Setting the action to <see cref="ViolationAction.Ignore"/> suppresses every protective measure the engine
-    /// would otherwise take. See <see cref="ViolationEventArgs.Action"/> for details.
+    /// Setting the action to <see cref="ViolationAction.Ignore"/> suppresses every protective measure the engine would otherwise take. See <see cref="ViolationEventArgs.Action"/> for details.
     /// </para>
     /// </summary>
     public event ViolationDelegate? ViolationDetected;
@@ -99,8 +97,10 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     public SynapseManager(SynapseConfig config)
     {
         Config = config ?? throw new ArgumentNullException(nameof(config));
+
         if (Config.BindEndPoints.Count == 0)
             throw new ArgumentException("At least one bind endpoint is required.", nameof(config));
+
         if (Config.SegmentAssemblyTimeoutMilliseconds > 0 && Config.SegmentAssemblyTimeoutMilliseconds > 300_000)
             throw new ArgumentOutOfRangeException(nameof(config), "SegmentAssemblyTimeoutMilliseconds must not exceed 300000 (5 minutes).");
 
@@ -118,13 +118,13 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Binds all configured endpoints, starts ingress loops, and launches background maintenance
-    /// (keep-alive and reliable retransmission).
+    /// Binds all configured endpoints, starts ingress loops, and launches background maintenance (keep-alive and reliable retransmission).
     /// </summary>
     public Task StartAsync(CancellationToken cancellationToken = default)
     {
         if (_isStarted)
             throw new InvalidOperationException("Engine is already running.");
+
         if (_isDisposed)
             throw new ObjectDisposedException(nameof(SynapseManager));
 
@@ -139,8 +139,10 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             try
             {
                 socket = new(bindEndPoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+
                 if (bindEndPoint.AddressFamily == AddressFamily.InterNetworkV6)
                     socket.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, false);
+
                 socket.Bind(bindEndPoint);
             }
             catch (SocketException socketException)
@@ -150,6 +152,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             }
 
             _sockets.Add(socket);
+
             if (bindEndPoint.AddressFamily == AddressFamily.InterNetworkV6)
                 ipv6Socket = socket;
             else
@@ -188,6 +191,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     {
         if (!_isStarted || _isDisposed)
             return;
+
         _isStarted = false;
         await ShutdownCoreAsync().ConfigureAwait(false);
         CancellationTokenSource? oldCts = _cancellationTokenSource;
@@ -205,6 +209,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             throw new InvalidOperationException("Engine not started.");
 
         ulong signature = Security.ComputeSignature(endPoint, ReadOnlySpan<byte>.Empty);
+
         if (Security.IsBlacklisted(signature))
         {
             RaiseConnectionFailed(endPoint, ConnectionRejectedReason.Blacklisted, null);
@@ -355,6 +360,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         CloseSockets();
 
         List<Task> pendingTasks = [.. _ingressTasks];
+
         if (_maintenanceTask is not null)
             pendingTasks.Add(_maintenanceTask);
 
@@ -404,6 +410,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         CloseSockets();
 
         List<Task> pendingTasks = [.. _ingressTasks];
+
         if (_maintenanceTask is not null)
             pendingTasks.Add(_maintenanceTask);
 
@@ -426,6 +433,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
                 socket.Close();
             }
             catch { }
+
             try
             {
                 socket.Dispose();
@@ -451,9 +459,8 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Returns the existing splitter for <paramref name="synapseConnection"/>, or rents a fresh one
-    /// from the pool and atomically assigns it. If two threads race, the loser's instance is returned
-    /// to the pool immediately and the winner's instance is used.
+    /// Returns the existing splitter for <paramref name="synapseConnection"/>, or rents a fresh one from the pool and atomically assigns it.
+    /// If two threads race, the loser's instance is returned to the pool immediately and the winner's instance is used.
     /// </summary>
     private PacketSplitter GetOrRentSplitter(SynapseConnection synapseConnection)
     {
@@ -464,6 +471,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         rented.Initialize(Config.MaximumTransmissionUnit, Config.MaximumSegments);
 
         PacketSplitter? existing = Interlocked.CompareExchange(ref synapseConnection.Splitter, rented, null);
+
         if (existing is not null)
         {
             ResettableObjectPool<PacketSplitter>.Return(rented);
@@ -486,6 +494,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
                 if (segment.Array is not null)
                     ArrayPool<byte>.Shared.Return(segment.Array);
             }
+
             synapseConnection.ReorderBuffer.Clear();
         }
     }
@@ -617,8 +626,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Removes the connection for <paramref name="endPoint"/>, returns pooled resources,
-    /// and optionally blacklists the computed signature.
+    /// Removes the connection for <paramref name="endPoint"/>, returns pooled resources, and optionally blacklists the computed signature.
     /// </summary>
     private void DisconnectAndBlacklist(IPEndPoint endPoint, bool canBlacklist)
     {
@@ -629,6 +637,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             synapseConnection.State = ConnectionState.Disconnected;
             RaiseConnectionClosed(synapseConnection);
         }
+
         if (canBlacklist)
         {
             ulong signature = Security.ComputeSignature(endPoint, ReadOnlySpan<byte>.Empty);

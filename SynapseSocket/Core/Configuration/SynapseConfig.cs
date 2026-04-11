@@ -81,11 +81,8 @@ public sealed class SynapseConfig
     public uint MaximumReassembledPacketSize = 0;
 
     /// <summary>
-    /// When true (default), received unreliable payloads are copied into a fresh pooled buffer
-    /// before being delivered to <see cref="SynapseManager.PacketReceived"/>, so the ingress
-    /// buffer is returned to the pool immediately.
-    /// When false, the ingress buffer slice is handed directly to the callback — zero allocation,
-    /// but the buffer must not be retained after the handler returns.
+    /// When true (default), received unreliable payloads are copied into a fresh pooled buffer before being delivered to <see cref="SynapseManager.PacketReceived"/>, so the ingress buffer is returned to the pool immediately.
+    /// When false, the ingress buffer slice is handed directly to the callback — zero allocation, but the buffer must not be retained after the handler returns.
     /// Has no effect on reliable or segmented receives, which always copy.
     /// </summary>
     public bool CopyUnreliablePayload = true;

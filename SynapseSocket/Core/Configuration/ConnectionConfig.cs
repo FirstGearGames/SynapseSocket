@@ -1,8 +1,7 @@
 namespace SynapseSocket.Core.Configuration;
 
 /// <summary>
-/// Configuration for connection lifecycle: keep-alive heartbeats, timeout detection,
-/// and the maintenance sweep window.
+/// Configuration for connection lifecycle: keep-alive heartbeats, timeout detection, and the maintenance sweep window.
 /// </summary>
 public sealed class ConnectionConfig
 {

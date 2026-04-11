@@ -8,8 +8,7 @@ using SynapseSocket.Core.Events;
 namespace SynapseSocket.Core;
 
 /// <summary>
-/// Background maintenance for <see cref="SynapseManager"/>: progressive keep-alive sweeps,
-/// timeout detection, and reliable retransmission.
+/// Background maintenance for <see cref="SynapseManager"/>: progressive keep-alive sweeps, timeout detection, and reliable retransmission.
 /// Implemented as a partial class to separate feature sets per the spec.
 /// </summary>
 public sealed partial class SynapseManager
@@ -20,6 +19,7 @@ public sealed partial class SynapseManager
     private async Task MaintenanceLoopAsync(CancellationToken cancellationToken)
     {
         int maintenanceLoopDelayMilliseconds = 50;
+
         while (!cancellationToken.IsCancellationRequested)
         {
             try
@@ -51,8 +51,7 @@ public sealed partial class SynapseManager
     }
 
     /// <summary>
-    /// Progressive keep-alive: iterates a slice of connections per tick so heartbeat traffic is spread
-    /// across the configured sweep window.
+    /// Progressive keep-alive: iterates a slice of connections per tick so heartbeat traffic is spread across the configured sweep window.
     /// Also detects timeouts and disconnects non-responsive peers.
     /// </summary>
     private void ProgressiveKeepAliveSweep(long nowTicks, CancellationToken cancellationToken)
@@ -64,6 +63,7 @@ public sealed partial class SynapseManager
         long timeoutTicks = TimeSpan.FromMilliseconds(Config.Connection.TimeoutMilliseconds).Ticks;
 
         List<SynapseConnection> snapshot = [];
+
         foreach (SynapseConnection synapseConnection in Connections.Snapshot())
             snapshot.Add(synapseConnection);
 
@@ -112,6 +112,7 @@ public sealed partial class SynapseManager
             foreach (KeyValuePair<ushort, SynapseConnection.PendingReliable> keyValuePair in synapseConnection.PendingReliableQueue)
             {
                 SynapseConnection.PendingReliable pendingReliable = keyValuePair.Value;
+
                 if (nowTicks - pendingReliable.SentTicks < resendTicks)
                     continue;
 
@@ -127,6 +128,7 @@ public sealed partial class SynapseManager
                 pendingReliable.Retries++;
                 pendingReliable.SentTicks = nowTicks;
                 Telemetry.OnReliableResend();
+
                 if (pendingReliable.Segments is not null)
                 {
                     for (int i = 0; i < pendingReliable.SegmentCount; i++)
@@ -141,9 +143,7 @@ public sealed partial class SynapseManager
     }
 
     /// <summary>
-    /// Evicts incomplete segment assemblies (reliable or unreliable) that have exceeded
-    /// <see cref="SynapseSocket.Core.Configuration.SynapseConfig.SegmentAssemblyTimeoutMilliseconds"/>
-    /// on each connection that has an active segmenter.
+    /// Evicts incomplete segment assemblies (reliable or unreliable) that have exceeded <see cref="SynapseSocket.Core.Configuration.SynapseConfig.SegmentAssemblyTimeoutMilliseconds"/> on each connection that has an active segmenter.
     /// </summary>
     private void SegmentAssemblyTimeoutSweep(long nowTicks)
     {
@@ -151,6 +151,7 @@ public sealed partial class SynapseManager
             return;
 
         long timeoutTicks = TimeSpan.FromMilliseconds(Config.SegmentAssemblyTimeoutMilliseconds).Ticks;
+
         foreach (SynapseConnection synapseConnection in Connections.Snapshot())
             synapseConnection.Reassembler?.RemoveExpiredSegments(nowTicks, timeoutTicks);
     }

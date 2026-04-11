@@ -105,6 +105,7 @@ public sealed partial class TransmissionEngine
             throw new InvalidOperationException("Reliable backpressure limit reached.");
 
         ushort sequence;
+
         lock (synapseConnection.ReliableLock)
             sequence = synapseConnection.NextOutgoingSequence++;
 
@@ -144,6 +145,7 @@ public sealed partial class TransmissionEngine
             throw new InvalidOperationException("Reliable backpressure limit reached.");
 
         ushort sequence = 0;
+
         if (isReliable)
         {
             lock (synapseConnection.ReliableLock)
@@ -180,6 +182,7 @@ public sealed partial class TransmissionEngine
                 // All segments share one backing buffer — only segments[0].Array needs returning.
                 if (segmentCount > 0 && segments[0].Array is not null)
                     ArrayPool<byte>.Shared.Return(segments[0].Array!);
+
                 ArrayPool<ArraySegment<byte>>.Shared.Return(segments);
             }
         }
