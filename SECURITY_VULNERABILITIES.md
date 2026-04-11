@@ -109,15 +109,8 @@ This entry has been removed from the active vulnerability list.
 
 ### V13 — No ACK Batching: ACK Flood Possible
 
-**Severity:** LOW  
-**Files:** `SynapseSocket/Transport/IngressEngine.cs` (lines ~299–304)  
-**Category:** Response flooding
-
-**Description:**  
-Every reliable packet triggers an immediate, individual ACK response. A peer (or attacker) sending a rapid burst of reliable packets receives an equal burst of ACK responses. This is not dangerous on its own but can amplify traffic in congested networks and cause the server to spend disproportionate time sending ACKs.
-
-**Suggested fix:**  
-Implement delayed ACKs: buffer ACKs and flush after N packets or T milliseconds (whichever comes first), a standard TCP optimization easily adapted to UDP.
+**Severity:** RESOLVED  
+**Resolution:** Added `ReliableConfig.AckBatchingEnabled` (default `false`) and `ReliableConfig.AckBatchIntervalMilliseconds` (default 20 ms). When enabled, ACKs are queued in `IngressEngine._pendingAcks` instead of being sent immediately and are flushed by `AckBatchFlushSweep` in the maintenance loop at the configured interval. Disabled by default to preserve existing latency behaviour; enable to reduce ACK traffic under burst conditions.
 
 ---
 

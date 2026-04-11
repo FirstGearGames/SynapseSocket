@@ -4,6 +4,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core.Events;
+using SynapseSocket.Transport;
 
 namespace SynapseSocket.Core;
 
@@ -13,6 +14,7 @@ namespace SynapseSocket.Core;
 /// </summary>
 public sealed partial class SynapseManager
 {
+    private long _lastAckFlushTicks;
     /// <summary>
     /// Background loop that periodically runs keep-alive, retransmit, and segment-timeout sweeps.
     /// </summary>
@@ -28,6 +30,7 @@ public sealed partial class SynapseManager
                 ProgressiveKeepAliveSweep(nowTicks, cancellationToken);
                 ReliableRetransmitSweep(nowTicks, cancellationToken);
                 SegmentAssemblyTimeoutSweep(nowTicks);
+                AckBatchFlushSweep(nowTicks, cancellationToken);
                 Security.RemoveExpiredRateBuckets(nowTicks, TimeSpan.FromMinutes(5).Ticks);
             }
             catch (OperationCanceledException)
@@ -91,6 +94,25 @@ public sealed partial class SynapseManager
                 _ = _sender.SendKeepAliveAsync(synapseConnection, cancellationToken);
             }
         }
+    }
+
+    /// <summary>
+    /// Flushes queued ACKs from all ingress engines when ACK batching is enabled and the flush interval has elapsed.
+    /// </summary>
+    private void AckBatchFlushSweep(long nowTicks, CancellationToken cancellationToken)
+    {
+        if (!Config.Reliable.AckBatchingEnabled)
+            return;
+
+        long intervalTicks = Config.Reliable.AckBatchIntervalMilliseconds * TimeSpan.TicksPerMillisecond;
+
+        if (nowTicks - _lastAckFlushTicks < intervalTicks)
+            return;
+
+        _lastAckFlushTicks = nowTicks;
+
+        foreach (IngressEngine engine in _ingressEngines)
+            engine.FlushPendingAcks(cancellationToken);
     }
 
     /// <summary>

@@ -74,6 +74,11 @@ public sealed partial class IngressEngine
     /// </summary>
     private readonly byte[] _natChallengeSecret = new byte[32];
     /// <summary>
+    /// Pending ACKs queued for batch delivery when <see cref="SynapseSocket.Core.Configuration.ReliableConfig.AckBatchingEnabled"/> is true.
+    /// Drained by <see cref="FlushPendingAcks"/>.
+    /// </summary>
+    private readonly ConcurrentQueue<(SynapseConnection Connection, ushort Sequence)> _pendingAcks = new();
+    /// <summary>
     /// Raised when a complete payload (unsegmented or fully reassembled) is ready for the application layer.
     /// </summary>
     public event PayloadDeliveredDelegate? PayloadDelivered;
@@ -341,7 +346,7 @@ public sealed partial class IngressEngine
                 byte[] payloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
                 Buffer.BlockCopy(buffer, headerSize, payloadBuffer, 0, payloadLength);
                 ArraySegment<byte> payload = new(payloadBuffer, 0, payloadLength);
-                _ = _sender.SendAckAsync(synapseConnection, sequence, cancellationToken);
+                EnqueueOrSendAck(synapseConnection, sequence, cancellationToken);
                 DeliverOrdered(synapseConnection, sequence, payload, isReliable: true);
                 return;
             }
@@ -357,7 +362,7 @@ public sealed partial class IngressEngine
 
                     if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, payload, isReliable: true, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
                     {
-                        _ = _sender.SendAckAsync(synapseConnection, sequence, cancellationToken);
+                        EnqueueOrSendAck(synapseConnection, sequence, cancellationToken);
                         DeliverOrdered(synapseConnection, sequence, assembledPayload, isReliable: true);
                     }
                     else if (isProtocolViolation)
@@ -614,6 +619,27 @@ public sealed partial class IngressEngine
     /// <param name="nowTicks">The current UTC tick count.</param>
     /// <param name="staleTicks">Age in ticks beyond which an entry is removed.</param>
     /// <typeparam name="TKey">The dictionary key type.</typeparam>
+    /// <summary>
+    /// Queues an ACK for batch delivery when batching is enabled, or sends it immediately when disabled.
+    /// </summary>
+    private void EnqueueOrSendAck(SynapseConnection synapseConnection, ushort sequence, CancellationToken cancellationToken)
+    {
+        if (_config.Reliable.AckBatchingEnabled)
+            _pendingAcks.Enqueue((synapseConnection, sequence));
+        else
+            _ = _sender.SendAckAsync(synapseConnection, sequence, cancellationToken);
+    }
+
+    /// <summary>
+    /// Drains the pending ACK queue and sends all queued acknowledgements.
+    /// Called by the maintenance loop at the configured <see cref="SynapseSocket.Core.Configuration.ReliableConfig.AckBatchIntervalMilliseconds"/> interval.
+    /// </summary>
+    public void FlushPendingAcks(CancellationToken cancellationToken)
+    {
+        while (_pendingAcks.TryDequeue(out (SynapseConnection Connection, ushort Sequence) item))
+            _ = _sender.SendAckAsync(item.Connection, item.Sequence, cancellationToken);
+    }
+
     private static void RemoveExpiredEntries<TKey>(ConcurrentDictionary<TKey, long> dictionary, long nowTicks, long staleTicks)
         where TKey : notnull
     {

@@ -86,6 +86,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     private readonly int _maximumUnsegmentedPayload;
     private readonly List<Socket> _sockets = [];
     private readonly List<Task> _ingressTasks = [];
+    private readonly List<IngressEngine> _ingressEngines = [];
     private TransmissionEngine? _sender;
     private CancellationTokenSource? _cancellationTokenSource;
     private Task? _maintenanceTask;
@@ -177,6 +178,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             ingressEngine.NatSessionFull += OnNatSessionFull;
             ingressEngine.NatSessionCreated += OnNatSessionCreated;
             ingressEngine.NatSessionUnavailable += OnNatSessionUnavailable;
+            _ingressEngines.Add(ingressEngine);
             _ingressTasks.Add(ingressEngine.StartAsync(_cancellationTokenSource.Token));
         }
 
@@ -367,6 +369,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             pendingTasks.Add(_maintenanceTask);
 
         _ingressTasks.Clear();
+        _ingressEngines.Clear();
         _maintenanceTask = null;
 
         if (pendingTasks.Count > 0)
@@ -417,6 +420,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             pendingTasks.Add(_maintenanceTask);
 
         _ingressTasks.Clear();
+        _ingressEngines.Clear();
         _maintenanceTask = null;
 
         if (pendingTasks.Count > 0)
