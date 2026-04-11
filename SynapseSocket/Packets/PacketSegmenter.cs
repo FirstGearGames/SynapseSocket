@@ -1,4 +1,5 @@
 using System;
+using CodeBoost.CodeAnalysis;
 using CodeBoost.Performance;
 
 namespace SynapseSocket.Packets;
@@ -20,12 +21,14 @@ public abstract class PacketSegmenter : IPoolResettable
     /// The maximum number of segments a single message may be split into.
     /// Set by <see cref="Initialize"/>; reset to 0 on return to pool.
     /// </summary>
+    [PoolResettableMember] 
     public uint MaximumSegments { get; private set; }
 
     /// <summary>
     /// The effective MTU (max bytes per wire packet) used for segmentation.
     /// Set by <see cref="Initialize"/>; reset to 0 on return to pool.
     /// </summary>
+    [PoolResettableMember]
     public uint MaximumTransmissionUnit { get; private set; }
 
     /// <summary>
@@ -33,12 +36,13 @@ public abstract class PacketSegmenter : IPoolResettable
     /// </summary>
     /// <param name="maximumTransmissionUnit">Maximum wire packet size in bytes; must be greater than <see cref="PacketHeader.MaxHeaderSize"/>.</param>
     /// <param name="maximumSegments">Maximum number of segments a single message may be split into; must be between 1 and 255 inclusive.</param>
+    [PoolResettableMethod]
     public void Initialize(uint maximumTransmissionUnit, uint maximumSegments)
     {
-        if (maximumTransmissionUnit == 0 || maximumTransmissionUnit <= PacketHeader.MaxHeaderSize)
+        if (maximumTransmissionUnit is 0 or <= PacketHeader.MaxHeaderSize)
             throw new ArgumentOutOfRangeException(nameof(maximumTransmissionUnit));
 
-        if (maximumSegments == 0 || maximumSegments > 255)
+        if (maximumSegments is 0 or > 255)
             throw new ArgumentOutOfRangeException(nameof(maximumSegments));
 
         MaximumTransmissionUnit = maximumTransmissionUnit;

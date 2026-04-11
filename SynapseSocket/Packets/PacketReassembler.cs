@@ -65,7 +65,7 @@ public sealed class PacketReassembler : PacketSegmenter
         assembledSegments = default;
         isProtocolViolation = false;
 
-        if (segmentCount == 0 || segmentCount > MaximumSegments || segmentIndex >= segmentCount)
+        if (segmentCount is 0 or > MaximumSegments || segmentIndex >= segmentCount)
             return false;
 
         lock (_lock)
@@ -166,14 +166,17 @@ public sealed class PacketReassembler : PacketSegmenter
         /// Expected total number of segments for this payload.
         /// </summary>
         public uint SegmentCount => _segmentCount;
+        [PoolResettableMember]
         private uint _segmentCount;
         /// <summary>
         /// Tick timestamp of the first segment received, used for assembly timeout eviction.
         /// </summary>
+        [PoolResettableMember]
         public long FirstReceivedTicks;
         /// <summary>
         /// Whether this assembly belongs to the reliable channel.
         /// </summary>
+        [PoolResettableMember]
         public bool IsReliable;
 
         // _segments is rented from ListPool on Initialize; each slot is pre-filled with null so segments can be stored by index as they arrive (out-of-order safe).
@@ -183,10 +186,12 @@ public sealed class PacketReassembler : PacketSegmenter
         /// <summary>
         /// Count of received segments.
         /// </summary>
+        [PoolResettableMember]
         private uint _receivedCount;
         /// <summary>
         /// Total length of added segments.
         /// </summary>
+        [PoolResettableMember]
         private uint _totalLength;
 
         /// <summary>
@@ -199,6 +204,7 @@ public sealed class PacketReassembler : PacketSegmenter
         /// </summary>
         /// <param name="segmentCount">Total number of segments expected for this payload.</param>
         /// <param name="isReliable">Whether the segments belong to the reliable channel.</param>
+        [PoolResettableMethod]
         public void Initialize(byte segmentCount, bool isReliable)
         {
             _segmentCount = segmentCount;
@@ -281,7 +287,6 @@ public sealed class PacketReassembler : PacketSegmenter
             _receivedCount = 0;
             _totalLength = 0;
             FirstReceivedTicks = 0;
-            IsReliable = false;
         }
     }
 }

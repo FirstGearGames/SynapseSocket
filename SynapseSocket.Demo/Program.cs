@@ -25,7 +25,7 @@ internal static class Program
         SynapseConfig serverConfig = new()
         {
             BindEndPoints = [new(IPAddress.Any, Port)],
-            IsTelemetryEnabled = true,
+            EnableTelemetry = true,
             MaximumSegments = 128,
             UnreliableSegmentMode = UnreliableSegmentMode.SegmentUnreliable,
         };
@@ -39,7 +39,7 @@ internal static class Program
         SynapseConfig clientConfig = new()
         {
             BindEndPoints = [new(IPAddress.Any, 0)],
-            IsTelemetryEnabled = true,
+            EnableTelemetry = true,
             MaximumSegments = 128,
             UnreliableSegmentMode = UnreliableSegmentMode.SegmentUnreliable,
         };

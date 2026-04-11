@@ -35,7 +35,7 @@ public static class TestHarness
         SynapseConfig synapseConfig = new()
         {
             BindEndPoints = { new(IPAddress.Loopback, port) },
-            IsTelemetryEnabled = true
+            EnableTelemetry = true
         };
         tweak?.Invoke(synapseConfig);
         return synapseConfig;
@@ -49,7 +49,7 @@ public static class TestHarness
         SynapseConfig synapseConfig = new()
         {
             BindEndPoints = { new(IPAddress.Loopback, 0) },
-            IsTelemetryEnabled = true
+            EnableTelemetry = true
         };
         tweak?.Invoke(synapseConfig);
         return synapseConfig;
