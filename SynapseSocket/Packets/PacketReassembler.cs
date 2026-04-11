@@ -65,7 +65,7 @@ public sealed class PacketReassembler : PacketSegmenter
         assembledSegments = default;
         isProtocolViolation = false;
 
-        if (segmentCount is 0 or > MaximumSegments || segmentIndex >= segmentCount)
+        if (segmentCount == 0 || segmentCount > MaximumSegments || segmentIndex >= segmentCount)
             return false;
 
         lock (_lock)
