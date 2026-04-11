@@ -15,10 +15,24 @@ namespace SynapseSocket.NatServer;
 /// </summary>
 internal sealed class NatSessionRegistry
 {
+    /// <summary>
+    /// Holds the state for a single active rendezvous session.
+    /// </summary>
     private sealed class Entry
     {
+        /// <summary>
+        /// External endpoint of the host that created this session.
+        /// </summary>
         internal readonly IPEndPoint Host;
+
+        /// <summary>
+        /// External endpoints of all peers that have joined this session.
+        /// </summary>
         internal readonly List<IPEndPoint> Joiners = new();
+
+        /// <summary>
+        /// UTC ticks of the last heartbeat received from the host. Used to evict stale sessions.
+        /// </summary>
         internal long LastHeartbeatTicks;
 
         internal Entry(IPEndPoint host)

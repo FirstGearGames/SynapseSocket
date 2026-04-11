@@ -103,12 +103,33 @@ public sealed class SynapseConnection
     /// </summary>
     internal sealed class PendingReliable
     {
+        /// <summary>
+        /// Sequence number of the pending packet.
+        /// </summary>
         public ushort Sequence;
+        /// <summary>
+        /// Raw packet bytes, including the header. Not used for segmented sends.
+        /// </summary>
         public byte[] Payload = [];
+        /// <summary>
+        /// Total wire length of the packet.
+        /// </summary>
         public int PacketLength;
+        /// <summary>
+        /// Per-segment buffers for segmented sends. Null for unsegmented packets.
+        /// </summary>
         public ArraySegment<byte>[]? Segments;
+        /// <summary>
+        /// Logical number of valid entries in <see cref="Segments"/>. May be less than the array length.
+        /// </summary>
         public int SegmentCount;
+        /// <summary>
+        /// UTC ticks when this packet was last sent or retransmitted.
+        /// </summary>
         public long SentTicks;
+        /// <summary>
+        /// Number of retransmission attempts so far.
+        /// </summary>
         public int Retries;
     }
 

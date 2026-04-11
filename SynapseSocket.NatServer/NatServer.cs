@@ -69,6 +69,9 @@ public sealed class NatServer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Routes an inbound datagram to the appropriate handler based on its <see cref="PacketType"/> byte.
+    /// </summary>
     private void HandleDatagram(byte[] data, IPEndPoint from)
     {
         // Layout: [PacketType (1 byte)] [payload]
@@ -97,6 +100,10 @@ public sealed class NatServer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Creates a new session for the requesting host and sends back a <see cref="PacketType.NatSessionCreated"/> response,
+    /// or <see cref="PacketType.NatSessionUnavailable"/> if the concurrent session limit has been reached.
+    /// </summary>
     private void HandleRequestSession(IPEndPoint from)
     {
         if (!_registry.TryCreateSession(from, out string sessionId))
@@ -110,6 +117,10 @@ public sealed class NatServer : IDisposable
         SendNatSessionCreated(from, sessionId);
     }
 
+    /// <summary>
+    /// Registers a joining peer against an existing session. Sends <see cref="PacketType.NatPeerReady"/> to both
+    /// the joiner and the host on success, or <see cref="PacketType.NatSessionFull"/> if the session was not found.
+    /// </summary>
     private void HandleRegister(byte[] data, IPEndPoint from)
     {
         string? sessionId = NatSessionRegistry.ParseSessionId(data, offset: 1, length: SessionIdBytes);
@@ -134,6 +145,9 @@ public sealed class NatServer : IDisposable
         SendPeerReady(host!, joiner!);
     }
 
+    /// <summary>
+    /// Refreshes the heartbeat timestamp for an existing session and acknowledges with <see cref="PacketType.NatHeartbeatAck"/>.
+    /// </summary>
     private void HandleHeartbeat(byte[] data, IPEndPoint from)
     {
         string? sessionId = NatSessionRegistry.ParseSessionId(data, offset: 1, length: SessionIdBytes);
@@ -145,6 +159,9 @@ public sealed class NatServer : IDisposable
         SendHeartbeatAck(from);
     }
 
+    /// <summary>
+    /// Closes an existing session, preventing any further joiners. Only honoured when the request comes from the session host.
+    /// </summary>
     private void HandleCloseSession(byte[] data, IPEndPoint from)
     {
         string? sessionId = NatSessionRegistry.ParseSessionId(data, offset: 1, length: SessionIdBytes);
@@ -160,6 +177,9 @@ public sealed class NatServer : IDisposable
     // Send helpers
     // -------------------------------------------------------------------------
 
+    /// <summary>
+    /// Sends a <see cref="PacketType.NatSessionCreated"/> packet carrying the server-assigned session ID.
+    /// </summary>
     private void SendNatSessionCreated(IPEndPoint to, string sessionId)
     {
         byte[] packet = new byte[1 + SessionIdBytes];
@@ -168,6 +188,9 @@ public sealed class NatServer : IDisposable
         _ = _socket.SendAsync(packet, packet.Length, to);
     }
 
+    /// <summary>
+    /// Sends a <see cref="PacketType.NatPeerReady"/> packet to <paramref name="to"/> carrying <paramref name="peer"/>'s external endpoint.
+    /// </summary>
     private void SendPeerReady(IPEndPoint to, IPEndPoint peer)
     {
         byte[] peerBytes = peer.Address.GetAddressBytes();
@@ -183,18 +206,30 @@ public sealed class NatServer : IDisposable
         _ = _socket.SendAsync(packet, packet.Length, to);
     }
 
+    /// <summary>
+    /// Sends a <see cref="PacketType.NatHeartbeatAck"/> packet.
+    /// </summary>
     private void SendHeartbeatAck(IPEndPoint to)
     {
         byte[] packet = [(byte)PacketType.NatHeartbeatAck];
         _ = _socket.SendAsync(packet, packet.Length, to);
     }
 
+    /// <summary>
+    /// Sends a <see cref="PacketType.NatSessionFull"/> packet indicating the session was not found or is already full.
+    /// </summary>
+    /// <summary>
+    /// Sends a <see cref="PacketType.NatSessionFull"/> packet indicating the session was not found or is already full.
+    /// </summary>
     private void SendSessionFull(IPEndPoint to)
     {
         byte[] packet = [(byte)PacketType.NatSessionFull];
         _ = _socket.SendAsync(packet, packet.Length, to);
     }
 
+    /// <summary>
+    /// Sends a <see cref="PacketType.NatSessionUnavailable"/> packet indicating the server's concurrent session limit has been reached.
+    /// </summary>
     private void SendSessionUnavailable(IPEndPoint to)
     {
         byte[] packet = [(byte)PacketType.NatSessionUnavailable];
