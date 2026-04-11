@@ -8,13 +8,17 @@ using CodeBoost.Performance;
 namespace SynapseSocket.Packets;
 
 /// <summary>
-/// Receive-side segmentation helper. Feeds arriving segment packets into per-stream reassembly
-/// buffers and emits the fully rebuilt payload when all segments have arrived.
-/// Instances are managed by <see cref="ResettableObjectPool{T}"/>; rent via the pool,
-/// call <see cref="PacketSegmenter.Initialize"/> before use, and return via the pool when done.
+/// Receive-side segmentation helper.
+/// Feeds arriving segment packets into per-stream reassembly buffers and emits the fully rebuilt payload when all segments have arrived.
+/// Instances are managed by <see cref="ResettableObjectPool{T}"/>; rent via the pool, call <see cref="PacketSegmenter.Initialize"/> before use, and return via the pool when done.
 /// </summary>
 public sealed class PacketReassembler : PacketSegmenter
 {
+    /// <summary>
+    /// Maximum number of concurrent assemblies permitted.
+    /// <see cref="UnsetMaximumConcurrentAssemblies"/> disables the limit.
+    /// </summary>
+    private uint _maximumConcurrentAssemblies;
     /// <summary>
     /// Active in-progress assemblies keyed by segment ID.
     /// </summary>
@@ -24,16 +28,16 @@ public sealed class PacketReassembler : PacketSegmenter
     /// </summary>
     private readonly object _lock = new();
     /// <summary>
-    /// Maximum number of concurrent assemblies permitted; 0 means unlimited.
+    /// Sentinel value for <see cref="_maximumConcurrentAssemblies"/> that disables the concurrent assembly limit.
     /// </summary>
-    private uint _maximumConcurrentAssemblies;
+    public const uint UnsetMaximumConcurrentAssemblies = 0;
 
     /// <summary>
     /// Configures the reassembler after renting from the pool.
     /// </summary>
     /// <param name="maximumTransmissionUnit">Maximum wire packet size in bytes.</param>
     /// <param name="maximumSegments">Maximum number of segments a single message may be split into.</param>
-    /// <param name="maximumConcurrentAssemblies">Maximum number of simultaneous in-progress assemblies; 0 means unlimited.</param>
+    /// <param name="maximumConcurrentAssemblies">Maximum number of simultaneous in-progress assemblies; <see cref="UnsetMaximumConcurrentAssemblies"/> disables the limit.</param>
     public void Initialize(uint maximumTransmissionUnit, uint maximumSegments, uint maximumConcurrentAssemblies)
     {
         base.Initialize(maximumTransmissionUnit, maximumSegments);
@@ -43,13 +47,10 @@ public sealed class PacketReassembler : PacketSegmenter
     /// <summary>
     /// Feeds a received segment into the reassembly buffer.
     /// Returns true and outputs the fully reassembled payload when the final segment arrives.
-    /// The caller is responsible for returning <paramref name="assembledSegments"/>.Array to
-    /// <see cref="ArrayPool{T}.Shared"/> when done.
+    /// The caller is responsible for returning <paramref name="assembledSegments"/>.Array to <see cref="ArrayPool{T}.Shared"/> when done.
     /// The completed <see cref="SegmentAssembly"/> is automatically returned to the pool.
-    /// If a protocol violation is detected (e.g. the same segmentId is seen with a different
-    /// segmentCount or reliability flag than previously declared), <paramref name="isProtocolViolation"/>
-    /// is set to true, the stale assembly is evicted, and the method returns false. Callers should
-    /// treat this as grounds for kicking/blacklisting the peer.
+    /// If a protocol violation is detected (e.g. the same segmentId is seen with a different segmentCount or reliability flag than previously declared), <paramref name="isProtocolViolation"/> is set to true, the stale assembly is evicted, and the method returns false.
+    /// Callers should treat this as grounds for kicking/blacklisting the peer.
     /// </summary>
     /// <param name="segmentId">Stream identifier shared by all segments of the same logical message.</param>
     /// <param name="segmentIndex">Zero-based position of this segment within the stream.</param>
@@ -118,6 +119,7 @@ public sealed class PacketReassembler : PacketSegmenter
         lock (_lock)
         {
             List<ushort> toRemove = ListPool<ushort>.Rent();
+
             try
             {
                 foreach (KeyValuePair<ushort, SegmentAssembly> keyValuePair in _currentSegments)
@@ -150,7 +152,7 @@ public sealed class PacketReassembler : PacketSegmenter
             _currentSegments.Clear();
         }
 
-        _maximumConcurrentAssemblies = 0;
+        _maximumConcurrentAssemblies = UnsetMaximumConcurrentAssemblies;
         base.OnReturn();
     }
 
@@ -163,7 +165,8 @@ public sealed class PacketReassembler : PacketSegmenter
         /// <summary>
         /// Expected total number of segments for this payload.
         /// </summary>
-        public int SegmentCount => _segmentCount;
+        public uint SegmentCount => _segmentCount;
+        private uint _segmentCount;
         /// <summary>
         /// Tick timestamp of the first segment received, used for assembly timeout eviction.
         /// </summary>
@@ -173,23 +176,18 @@ public sealed class PacketReassembler : PacketSegmenter
         /// </summary>
         public bool IsReliable;
 
-        // _segments is rented from ListPool on Initialize; each slot is pre-filled with null
-        // so segments can be stored by index as they arrive (out-of-order safe).
+        // _segments is rented from ListPool on Initialize; each slot is pre-filled with null so segments can be stored by index as they arrive (out-of-order safe).
         // _lengths tracks each segment's actual data length (ArrayPool may over-allocate).
         [PoolResettableMember]
         private List<ArraySegment<byte>>? _segments;
         /// <summary>
-        /// Expected count of segments.
-        /// </summary>
-        private int _segmentCount;
-        /// <summary>
         /// Count of received segments.
         /// </summary>
-        private int _receivedCount;
+        private uint _receivedCount;
         /// <summary>
         /// Total length of added segments.
         /// </summary>
-        private int _totalLength;
+        private uint _totalLength;
 
         /// <summary>
         /// Initializes a new <see cref="SegmentAssembly"/> instance.
@@ -232,14 +230,12 @@ public sealed class PacketReassembler : PacketSegmenter
             _segments[segmentIndex] = new(rentedBuffer, offset: 0, segmentLength);
 
             _receivedCount++;
-            _totalLength += segmentLength;
+            _totalLength += (uint)segmentLength;
         }
 
         /// <summary>
-        /// Copies all segments into a single rented buffer and returns it as an
-        /// <see cref="ArraySegment{T}"/> scoped to the exact reassembled length.
-        /// The caller is responsible for returning <see cref="ArraySegment{T}.Array"/> to
-        /// <see cref="ArrayPool{T}.Shared"/> when done.
+        /// Copies all segments into a single rented buffer and returns it as an <see cref="ArraySegment{T}"/> scoped to the exact reassembled length.
+        /// The caller is responsible for returning <see cref="ArraySegment{T}.Array"/> to <see cref="ArrayPool{T}.Shared"/> when done.
         /// </summary>
         /// <param name="assembledSegment">Receives the fully assembled payload when the method returns true.</param>
         /// <returns>True when all segments have been received and the payload has been assembled; otherwise false.</returns>
@@ -252,7 +248,7 @@ public sealed class PacketReassembler : PacketSegmenter
                 return false;
             }
 
-            byte[] reassembledBytes = ArrayPool<byte>.Shared.Rent(_totalLength);
+            byte[] reassembledBytes = ArrayPool<byte>.Shared.Rent((int)_totalLength);
 
             int offset = 0;
             for (int i = 0; i < _segmentCount; i++)
@@ -263,7 +259,7 @@ public sealed class PacketReassembler : PacketSegmenter
                 offset += segmentLength;
             }
 
-            assembledSegment = new(reassembledBytes, offset: 0, _totalLength);
+            assembledSegment = new(reassembledBytes, offset: 0, (int)_totalLength);
             return true;
         }
 
@@ -277,6 +273,7 @@ public sealed class PacketReassembler : PacketSegmenter
             {
                 foreach (ArraySegment<byte> arraySegment in _segments)
                     arraySegment.PoolArrayIntoShared();
+
                 ListPool<ArraySegment<byte>>.ReturnAndNullifyReference(ref _segments);
             }
 
