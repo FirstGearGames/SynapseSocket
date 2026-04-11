@@ -6,3 +6,4 @@
 # This matches any bin or obj folder and all their contents/subfolders
 **/bin/
 **/obj/
+docs/commit-info.txt
