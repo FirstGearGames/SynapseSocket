@@ -41,6 +41,8 @@ public static class PacketHeader
     /// <summary>
     /// Computes the header size for a given flag combination.
     /// </summary>
+    /// <param name="flags">The packet flags that determine which optional header fields are present.</param>
+    /// <returns>The total header size in bytes for the given flag combination.</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int ComputeHeaderSize(PacketFlags flags)
     {
@@ -54,6 +56,13 @@ public static class PacketHeader
     /// Writes a header into the supplied buffer starting at offset 0.
     /// Returns the number of bytes written.
     /// </summary>
+    /// <param name="buffer">Destination buffer to write the header into.</param>
+    /// <param name="flags">Packet flags that control which header fields are written.</param>
+    /// <param name="sequence">Reliable sequence number; written only when <see cref="PacketFlags.Reliable"/> or <see cref="PacketFlags.Ack"/> is set.</param>
+    /// <param name="segmentId">Segment stream identifier; written only when <see cref="PacketFlags.Segmented"/> is set.</param>
+    /// <param name="segmentIndex">Zero-based index of this segment within the stream; written only when <see cref="PacketFlags.Segmented"/> is set.</param>
+    /// <param name="segmentCount">Total number of segments in the stream; written only when <see cref="PacketFlags.Segmented"/> is set.</param>
+    /// <returns>The number of bytes written to <paramref name="buffer"/>.</returns>
     public static int Write(Span<byte> buffer, PacketFlags flags, ushort sequence, ushort segmentId, byte segmentIndex, byte segmentCount)
     {
         int offset = 0;
@@ -81,6 +90,14 @@ public static class PacketHeader
     /// Returns the total number of bytes written (header + payload).
     /// Use this as the single source of truth for building a complete wire packet.
     /// </summary>
+    /// <param name="destination">Destination buffer to write the complete packet into.</param>
+    /// <param name="flags">Packet flags that control which header fields are written.</param>
+    /// <param name="sequence">Reliable sequence number; written only when <see cref="PacketFlags.Reliable"/> or <see cref="PacketFlags.Ack"/> is set.</param>
+    /// <param name="segmentId">Segment stream identifier; written only when <see cref="PacketFlags.Segmented"/> is set.</param>
+    /// <param name="segmentIndex">Zero-based index of this segment within the stream; written only when <see cref="PacketFlags.Segmented"/> is set.</param>
+    /// <param name="segmentCount">Total number of segments in the stream; written only when <see cref="PacketFlags.Segmented"/> is set.</param>
+    /// <param name="payload">Application payload to append after the header.</param>
+    /// <returns>The total number of bytes written to <paramref name="destination"/> (header size plus payload length).</returns>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int BuildPacket(Span<byte> destination, PacketFlags flags, ushort sequence, ushort segmentId, byte segmentIndex, byte segmentCount, ReadOnlySpan<byte> payload)
     {
@@ -93,6 +110,13 @@ public static class PacketHeader
     /// Reads a header from the supplied buffer. Returns the number of bytes consumed.
     /// Throws if the buffer is too small for the declared flags.
     /// </summary>
+    /// <param name="buffer">Source buffer containing the raw wire packet.</param>
+    /// <param name="flags">Receives the packet flags read from the first byte.</param>
+    /// <param name="sequence">Receives the reliable sequence number, or 0 if not present.</param>
+    /// <param name="segmentId">Receives the segment stream identifier, or 0 if not present.</param>
+    /// <param name="segmentIndex">Receives the zero-based segment index, or 0 if not present.</param>
+    /// <param name="segmentCount">Receives the total segment count, or 0 if not present.</param>
+    /// <returns>The number of bytes consumed from <paramref name="buffer"/> by the header.</returns>
     public static int Read(ReadOnlySpan<byte> buffer, out PacketFlags flags, out ushort sequence, out ushort segmentId, out byte segmentIndex, out byte segmentCount)
     {
         if (buffer.Length < FlagSize) throw new ArgumentException("Buffer too small for header.");

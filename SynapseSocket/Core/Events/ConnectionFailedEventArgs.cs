@@ -28,6 +28,9 @@ public sealed class ConnectionFailedEventArgs : EventArgs, IPoolResettable
     [PoolResettableMember]
     public string? Message { get; private set; }
 
+    /// <summary>
+    /// Initialises a new instance of <see cref="ConnectionFailedEventArgs"/>.
+    /// </summary>
     public ConnectionFailedEventArgs() { }
 
     /// <summary>

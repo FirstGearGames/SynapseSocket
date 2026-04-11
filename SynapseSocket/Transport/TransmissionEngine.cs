@@ -19,10 +19,25 @@ namespace SynapseSocket.Transport;
 /// </summary>
 public sealed partial class TransmissionEngine
 {
+    /// <summary>
+    /// Primary UDP socket used for all outbound traffic; also handles IPv6 when no dedicated IPv6 socket is provided.
+    /// </summary>
     private readonly Socket _ipv4Socket;
+    /// <summary>
+    /// Optional dedicated IPv6 UDP socket. When non-null, IPv6 datagrams are routed through this socket.
+    /// </summary>
     private readonly Socket? _ipv6Socket;
+    /// <summary>
+    /// Engine configuration snapshot.
+    /// </summary>
     private readonly SynapseConfig _config;
+    /// <summary>
+    /// Telemetry counters for sent-byte and packet tracking.
+    /// </summary>
     private readonly Telemetry _telemetry;
+    /// <summary>
+    /// Latency simulator that may artificially delay or drop outbound packets for testing purposes.
+    /// </summary>
     private readonly LatencySimulator _latencySimulator;
 
     /// <summary>
@@ -57,6 +72,9 @@ public sealed partial class TransmissionEngine
     /// Sends an unreliable, unsegmented payload to the connection's remote endpoint.
     /// Builds a header-only packet, copies the payload after it, and sends immediately.
     /// </summary>
+    /// <param name="synapseConnection">The target connection.</param>
+    /// <param name="payload">The application payload to send.</param>
+    /// <param name="cancellationToken">Token to cancel the send operation.</param>
     internal async Task SendUnreliableUnsegmentedAsync(SynapseConnection synapseConnection, ArraySegment<byte> payload, CancellationToken cancellationToken)
     {
         const PacketFlags Flags = PacketFlags.None;
@@ -78,6 +96,9 @@ public sealed partial class TransmissionEngine
     /// Assigns a sequence number, stores a <see cref="SynapseConnection.PendingReliable"/>
     /// entry for retransmission, and sends immediately.
     /// </summary>
+    /// <param name="synapseConnection">The target connection.</param>
+    /// <param name="payload">The application payload to send reliably.</param>
+    /// <param name="cancellationToken">Token to cancel the send operation.</param>
     internal async Task SendReliableUnsegmentedAsync(SynapseConnection synapseConnection, ArraySegment<byte> payload, CancellationToken cancellationToken)
     {
         if (synapseConnection.PendingReliableQueue.Count >= _config.Reliable.MaximumPending)
@@ -112,6 +133,11 @@ public sealed partial class TransmissionEngine
     /// and its lifetime is managed by the retransmission sweep and ACK handler.
     /// For unreliable sends, the backing buffer is returned to the pool after the last send completes.
     /// </summary>
+    /// <param name="synapseConnection">The target connection.</param>
+    /// <param name="payload">The application payload to split and send.</param>
+    /// <param name="isReliable">True to send segments reliably with retransmission; false for unreliable delivery.</param>
+    /// <param name="splitter">The <see cref="PacketSplitter"/> instance used to produce the segment array.</param>
+    /// <param name="cancellationToken">Token to cancel the send operations.</param>
     internal async Task SendSegmentedAsync(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable, PacketSplitter splitter, CancellationToken cancellationToken)
     {
         if (isReliable && synapseConnection.PendingReliableQueue.Count >= _config.Reliable.MaximumPending)
@@ -162,6 +188,10 @@ public sealed partial class TransmissionEngine
     /// <summary>
     /// Sends a reliable-channel acknowledgement for the given sequence number.
     /// </summary>
+    /// <param name="synapseConnection">The connection to acknowledge.</param>
+    /// <param name="sequence">The sequence number being acknowledged.</param>
+    /// <param name="cancellationToken">Token to cancel the send operation.</param>
+    /// <returns>A task that completes when the ACK packet has been handed to the socket.</returns>
     public Task SendAckAsync(SynapseConnection synapseConnection, ushort sequence, CancellationToken cancellationToken)
     {
         const PacketFlags Flags = PacketFlags.Ack;
@@ -174,6 +204,9 @@ public sealed partial class TransmissionEngine
     /// <summary>
     /// Sends a handshake packet with a 4-byte cryptographic nonce in the payload.
     /// </summary>
+    /// <param name="target">The remote endpoint to send the handshake to.</param>
+    /// <param name="cancellationToken">Token to cancel the send operation.</param>
+    /// <returns>A task that completes when the handshake packet has been handed to the socket.</returns>
     public Task SendHandshakeAsync(IPEndPoint target, CancellationToken cancellationToken)
     {
         const PacketFlags Flags = PacketFlags.Handshake;
@@ -189,6 +222,9 @@ public sealed partial class TransmissionEngine
     /// <summary>
     /// Sends a keep-alive heartbeat to the connection's remote endpoint.
     /// </summary>
+    /// <param name="synapseConnection">The connection to send the heartbeat to.</param>
+    /// <param name="cancellationToken">Token to cancel the send operation.</param>
+    /// <returns>A task that completes when the keep-alive packet has been handed to the socket.</returns>
     public Task SendKeepAliveAsync(SynapseConnection synapseConnection, CancellationToken cancellationToken)
     {
         const PacketFlags Flags = PacketFlags.KeepAlive;
@@ -201,6 +237,9 @@ public sealed partial class TransmissionEngine
     /// <summary>
     /// Sends a disconnect notification to the connection's remote endpoint.
     /// </summary>
+    /// <param name="synapseConnection">The connection being torn down.</param>
+    /// <param name="cancellationToken">Token to cancel the send operation.</param>
+    /// <returns>A task that completes when the disconnect packet has been handed to the socket.</returns>
     public Task SendDisconnectAsync(SynapseConnection synapseConnection, CancellationToken cancellationToken)
     {
         const PacketFlags Flags = PacketFlags.Disconnect;
@@ -214,6 +253,9 @@ public sealed partial class TransmissionEngine
     /// Sends bytes directly over the appropriate socket (IPv6 when available, otherwise IPv4)
     /// and records the sent byte count in telemetry.
     /// </summary>
+    /// <param name="buffer">The buffer containing the bytes to send.</param>
+    /// <param name="length">Number of bytes to send from the start of <paramref name="buffer"/>.</param>
+    /// <param name="target">The remote endpoint to send to.</param>
     private async Task SendDirectAsync(byte[] buffer, int length, IPEndPoint target)
     {
         Socket socket = target.AddressFamily == AddressFamily.InterNetworkV6 && _ipv6Socket is not null ? _ipv6Socket : _ipv4Socket;
@@ -225,6 +267,9 @@ public sealed partial class TransmissionEngine
     /// Sends a packet and returns its backing buffer to the shared <see cref="ArrayPool{T}"/>
     /// once the send completes, guaranteeing the rental is returned even if an exception occurs.
     /// </summary>
+    /// <param name="segment">The wire-ready bytes to send; <see cref="ArraySegment{T}.Array"/> is returned to the pool after sending.</param>
+    /// <param name="target">The remote endpoint to send to.</param>
+    /// <param name="cancellationToken">Token to cancel the send operation.</param>
     private async Task SendAndPoolBufferAsync(ArraySegment<byte> segment, IPEndPoint target, CancellationToken cancellationToken)
     {
         try

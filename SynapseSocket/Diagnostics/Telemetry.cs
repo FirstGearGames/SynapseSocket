@@ -65,6 +65,7 @@ public sealed class Telemetry
     /// <summary>
     /// Creates a telemetry instance.
     /// </summary>
+    /// <param name="isEnabled">Whether telemetry collection is active.</param>
     public Telemetry(bool isEnabled)
     {
         IsEnabled = isEnabled;
@@ -73,6 +74,7 @@ public sealed class Telemetry
     /// <summary>
     /// Records an inbound packet, incrementing both the byte and packet counters.
     /// </summary>
+    /// <param name="bytes">Number of bytes in the received packet.</param>
     internal void OnReceived(int bytes)
     {
         if (!IsEnabled) return;
@@ -83,6 +85,7 @@ public sealed class Telemetry
     /// <summary>
     /// Records an outbound packet, incrementing both the byte and packet counters.
     /// </summary>
+    /// <param name="bytes">Number of bytes in the sent packet.</param>
     internal void OnSent(int bytes)
     {
         if (!IsEnabled) return;

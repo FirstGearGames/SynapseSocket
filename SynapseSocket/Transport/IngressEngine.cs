@@ -97,6 +97,12 @@ public sealed partial class IngressEngine
     /// <summary>
     /// Creates a new ingress engine bound to the provided socket.
     /// </summary>
+    /// <param name="socket">The bound UDP socket to receive from.</param>
+    /// <param name="config">Engine configuration snapshot.</param>
+    /// <param name="security">Security provider for signature, blacklist, and rate-limit checks.</param>
+    /// <param name="connections">Active connection table shared with the rest of the engine.</param>
+    /// <param name="sender">Transmission engine used to emit acknowledgements and handshake responses.</param>
+    /// <param name="telemetry">Telemetry counters for this engine instance.</param>
     public IngressEngine(Socket socket, SynapseConfig config, SecurityProvider security, ConnectionManager connections, TransmissionEngine sender, Telemetry telemetry)
     {
         _socket = socket;
@@ -110,12 +116,19 @@ public sealed partial class IngressEngine
     /// <summary>
     /// Starts the async receive loop on the thread pool.
     /// </summary>
+    /// <param name="cancellationToken">Token that signals the receive loop to stop.</param>
+    /// <returns>A task that completes when the receive loop exits.</returns>
     public Task StartAsync(CancellationToken cancellationToken)
     {
         IsRunning = true;
         return Task.Run(() => ReceiveLoopAsync(cancellationToken), cancellationToken);
     }
 
+    /// <summary>
+    /// Core receive loop: awaits datagrams, runs lowest-level filters, and dispatches to packet handlers.
+    /// Runs until <paramref name="cancellationToken"/> is cancelled or the socket is disposed.
+    /// </summary>
+    /// <param name="cancellationToken">Token that signals the loop to exit cleanly.</param>
     private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
     {
         EndPoint anyEndPoint = _socket.AddressFamily == AddressFamily.InterNetworkV6 ? new(IPAddress.IPv6Any, 0) : new IPEndPoint(IPAddress.Any, 0);
@@ -217,6 +230,14 @@ public sealed partial class IngressEngine
     /// Parses a single received datagram and routes it to the appropriate handler
     /// (handshake, data, ack, disconnect, keep-alive, or NAT probe/server).
     /// </summary>
+    /// <param name="buffer">The raw receive buffer containing the datagram.</param>
+    /// <param name="length">Number of valid bytes in <paramref name="buffer"/>.</param>
+    /// <param name="fromEndPoint">The source endpoint of the datagram.</param>
+    /// <param name="cancellationToken">Token forwarded to async send helpers.</param>
+    /// <param name="isBufferHandedOff">
+    /// Set to true when ownership of <paramref name="buffer"/> is transferred to a
+    /// <see cref="PayloadDelivered"/> subscriber so the receive loop does not return it to the pool.
+    /// </param>
     private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, CancellationToken cancellationToken, ref bool isBufferHandedOff)
     {
         PacketFlags flags;
@@ -397,6 +418,8 @@ public sealed partial class IngressEngine
     /// from the pool and atomically assigns it. If two threads race, the loser's instance is returned
     /// to the pool and the winner's instance is used.
     /// </summary>
+    /// <param name="synapseConnection">The connection whose reassembler is needed.</param>
+    /// <returns>The initialised <see cref="PacketReassembler"/> assigned to the connection.</returns>
     private PacketReassembler GetOrRentReassembler(SynapseConnection synapseConnection)
     {
         if (synapseConnection.Reassembler is not null)
@@ -418,6 +441,10 @@ public sealed partial class IngressEngine
     /// <summary>
     /// Delivers in-order isReliable payloads and drains any consecutive buffered packets from the reorder buffer.
     /// </summary>
+    /// <param name="synapseConnection">The connection the payload belongs to.</param>
+    /// <param name="sequence">The sequence number of the arriving packet.</param>
+    /// <param name="payload">The payload bytes to deliver.</param>
+    /// <param name="isReliable">True if the payload was sent reliably; forwarded to <see cref="PayloadDelivered"/>.</param>
     private void DeliverOrdered(SynapseConnection synapseConnection, ushort sequence, ArraySegment<byte> payload, bool isReliable)
     {
         List<ArraySegment<byte>>? toDeliver = null;
@@ -468,6 +495,8 @@ public sealed partial class IngressEngine
     /// <summary>
     /// Evicts stale entries from the NAT probe response-time dictionary.
     /// </summary>
+    /// <param name="nowTicks">The current UTC tick count.</param>
+    /// <param name="staleTicks">Age in ticks beyond which an entry is considered stale.</param>
     private void RemoveExpiredProbeLimitEntries(long nowTicks, long staleTicks) =>
         RemoveExpiredEntries(_natProbeLastResponseTicks, nowTicks, staleTicks);
 
@@ -475,6 +504,8 @@ public sealed partial class IngressEngine
     /// Parses a NAT server packet body into an <see cref="IPEndPoint"/> (address family byte + address + port).
     /// Returns null if the body is malformed or too short.
     /// </summary>
+    /// <param name="body">The raw body bytes following the NAT packet-type byte.</param>
+    /// <returns>The parsed <see cref="IPEndPoint"/>, or null if the body is too short or uses an unrecognised address family.</returns>
     private static IPEndPoint? TryParsePeerEndPoint(ReadOnlySpan<byte> body)
     {
         if (body.Length < 1)
@@ -500,6 +531,11 @@ public sealed partial class IngressEngine
     /// Processes an inbound handshake: checks blacklist, connection cap, replay cache,
     /// and signature validation. Registers the connection on success and sends a handshake-ack.
     /// </summary>
+    /// <param name="fromEndPoint">The source endpoint of the handshake datagram.</param>
+    /// <param name="buffer">The raw receive buffer.</param>
+    /// <param name="headerSize">Byte offset where the payload begins in <paramref name="buffer"/>.</param>
+    /// <param name="length">Total number of valid bytes in <paramref name="buffer"/>.</param>
+    /// <param name="cancellationToken">Token forwarded to the handshake-ack send.</param>
     private void ProcessHandshake(IPEndPoint fromEndPoint, byte[] buffer, int headerSize, int length, CancellationToken cancellationToken)
     {
         ReadOnlySpan<byte> handshakePayload = buffer.AsSpan(headerSize, length - headerSize);
@@ -559,6 +595,8 @@ public sealed partial class IngressEngine
     /// <summary>
     /// Evicts stale entries from the handshake replay cache.
     /// </summary>
+    /// <param name="nowTicks">The current UTC tick count.</param>
+    /// <param name="staleTicks">Age in ticks beyond which a cached handshake signature is considered expired.</param>
     private void RemoveExpiredHandshakeEntries(long nowTicks, long staleTicks) =>
         RemoveExpiredEntries(_seenHandshakes, nowTicks, staleTicks);
 
@@ -566,6 +604,10 @@ public sealed partial class IngressEngine
     /// Generic helper that removes entries from a <see cref="ConcurrentDictionary{TKey, Long}"/>
     /// whose tick-valued values are older than <paramref name="staleTicks"/> relative to <paramref name="nowTicks"/>.
     /// </summary>
+    /// <param name="dictionary">The dictionary to prune.</param>
+    /// <param name="nowTicks">The current UTC tick count.</param>
+    /// <param name="staleTicks">Age in ticks beyond which an entry is removed.</param>
+    /// <typeparam name="TKey">The dictionary key type.</typeparam>
     private static void RemoveExpiredEntries<TKey>(ConcurrentDictionary<TKey, long> dictionary, long nowTicks, long staleTicks)
         where TKey : notnull
     {
@@ -582,9 +624,20 @@ public sealed partial class IngressEngine
     /// </summary>
     private readonly struct IpKey : IEquatable<IpKey>
     {
+        /// <summary>
+        /// High 64 bits of the address (holds the full IPv4 address or the first 8 bytes of an IPv6 address).
+        /// </summary>
         private readonly ulong _upper64;
+        /// <summary>
+        /// Low 64 bits of the address (zero for IPv4; bytes 8-15 of an IPv6 address).
+        /// </summary>
         private readonly ulong _lower64;
 
+        /// <summary>
+        /// Initialises an <see cref="IpKey"/> from its raw 128-bit representation.
+        /// </summary>
+        /// <param name="upper64">High 64 bits of the address.</param>
+        /// <param name="lower64">Low 64 bits of the address.</param>
         private IpKey(ulong upper64, ulong lower64)
         {
             _upper64 = upper64;
@@ -610,8 +663,11 @@ public sealed partial class IngressEngine
             }
         }
 
+        /// <inheritdoc/>
         public bool Equals(IpKey other) => _upper64 == other._upper64 && _lower64 == other._lower64;
+        /// <inheritdoc/>
         public override bool Equals(object? obj) => obj is IpKey other && Equals(other);
+        /// <inheritdoc/>
         public override int GetHashCode() => HashCode.Combine(_upper64, _lower64);
     }
 }

@@ -15,13 +15,25 @@ namespace SynapseSocket.Packets;
 /// </summary>
 public sealed class PacketReassembler : PacketSegmenter
 {
+    /// <summary>
+    /// Active in-progress assemblies keyed by segment ID.
+    /// </summary>
     private readonly Dictionary<ushort, SegmentAssembly> _currentSegments = [];
+    /// <summary>
+    /// Guards access to <see cref="_currentSegments"/>.
+    /// </summary>
     private readonly object _lock = new();
+    /// <summary>
+    /// Maximum number of concurrent assemblies permitted; 0 means unlimited.
+    /// </summary>
     private uint _maximumConcurrentAssemblies;
 
     /// <summary>
     /// Configures the reassembler after renting from the pool.
     /// </summary>
+    /// <param name="maximumTransmissionUnit">Maximum wire packet size in bytes.</param>
+    /// <param name="maximumSegments">Maximum number of segments a single message may be split into.</param>
+    /// <param name="maximumConcurrentAssemblies">Maximum number of simultaneous in-progress assemblies; 0 means unlimited.</param>
     public void Initialize(uint maximumTransmissionUnit, uint maximumSegments, uint maximumConcurrentAssemblies)
     {
         base.Initialize(maximumTransmissionUnit, maximumSegments);
@@ -39,6 +51,14 @@ public sealed class PacketReassembler : PacketSegmenter
     /// is set to true, the stale assembly is evicted, and the method returns false. Callers should
     /// treat this as grounds for kicking/blacklisting the peer.
     /// </summary>
+    /// <param name="segmentId">Stream identifier shared by all segments of the same logical message.</param>
+    /// <param name="segmentIndex">Zero-based position of this segment within the stream.</param>
+    /// <param name="segmentCount">Total number of segments in the stream.</param>
+    /// <param name="segmentData">Raw payload bytes for this segment.</param>
+    /// <param name="isReliable">Whether the segment was delivered on the reliable channel.</param>
+    /// <param name="assembledSegments">Receives the fully reassembled payload when the method returns true.</param>
+    /// <param name="isProtocolViolation">Set to true when a protocol inconsistency is detected; false otherwise.</param>
+    /// <returns>True when the final segment has arrived and the payload is fully reassembled; otherwise false.</returns>
     public bool TryReassemble(ushort segmentId, byte segmentIndex, byte segmentCount, ReadOnlySpan<byte> segmentData, bool isReliable, out ArraySegment<byte> assembledSegments, out bool isProtocolViolation)
     {
         assembledSegments = default;
@@ -56,6 +76,7 @@ public sealed class PacketReassembler : PacketSegmenter
                     isProtocolViolation = true;
                     return false;
                 }
+
                 segmentAssembly = ResettableObjectPool<SegmentAssembly>.Rent();
                 segmentAssembly.Initialize(segmentCount, isReliable);
                 _currentSegments[segmentId] = segmentAssembly;
@@ -90,6 +111,8 @@ public sealed class PacketReassembler : PacketSegmenter
     /// Removes and returns to pool incomplete segment assemblies that have exceeded the timeout.
     /// This ensures that assemblies from connections that disconnect before completing are not held indefinitely.
     /// </summary>
+    /// <param name="nowTicks">Current timestamp in <see cref="System.DateTime.Ticks"/>.</param>
+    /// <param name="timeoutTicks">Maximum age in ticks before an incomplete assembly is evicted.</param>
     public void RemoveExpiredSegments(long nowTicks, long timeoutTicks)
     {
         lock (_lock)
@@ -102,6 +125,7 @@ public sealed class PacketReassembler : PacketSegmenter
                     if (nowTicks - keyValuePair.Value.FirstReceivedTicks > timeoutTicks)
                         toRemove.Add(keyValuePair.Key);
                 }
+
                 foreach (ushort id in toRemove)
                 {
                     if (_currentSegments.Remove(id, out SegmentAssembly? evicted))
@@ -122,8 +146,10 @@ public sealed class PacketReassembler : PacketSegmenter
         {
             foreach (SegmentAssembly segmentAssembly in _currentSegments.Values)
                 ResettableObjectPool<SegmentAssembly>.Return(segmentAssembly);
+
             _currentSegments.Clear();
         }
+
         _maximumConcurrentAssemblies = 0;
         base.OnReturn();
     }
@@ -164,11 +190,17 @@ public sealed class PacketReassembler : PacketSegmenter
         /// Total length of added segments.
         /// </summary>
         private int _totalLength;
+
+        /// <summary>
+        /// Initializes a new <see cref="SegmentAssembly"/> instance.
+        /// </summary>
         public SegmentAssembly() { }
 
         /// <summary>
         /// Prepares the assembly for a new segmented payload with the given segment count and reliability flag.
         /// </summary>
+        /// <param name="segmentCount">Total number of segments expected for this payload.</param>
+        /// <param name="isReliable">Whether the segments belong to the reliable channel.</param>
         public void Initialize(byte segmentCount, bool isReliable)
         {
             _segmentCount = segmentCount;
@@ -183,6 +215,8 @@ public sealed class PacketReassembler : PacketSegmenter
         /// Stores a segment at the given index, copying its data into a pooled buffer.
         /// Duplicate indices are silently ignored.
         /// </summary>
+        /// <param name="segmentIndex">Zero-based index of the segment to store.</param>
+        /// <param name="segmentData">Raw bytes for this segment.</param>
         public void Add(byte segmentIndex, ReadOnlySpan<byte> segmentData)
         {
             if (_segments![segmentIndex].Array is not null)
@@ -207,6 +241,8 @@ public sealed class PacketReassembler : PacketSegmenter
         /// The caller is responsible for returning <see cref="ArraySegment{T}.Array"/> to
         /// <see cref="ArrayPool{T}.Shared"/> when done.
         /// </summary>
+        /// <param name="assembledSegment">Receives the fully assembled payload when the method returns true.</param>
+        /// <returns>True when all segments have been received and the payload has been assembled; otherwise false.</returns>
         public bool TryGetAssembledSegments(out ArraySegment<byte> assembledSegment)
         {
             // Exit if all segments have not been received.
@@ -243,6 +279,7 @@ public sealed class PacketReassembler : PacketSegmenter
                     arraySegment.PoolArrayIntoShared();
                 ListPool<ArraySegment<byte>>.ReturnAndNullifyReference(ref _segments);
             }
+
             _segmentCount = 0;
             _receivedCount = 0;
             _totalLength = 0;

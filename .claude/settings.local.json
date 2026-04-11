@@ -6,7 +6,14 @@
       "Bash(claude --version)",
       "Bash(claude plugin:*)",
       "Bash(npm view:*)",
-      "Read(//c/Users/email/.claude/plugins/**)"
+      "Read(//c/Users/email/.claude/plugins/**)",
+      "WebFetch(domain:github.com)",
+      "Bash(curl:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(gh api:*)",
+      "Bash(python3 -c \"import sys,json; [print\\(f['name']\\) for f in json.load\\(sys.stdin\\)]\")",
+      "WebFetch(domain:api.github.com)",
+      "Bash(xargs grep:*)"
     ]
   }
 }

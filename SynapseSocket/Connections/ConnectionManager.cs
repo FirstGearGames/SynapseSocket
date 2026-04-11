@@ -26,6 +26,9 @@ public sealed class ConnectionManager
     /// <summary>
     /// Tries to find an existing connection by its remote endpoint.
     /// </summary>
+    /// <param name="endPoint">The remote endpoint to look up.</param>
+    /// <param name="connection">When this method returns, contains the matching connection, or null if not found.</param>
+    /// <returns>True if a connection was found for the given endpoint; otherwise false.</returns>
     public bool TryGet(IPEndPoint endPoint, out SynapseConnection? connection)
     {
         return _byEndPoint.TryGetValue(new(endPoint), out connection);
@@ -34,6 +37,9 @@ public sealed class ConnectionManager
     /// <summary>
     /// Tries to find a connection by signature.
     /// </summary>
+    /// <param name="signature">The 64-bit signature to look up.</param>
+    /// <param name="connection">When this method returns, contains the matching connection, or null if not found.</param>
+    /// <returns>True if a connection was found for the given signature; otherwise false.</returns>
     public bool TryGetBySignature(ulong signature, out SynapseConnection? connection)
         => _bySignature.TryGetValue(signature, out connection);
 
@@ -48,6 +54,10 @@ public sealed class ConnectionManager
     /// Registers a new connection.
     /// Returns the existing one if already present.
     /// </summary>
+    /// <param name="endPoint">The remote endpoint identifying the peer.</param>
+    /// <param name="signature">The 64-bit signature associated with the peer.</param>
+    /// <param name="factory">Factory invoked to create a new connection if one does not already exist for the given endpoint.</param>
+    /// <returns>The existing connection for the endpoint, or the newly created one.</returns>
     public SynapseConnection GetOrAdd(IPEndPoint endPoint, ulong signature, Func<IPEndPoint, ulong, SynapseConnection> factory)
     {
         EndPointKey endPointKey = new(endPoint);
@@ -65,6 +75,9 @@ public sealed class ConnectionManager
     /// <summary>
     /// Removes and returns a connection by endpoint.
     /// </summary>
+    /// <param name="endPoint">The remote endpoint of the connection to remove.</param>
+    /// <param name="removedSynapseConnection">When this method returns, contains the removed connection, or null if not found.</param>
+    /// <returns>True if the connection was found and removed; otherwise false.</returns>
     public bool Remove(IPEndPoint endPoint, out SynapseConnection? removedSynapseConnection)
     {
         bool isRemoved = _byEndPoint.TryRemove(new(endPoint), out removedSynapseConnection);
@@ -76,6 +89,7 @@ public sealed class ConnectionManager
     /// Enumerates all currently tracked connections.
     /// Snapshot is taken at call time.
     /// </summary>
+    /// <returns>A sequence containing all active <see cref="SynapseConnection"/> instances at the moment of enumeration.</returns>
     public IEnumerable<SynapseConnection> Snapshot()
     {
         foreach (KeyValuePair<EndPointKey, SynapseConnection> keyValuePair in _byEndPoint)
@@ -87,17 +101,39 @@ public sealed class ConnectionManager
     /// </summary>
     private readonly struct EndPointKey : IEquatable<EndPointKey>
     {
+        /// <summary>
+        /// Initializes a new <see cref="EndPointKey"/> wrapping the given endpoint.
+        /// </summary>
+        /// <param name="endPoint">The remote endpoint to wrap.</param>
         public EndPointKey(IPEndPoint endPoint) { _endPoint = endPoint; }
 
+        /// <summary>
+        /// Compares this key to another by address and port.
+        /// </summary>
+        /// <param name="other">The other key to compare against.</param>
+        /// <returns>True if both keys represent the same address and port; otherwise false.</returns>
         public bool Equals(EndPointKey other)
         {
             if (_endPoint is null || other._endPoint is null) return ReferenceEquals(_endPoint, other._endPoint);
             return _endPoint.Port == other._endPoint.Port && _endPoint.Address.Equals(other._endPoint.Address);
         }
 
+        /// <summary>
+        /// Compares this key to a boxed object.
+        /// </summary>
+        /// <param name="obj">The object to compare against.</param>
+        /// <returns>True if <paramref name="obj"/> is an <see cref="EndPointKey"/> that equals this instance; otherwise false.</returns>
         public override bool Equals(object? obj) => obj is EndPointKey endPointKey && Equals(endPointKey);
+
+        /// <summary>
+        /// Returns a hash code derived from the endpoint's address and port.
+        /// </summary>
+        /// <returns>A 32-bit signed integer hash code.</returns>
         public override int GetHashCode() => _endPoint is null ? 0 : unchecked(_endPoint.Address.GetHashCode() * 397) ^ _endPoint.Port;
 
+        /// <summary>
+        /// The wrapped remote endpoint.
+        /// </summary>
         private readonly IPEndPoint _endPoint;
     }
 }

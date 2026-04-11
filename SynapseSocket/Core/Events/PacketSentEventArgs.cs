@@ -29,6 +29,9 @@ public sealed class PacketSentEventArgs : EventArgs, IPoolResettable
     /// </summary>
     public bool IsReliable { get; private set; }
 
+    /// <summary>
+    /// Initialises a new instance of <see cref="PacketSentEventArgs"/>.
+    /// </summary>
     public PacketSentEventArgs() { }
 
     /// <summary>

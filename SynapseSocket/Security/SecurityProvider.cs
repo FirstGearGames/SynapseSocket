@@ -15,9 +15,21 @@ public sealed class SecurityProvider
     /// The signature calculator in use.
     /// </summary>
     public ISignatureProvider SignatureProvider { get; }
+    /// <summary>
+    /// Set of blacklisted peer signatures. Values are unused placeholders.
+    /// </summary>
     private readonly ConcurrentDictionary<ulong, byte> _blacklist = [];
+    /// <summary>
+    /// Per-signature sliding-window rate buckets, keyed by peer signature.
+    /// </summary>
     private readonly ConcurrentDictionary<ulong, RateBucket> _rateBuckets = [];
+    /// <summary>
+    /// Maximum number of packets a single peer may send per second. Zero disables rate limiting.
+    /// </summary>
     private readonly uint _maximumPacketsPerSecond;
+    /// <summary>
+    /// Maximum permitted size of a single incoming packet in bytes. Packets exceeding this are rejected.
+    /// </summary>
     private readonly uint _maximumPacketSize;
     /// <summary>
     /// The sentinel value returned when a signature cannot be computed.
@@ -28,6 +40,9 @@ public sealed class SecurityProvider
     /// <summary>
     /// Creates a new security provider.
     /// </summary>
+    /// <param name="signatureProvider">The signature provider used to identify remote peers.</param>
+    /// <param name="maximumPacketsPerSecond">Per-peer packet rate limit. Zero disables rate limiting.</param>
+    /// <param name="maximumPacketSize">Maximum permitted packet size in bytes.</param>
     public SecurityProvider(ISignatureProvider signatureProvider, uint maximumPacketsPerSecond, uint maximumPacketSize)
     {
         SignatureProvider = signatureProvider ?? throw new ArgumentNullException(nameof(signatureProvider));
@@ -39,6 +54,9 @@ public sealed class SecurityProvider
     /// Computes the signature for an endpoint.
     /// Returns <see cref="UnsetSignature"/> if the provider reports failure.
     /// </summary>
+    /// <param name="endPoint">The remote peer's endpoint.</param>
+    /// <param name="handshakePayload">The handshake payload bytes, or empty if not yet available.</param>
+    /// <returns>The computed 64-bit signature, or <see cref="UnsetSignature"/> on failure.</returns>
     public ulong ComputeSignature(IPEndPoint endPoint, ReadOnlySpan<byte> handshakePayload)
     {
         if (!SignatureProvider.TryCompute(endPoint, handshakePayload, out ulong signature))
@@ -50,17 +68,22 @@ public sealed class SecurityProvider
     /// <summary>
     /// Returns true if the given signature is blacklisted.
     /// </summary>
+    /// <param name="signature">The peer signature to check.</param>
+    /// <returns>True if the signature is present in the blacklist.</returns>
     public bool IsBlacklisted(ulong signature) => _blacklist.ContainsKey(signature);
 
     /// <summary>
     /// Adds a signature to the blacklist.
     /// </summary>
+    /// <param name="signature">The peer signature to blacklist.</param>
     public void AddToBlacklist(ulong signature) => _blacklist[signature] = 1;
 
     /// <summary>
     /// Removes a signature from the blacklist.
     /// Returns true if the signature was present and removed.
     /// </summary>
+    /// <param name="signature">The peer signature to remove.</param>
+    /// <returns>True if the signature was present and has been removed; false if it was not found.</returns>
     public bool RemoveFromBlacklist(ulong signature) => _blacklist.TryRemove(signature, out _);
 
     /// <summary>
@@ -71,6 +94,9 @@ public sealed class SecurityProvider
     /// a kick+blacklist action removes it from the connection table, so the next packet from that
     /// peer falls through to <see cref="InspectNew"/> automatically.
     /// </summary>
+    /// <param name="packetLength">Length of the received packet in bytes.</param>
+    /// <param name="cachedSignature">The pre-computed signature stored on the connection.</param>
+    /// <returns>A <see cref="FilterResult"/> indicating whether the packet should be processed or dropped.</returns>
     public FilterResult InspectEstablished(int packetLength, ulong cachedSignature)
     {
         if (packetLength <= 0 || (uint)packetLength > _maximumPacketSize)
@@ -89,6 +115,10 @@ public sealed class SecurityProvider
     /// rejected packets), checks the blacklist, then delegates to <see cref="InspectEstablished"/>
     /// for size and rate-limit enforcement.
     /// </summary>
+    /// <param name="endPoint">The remote endpoint the packet arrived from.</param>
+    /// <param name="packetLength">Length of the received packet in bytes.</param>
+    /// <param name="signature">The computed peer signature, or <see cref="UnsetSignature"/> on failure.</param>
+    /// <returns>A <see cref="FilterResult"/> indicating whether the packet should be processed or dropped.</returns>
     public FilterResult InspectNew(IPEndPoint endPoint, int packetLength, out ulong signature)
     {
         // Reject immediately if the signature cannot be computed or resolves to the unset sentinel.
@@ -110,6 +140,8 @@ public sealed class SecurityProvider
     /// Removes rate buckets that have not seen traffic in longer than <paramref name="expiryTicks"/>.
     /// Call from the maintenance loop to bound <c>_rateBuckets</c> growth.
     /// </summary>
+    /// <param name="nowTicks">The current UTC tick count.</param>
+    /// <param name="expiryTicks">The number of ticks of inactivity after which a bucket is removed.</param>
     public void RemoveExpiredRateBuckets(long nowTicks, long expiryTicks)
     {
         foreach (KeyValuePair<ulong, RateBucket> entry in _rateBuckets)
@@ -146,6 +178,8 @@ public sealed class SecurityProvider
         /// Returns true if the endpoint may send another packet within the current window,
         /// incrementing the counter; returns false when the limit has been reached.
         /// </summary>
+        /// <param name="maximumPacketsPerSecond">The maximum number of packets allowed per second.</param>
+        /// <returns>True if the packet is within the rate limit; false if the limit has been exceeded.</returns>
         public bool Allow(uint maximumPacketsPerSecond)
         {
             lock (_lock)

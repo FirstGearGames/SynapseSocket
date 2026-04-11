@@ -31,6 +31,8 @@ public abstract class PacketSegmenter : IPoolResettable
     /// <summary>
     /// Configures the segmenter after renting from the pool.
     /// </summary>
+    /// <param name="maximumTransmissionUnit">Maximum wire packet size in bytes; must be greater than <see cref="PacketHeader.MaxHeaderSize"/>.</param>
+    /// <param name="maximumSegments">Maximum number of segments a single message may be split into; must be between 1 and 255 inclusive.</param>
     public void Initialize(uint maximumTransmissionUnit, uint maximumSegments)
     {
         if (maximumTransmissionUnit == 0 || maximumTransmissionUnit <= PacketHeader.MaxHeaderSize)

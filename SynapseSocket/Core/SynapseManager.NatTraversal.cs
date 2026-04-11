@@ -26,9 +26,13 @@ namespace SynapseSocket.Core;
 /// </summary>
 public sealed partial class SynapseManager
 {
-    // Set before ConnectViaNatServerAsync returns; completed by OnNatPeerReady.
+    /// <summary>
+    /// Completion source set before <see cref="ConnectViaNatServerAsync"/> returns and resolved by <see cref="OnNatPeerReady"/>.
+    /// </summary>
     private TaskCompletionSource<IPEndPoint>? _natPeerSource;
-    // Guards _natPeerSource assignment to prevent concurrent callers racing.
+    /// <summary>
+    /// Guards <see cref="_natPeerSource"/> assignment to prevent concurrent callers from racing.
+    /// </summary>
     private readonly object _natPeerSourceLock = new();
 
     // -------------------------------------------------------------------------

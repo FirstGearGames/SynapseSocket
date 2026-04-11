@@ -28,6 +28,8 @@ public sealed partial class IngressEngine
     /// Handles an inbound NAT probe from an unrecognised endpoint.
     /// Responds with a probe + handshake, subject to per-IP rate limiting.
     /// </summary>
+    /// <param name="fromEndPoint">The source endpoint that sent the NAT probe.</param>
+    /// <param name="cancellationToken">Token forwarded to outbound send helpers.</param>
     private void ProcessNatProbe(IPEndPoint fromEndPoint, CancellationToken cancellationToken)
     {
         if (_config.NatTraversal.Mode == NatTraversalMode.Disabled)
@@ -69,6 +71,8 @@ public sealed partial class IngressEngine
     /// Routes an inbound packet from the configured NAT rendezvous server
     /// to the appropriate handler (PeerReady, SessionFull, HeartbeatAck).
     /// </summary>
+    /// <param name="fromEndPoint">The source endpoint the packet arrived from.</param>
+    /// <param name="payload">The packet bytes following the wire header.</param>
     private void ProcessNatServerPacket(IPEndPoint fromEndPoint, ReadOnlySpan<byte> payload)
     {
         if (_config.NatTraversal.Mode != NatTraversalMode.Server)

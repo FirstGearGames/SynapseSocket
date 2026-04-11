@@ -27,6 +27,11 @@ public sealed class PacketSplitter : PacketSegmenter
     /// Use <paramref name="segmentCount"/> (not the array length) to iterate — the rented
     /// outer array may be larger than needed.
     /// </summary>
+    /// <param name="payload">The application payload to split into segments.</param>
+    /// <param name="isReliable">Whether the segments should be flagged for reliable delivery.</param>
+    /// <param name="segmentCount">Receives the number of valid segments produced.</param>
+    /// <param name="sequence">Reliable sequence number to embed in each segment header; used only when <paramref name="isReliable"/> is true.</param>
+    /// <returns>A rented array of <see cref="ArraySegment{T}"/> values, each representing one wire-ready segment packet.</returns>
     public ArraySegment<byte>[] Split(ReadOnlySpan<byte> payload, bool isReliable, out int segmentCount, ushort sequence = 0)
     {
         int segmentPayloadSize = (int)MaximumTransmissionUnit - PacketHeader.FlagSize - PacketHeader.SegmentSize - (isReliable ? PacketHeader.SequenceSize : 0);

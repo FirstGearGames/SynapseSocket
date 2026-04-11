@@ -17,6 +17,9 @@ public sealed class ConnectionEventArgs : EventArgs, IPoolResettable
     [PoolResettableMember]
     public SynapseConnection Connection { get; private set; }
 
+    /// <summary>
+    /// Initialises a new instance of <see cref="ConnectionEventArgs"/>.
+    /// </summary>
     public ConnectionEventArgs() { }
 
     /// <summary>

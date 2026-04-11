@@ -60,6 +60,9 @@ public sealed class ViolationEventArgs : EventArgs, IPoolResettable
     /// </summary>
     public ViolationAction Action;
 
+    /// <summary>
+    /// Initialises a new instance of <see cref="ViolationEventArgs"/>.
+    /// </summary>
     public ViolationEventArgs() { }
 
     /// <summary>
@@ -77,6 +80,7 @@ public sealed class ViolationEventArgs : EventArgs, IPoolResettable
         Action = initialAction;
     }
 
+    /// <inheritdoc/>
     public void OnReturn()
     {
         EndPoint = null;
@@ -84,5 +88,6 @@ public sealed class ViolationEventArgs : EventArgs, IPoolResettable
         Details = null;
     }
 
+    /// <inheritdoc/>
     public void OnRent() { }
 }

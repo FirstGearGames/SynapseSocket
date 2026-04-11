@@ -20,5 +20,6 @@ public interface ISignatureValidator
     /// <param name="endPoint">The remote peer's endpoint.</param>
     /// <param name="signature">The signature computed by the configured <see cref="ISignatureProvider"/>.</param>
     /// <param name="handshakePayload">The handshake payload bytes (may be empty).</param>
+    /// <returns>True to accept the handshake; false to reject it and raise <c>ConnectionFailed(SignatureRejected)</c>.</returns>
     bool Validate(IPEndPoint endPoint, ulong signature, ReadOnlySpan<byte> handshakePayload);
 }

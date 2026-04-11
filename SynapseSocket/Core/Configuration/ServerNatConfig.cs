@@ -46,6 +46,7 @@ public sealed class ServerNatConfig
     /// Generates a random <see cref="SessionIdLength"/>-character uppercase alphanumeric session ID
     /// suitable for display and manual entry (e.g., <c>"A3X7KQ"</c>).
     /// </summary>
+    /// <returns>A randomly generated uppercase alphanumeric session ID string.</returns>
     public static string GenerateSessionId()
     {
         byte[] randomBytes = new byte[SessionIdLength];
