@@ -81,11 +81,13 @@ public sealed class SynapseConfig
     public uint MaximumReassembledPacketSize = 0;
 
     /// <summary>
-    /// When true (default), received unreliable payloads are copied into a fresh pooled buffer before being delivered to <see cref="SynapseManager.PacketReceived"/>, so the ingress buffer is returned to the pool immediately.
-    /// When false, the ingress buffer slice is handed directly to the callback — zero allocation, but the buffer must not be retained after the handler returns.
-    /// Has no effect on reliable or segmented receives, which always copy.
+    /// When true (default), received payloads are copied into a fresh buffer before being dispatched via <see cref="SynapseManager.PacketReceived"/>.
+    /// The copy is recycled after the event returns; do not retain references to <see cref="SynapseSocket.Core.Events.PacketReceivedEventArgs.Payload"/> beyond the handler.
+    /// When false, the internal payload buffer is dispatched directly and recycled immediately after the event returns.
+    /// Copy payload data within the handler if it is needed beyond the callback.
+    /// Note: reliable and segmented receives always copy internally regardless of this setting.
     /// </summary>
-    public bool CopyUnreliablePayload = true;
+    public bool CopyReceivedPayloads = true;
 
     /// <summary>
     /// Enables telemetry counters.

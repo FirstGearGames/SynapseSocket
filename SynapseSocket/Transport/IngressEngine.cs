@@ -139,7 +139,7 @@ public sealed partial class IngressEngine
         while (!cancellationToken.IsCancellationRequested)
         {
             byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
-            bool isBufferHandedOff = false;
+            bool isPayloadCopied = true;
 
             try
             {
@@ -204,7 +204,7 @@ public sealed partial class IngressEngine
 
                 _telemetry.OnReceived(receivedLength);
 
-                ProcessPacket(rentedBuffer, receivedLength, fromEndPoint, cancellationToken, ref isBufferHandedOff);
+                ProcessPacket(rentedBuffer, receivedLength, fromEndPoint, cancellationToken, ref isPayloadCopied);
             }
             catch (OperationCanceledException)
             {
@@ -218,8 +218,8 @@ public sealed partial class IngressEngine
             }
             finally
             {
-                // When CopyReceivedUnreliablePayload is false, ownership of rentedBuffer is transferred to the PayloadDelivered subscriber (via OnPayloadDelivered), which returns it to the pool.
-                if (!isBufferHandedOff)
+                // When CopyReceivedPayloads is false, ownership of rentedBuffer is transferred to the PayloadDelivered subscriber (via OnPayloadDelivered), which returns it to the pool.
+                if (isPayloadCopied)
                     ArrayPool<byte>.Shared.Return(rentedBuffer, clearArray: false);
             }
         }
@@ -233,10 +233,10 @@ public sealed partial class IngressEngine
     /// <param name="length">Number of valid bytes in <paramref name="buffer"/>.</param>
     /// <param name="fromEndPoint">The source endpoint of the datagram.</param>
     /// <param name="cancellationToken">Token forwarded to async send helpers.</param>
-    /// <param name="isBufferHandedOff">
-    /// Set to true when ownership of <paramref name="buffer"/> is transferred to a <see cref="PayloadDelivered"/> subscriber so the receive loop does not return it to the pool.
+    /// <param name="isPayloadCopied">
+    /// Set to false when ownership of <paramref name="buffer"/> is transferred to a <see cref="PayloadDelivered"/> subscriber so the receive loop does not return it to the pool.
     /// </param>
-    private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, CancellationToken cancellationToken, ref bool isBufferHandedOff)
+    private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, CancellationToken cancellationToken, ref bool isPayloadCopied)
     {
         PacketFlags flags;
         ushort sequence;
@@ -337,7 +337,7 @@ public sealed partial class IngressEngine
 
             if ((flags & PacketFlags.Segmented) != 0)
             {
-                if (_config.MaximumSegments != SynapseConfig.DisabledMaximumSegments)
+                if (_config.MaximumSegments is not SynapseConfig.DisabledMaximumSegments)
                 {
                     PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
 
@@ -397,11 +397,11 @@ public sealed partial class IngressEngine
             return;
         }
 
-        // Unreliable non-segmented: either pass the ingress buffer directly (zero-copy) or copy the payload into a fresh pool buffer (safe for immediate caller reuse).
-        // When handing off, isBufferHandedOff signals the receive loop not to return rentedBuffer — ownership passes to the PayloadDelivered subscriber, which returns it after callbacks.
-        if (!_config.CopyUnreliablePayload)
+        // Unreliable non-segmented: either pass the ingress buffer directly (zero-copy) or copy the payload into a fresh pool buffer.
+        // When handing off, isPayloadCopied = false signals the receive loop not to return rentedBuffer — ownership passes to the PayloadDelivered subscriber, which returns it after callbacks.
+        if (!_config.CopyReceivedPayloads)
         {
-            isBufferHandedOff = true;
+            isPayloadCopied = false;
             PayloadDelivered?.Invoke(synapseConnection, new(buffer, headerSize, payloadLength), false);
         }
         else
