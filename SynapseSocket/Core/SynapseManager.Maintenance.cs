@@ -14,7 +14,11 @@ namespace SynapseSocket.Core;
 /// </summary>
 public sealed partial class SynapseManager
 {
+    /// <summary>
+    /// UTC ticks of the last ACK batch flush. Used by <see cref="AckBatchFlushSweep"/> to enforce the configured interval.
+    /// </summary>
     private long _lastAckFlushTicks;
+
     /// <summary>
     /// Background loop that periodically runs keep-alive, retransmit, and segment-timeout sweeps.
     /// </summary>
