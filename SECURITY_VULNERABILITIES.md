@@ -11,7 +11,7 @@
 | # | Vulnerability | Severity | File | Category |
 |---|---|---|---|---|
 | 6 | NAT probe sends two responses — amplification vector | RESOLVED | `IngressEngine.Nat.cs` | Amplification |
-| 7 | Rate limiting counts packets only, not bytes | HIGH | `SecurityProvider.cs` | Resource Exhaustion |
+| 7 | Rate limiting counts packets only, not bytes | RESOLVED | `SecurityProvider.cs` | Resource Exhaustion |
 | 8 | Segment count not validated against actual payload bytes | HIGH | `IngressEngine.cs` | Resource Exhaustion |
 | 9 | Handshake nonce generated but never echoed or validated | MEDIUM | `TransmissionEngine.cs` | Replay |
 | 10 | Default signature ignores port — same-IP collision | MEDIUM | `DefaultSignatureProvider.cs` | Spoofing |
@@ -75,20 +75,8 @@ This entry has been removed from the active vulnerability list.
 
 ### V7 — Rate Limiting Counts Packets, Not Bytes
 
-**Severity:** HIGH  
-**Files:** `SynapseSocket/Security/SecurityProvider.cs` (lines ~98–108) or equivalent  
-**Category:** Resource exhaustion / bandwidth amplification
-
-**Description:**  
-`InspectEstablished` counts incoming packets per second against `_maximumPacketsPerSecond` but does not measure bytes per second. An attacker stays within the packet-rate cap while sending maximum-size payloads, potentially saturating the server's bandwidth or processing pipeline.
-
-**Exploit:**
-- `MaximumPacketsPerSecond = 2 000`, `MaximumTransmissionUnit = 1 200` bytes.
-- Attacker sends 2 000 packets × 1 200 bytes = 2.4 MB/s per connection, unlimited in aggregate.
-- With 100 connections from different IPs: 240 MB/s, all within the per-connection packet-rate limit.
-
-**Suggested fix:**  
-Add a parallel `bytesPerSecond` token-bucket alongside the packet-count bucket. Reject packets that would exceed a configured `MaximumBytesPerSecond` threshold.
+**Severity:** RESOLVED  
+**Resolution:** Added `MaximumBytesPerSecond` to `SynapseConfig` (default 0 = disabled) and a parallel `_byteCount` accumulator to `RateBucket`. Both limits are checked independently in a single window pass — exceeding either rejects the packet. Disabled by default to avoid breaking existing configs; set `MaximumBytesPerSecond` to enforce a byte cap alongside the packet cap.
 
 ---
 

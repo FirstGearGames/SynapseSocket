@@ -24,9 +24,13 @@ public sealed class SecurityProvider
     /// </summary>
     private readonly ConcurrentDictionary<ulong, RateBucket> _rateBuckets = [];
     /// <summary>
-    /// Maximum number of packets a single peer may send per second. Zero disables rate limiting.
+    /// Maximum number of packets a single peer may send per second. Zero disables packet rate limiting.
     /// </summary>
     private readonly uint _maximumPacketsPerSecond;
+    /// <summary>
+    /// Maximum number of bytes a single peer may send per second. Zero disables byte rate limiting.
+    /// </summary>
+    private readonly uint _maximumBytesPerSecond;
     /// <summary>
     /// Maximum permitted size of a single incoming packet in bytes. Packets exceeding this are rejected.
     /// </summary>
@@ -41,12 +45,14 @@ public sealed class SecurityProvider
     /// Creates a new security provider.
     /// </summary>
     /// <param name="signatureProvider">The signature provider used to identify remote peers.</param>
-    /// <param name="maximumPacketsPerSecond">Per-peer packet rate limit. Zero disables rate limiting.</param>
+    /// <param name="maximumPacketsPerSecond">Per-peer packet rate limit. Zero disables packet rate limiting.</param>
+    /// <param name="maximumBytesPerSecond">Per-peer byte rate limit. Zero disables byte rate limiting.</param>
     /// <param name="maximumPacketSize">Maximum permitted packet size in bytes.</param>
-    public SecurityProvider(ISignatureProvider signatureProvider, uint maximumPacketsPerSecond, uint maximumPacketSize)
+    public SecurityProvider(ISignatureProvider signatureProvider, uint maximumPacketsPerSecond, uint maximumBytesPerSecond, uint maximumPacketSize)
     {
         SignatureProvider = signatureProvider ?? throw new ArgumentNullException(nameof(signatureProvider));
         _maximumPacketsPerSecond = maximumPacketsPerSecond;
+        _maximumBytesPerSecond = maximumBytesPerSecond;
         _maximumPacketSize = maximumPacketSize;
     }
 
@@ -100,11 +106,11 @@ public sealed class SecurityProvider
         if (packetLength <= 0 || (uint)packetLength > _maximumPacketSize)
             return FilterResult.Oversized;
 
-        if (_maximumPacketsPerSecond == 0)
+        if (_maximumPacketsPerSecond == 0 && _maximumBytesPerSecond == 0)
             return FilterResult.Allowed;
 
         RateBucket rateBucket = _rateBuckets.GetOrAdd(cachedSignature, static _ => new());
-        return rateBucket.Allow(_maximumPacketsPerSecond) ? FilterResult.Allowed : FilterResult.RateLimited;
+        return rateBucket.Allow(packetLength, _maximumPacketsPerSecond, _maximumBytesPerSecond) ? FilterResult.Allowed : FilterResult.RateLimited;
     }
 
     /// <summary>
@@ -165,33 +171,43 @@ public sealed class SecurityProvider
         /// </summary>
         private uint _packetCount;
         /// <summary>
+        /// Number of bytes admitted in the current rate window.
+        /// </summary>
+        private uint _byteCount;
+        /// <summary>
         /// Synchronisation guard for the sliding-window state.
         /// </summary>
         private readonly object _lock = new();
 
         /// <summary>
-        /// Returns true if the endpoint may send another packet within the current window, incrementing the counter; returns false when the limit has been reached.
+        /// Returns true if the endpoint may send this packet within the current window, incrementing both counters; returns false when either limit has been reached.
         /// </summary>
-        /// <param name="maximumPacketsPerSecond">The maximum number of packets allowed per second.</param>
-        /// <returns>True if the packet is within the rate limit; false if the limit has been exceeded.</returns>
-        public bool Allow(uint maximumPacketsPerSecond)
+        /// <param name="packetLength">Size of the incoming packet in bytes.</param>
+        /// <param name="maximumPacketsPerSecond">Maximum packets per second; zero disables packet rate limiting.</param>
+        /// <param name="maximumBytesPerSecond">Maximum bytes per second; zero disables byte rate limiting.</param>
+        /// <returns>True if the packet is within both rate limits; false if either limit has been exceeded.</returns>
+        public bool Allow(int packetLength, uint maximumPacketsPerSecond, uint maximumBytesPerSecond)
         {
             lock (_lock)
             {
                 long nowTicks = DateTime.UtcNow.Ticks;
                 LastAccessTicks = nowTicks;
-                long windowTicks = TimeSpan.TicksPerSecond;
 
-                if (nowTicks - _windowStartTicks >= windowTicks)
+                if (nowTicks - _windowStartTicks >= TimeSpan.TicksPerSecond)
                 {
                     _windowStartTicks = nowTicks;
                     _packetCount = 0;
+                    _byteCount = 0;
                 }
 
-                if (_packetCount >= maximumPacketsPerSecond)
+                if (maximumPacketsPerSecond > 0 && _packetCount >= maximumPacketsPerSecond)
+                    return false;
+
+                if (maximumBytesPerSecond > 0 && _byteCount + (uint)packetLength > maximumBytesPerSecond)
                     return false;
 
                 _packetCount++;
+                _byteCount += (uint)packetLength;
                 return true;
             }
         }

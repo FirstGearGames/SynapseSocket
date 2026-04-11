@@ -30,9 +30,15 @@ public sealed class SynapseConfig
 
     /// <summary>
     /// Maximum packets per second allowed per signature.
-    /// Set to <see cref="UnsetMaximumPacketsPerSecond"/> (0) to disable rate limiting.
+    /// Set to <see cref="UnsetMaximumPacketsPerSecond"/> (0) to disable packet rate limiting.
     /// </summary>
     public uint MaximumPacketsPerSecond = 2000;
+
+    /// <summary>
+    /// Maximum bytes per second allowed per signature.
+    /// Set to <see cref="UnsetMaximumBytesPerSecond"/> (0) to disable byte rate limiting.
+    /// </summary>
+    public uint MaximumBytesPerSecond = 0;
 
     /// <summary>
     /// Maximum number of segments a segmented payload may be split into.
@@ -136,7 +142,12 @@ public sealed class SynapseConfig
     public const uint DisabledMaximumSegments = 0;
 
     /// <summary>
-    /// Sentinel value: pass as <see cref="MaximumPacketsPerSecond"/> to disable rate limiting.
+    /// Sentinel value: pass as <see cref="MaximumPacketsPerSecond"/> to disable packet rate limiting.
     /// </summary>
     public const uint UnsetMaximumPacketsPerSecond = 0;
+
+    /// <summary>
+    /// Sentinel value: pass as <see cref="MaximumBytesPerSecond"/> to disable byte rate limiting.
+    /// </summary>
+    public const uint UnsetMaximumBytesPerSecond = 0;
 }
