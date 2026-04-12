@@ -3,6 +3,8 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
+using CodeBoost.CodeAnalysis;
+using CodeBoost.Extensions;
 using CodeBoost.Performance;
 using SynapseSocket.Packets;
 
@@ -98,38 +100,57 @@ public sealed class SynapseConnection
         /// <summary>
         /// Sequence number of the pending packet.
         /// </summary>
-        public ushort Sequence;
-
+        [PoolResettableMember]
+        public ushort Sequence { get; private set; } // Unused?
         /// <summary>
         /// Rented packet buffer (header + payload) for unsegmented reliable sends. Null for segmented sends.
         /// Returned to <see cref="ArrayPool{T}.Shared"/> by <see cref="ReleasePendingReliable"/>.
         /// </summary>
-        public byte[]? Payload;
-
+        [PoolResettableMember]
+        public byte[]? Payload { get; private set; }
         /// <summary>
         /// Total wire length of the packet, or of each segment when segmented.
         /// </summary>
-        public int PacketLength;
-
+        [PoolResettableMember]
+        public int PacketLength { get; private set; }
         /// <summary>
         /// Per-segment buffers for segmented sends. Null for unsegmented packets.
         /// </summary>
-        public ArraySegment<byte>[]? Segments;
-
+        [PoolResettableMember]
+        public List<ArraySegment<byte>> Segments { get; private set; }
         /// <summary>
         /// Logical number of valid entries in <see cref="Segments"/>. May be less than the array length.
         /// </summary>
-        public int SegmentCount;
-
+        [PoolResettableMember]
+        public int SegmentCount { get; private set; }
         /// <summary>
         /// UTC ticks when this packet was last sent or retransmitted.
         /// </summary>
+        [PoolResettableMember]
         public long SentTicks;
-
         /// <summary>
         /// Number of retransmission attempts so far.
         /// </summary>
+        [PoolResettableMember]
         public int Retries;
+
+        [PoolResettableMethod]
+        public void Initialize(ushort sequence, List<ArraySegment<byte>> segments, int segmentCount, long sentTicks)
+        {
+            Sequence = sequence;
+            Segments = segments;
+            SegmentCount = segmentCount;
+            SentTicks = sentTicks;
+        }
+
+        [PoolResettableMethod]
+        public void Initialize(ushort sequence, byte[] payload, int packetLength, long sentTicks)
+        {
+            Sequence = sequence;
+            Payload = payload;
+            PacketLength = packetLength;
+            SentTicks = sentTicks;
+        }
 
         /// <inheritdoc/>
         public void OnRent() { }
@@ -138,12 +159,25 @@ public sealed class SynapseConnection
         public void OnReturn()
         {
             Sequence = 0;
-            Payload = null;
+            Retries = 0;
             PacketLength = 0;
-            Segments = null;
             SegmentCount = 0;
             SentTicks = 0;
-            Retries = 0;
+            
+            /* Only Segments or Payload will have value, never both. */
+            if (Segments is not null)
+            {
+                foreach (ArraySegment<byte> arraySegment in Segments)
+                    arraySegment.PoolArrayIntoShared();
+
+                ListPool<ArraySegment<byte>>.Return(Segments);
+                Segments = null;
+            }
+            else if (Payload is not null)
+            {
+                ArrayPool<byte>.Shared.Return(Payload);
+                Payload = null;
+            }
         }
     }
 
@@ -155,19 +189,6 @@ public sealed class SynapseConnection
     /// </summary>
     internal static void ReleasePendingReliable(PendingReliable pendingReliable)
     {
-        if (pendingReliable.Segments is not null)
-        {
-            // All segments share a single backing buffer; returning segments[0].Array is sufficient.
-            if (pendingReliable.SegmentCount > 0 && pendingReliable.Segments[0].Array is not null)
-                ArrayPool<byte>.Shared.Return(pendingReliable.Segments[0].Array!);
-
-            ArrayPool<ArraySegment<byte>>.Shared.Return(pendingReliable.Segments);
-        }
-        else if (pendingReliable.Payload is not null)
-        {
-            ArrayPool<byte>.Shared.Return(pendingReliable.Payload);
-        }
-
         ResettableObjectPool<PendingReliable>.Return(pendingReliable);
     }
 

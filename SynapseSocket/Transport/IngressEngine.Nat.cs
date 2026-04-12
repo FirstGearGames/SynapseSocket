@@ -157,8 +157,7 @@ public sealed partial class IngressEngine
                 break;
 
             case PacketType.NatSessionCreated:
-                string? sessionId = ParseNatSessionId(payload);
-                if (sessionId is not null)
+                if (TryParseNatSessionId(payload, out uint sessionId))
                     NatSessionCreated?.Invoke(sessionId);
                 break;
 
@@ -220,15 +219,19 @@ public sealed partial class IngressEngine
         RemoveExpiredEntries(_natProbeLastResponseTicks, nowTicks, staleTicks);
 
     /// <summary>
-    /// Parses a fixed-length ASCII session ID from a <see cref="PacketType.NatSessionCreated"/> payload.
-    /// Returns null if the payload is too short.
+    /// Parses the uint session ID from a <see cref="PacketType.NatSessionCreated"/> payload.
+    /// Returns false if the payload is too short.
     /// </summary>
-    private static string? ParseNatSessionId(ReadOnlySpan<byte> payload)
+    private static bool TryParseNatSessionId(ReadOnlySpan<byte> payload, out uint sessionId)
     {
-        if (payload.Length < ServerNatConfig.SessionIdLength)
-            return null;
+        if (payload.Length < NatWireFormat.SessionIdBytes)
+        {
+            sessionId = 0;
+            return false;
+        }
 
-        return System.Text.Encoding.ASCII.GetString(payload[..ServerNatConfig.SessionIdLength]);
+        sessionId = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(payload[..NatWireFormat.SessionIdBytes]);
+        return true;
     }
 
     /// <summary>

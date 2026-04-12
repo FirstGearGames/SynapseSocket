@@ -4,7 +4,6 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
-using SynapseSocket.Core.Configuration;
 using SynapseSocket.Packets;
 
 namespace SynapseSocket.NatServer;
@@ -24,27 +23,23 @@ namespace SynapseSocket.NatServer;
 /// </summary>
 public sealed class NatServer : IDisposable
 {
-    private static readonly int SessionIdBytes = ServerNatConfig.SessionIdLength;
+    private readonly UdpClient _socket;
+    private readonly NatSessionRegistry _registry;
+    private readonly Timer _evictionTimer;
 
     /// <summary>
     /// Immutable single-byte payload for <see cref="PacketType.NatHeartbeatAck"/>. Shared across all sends.
     /// </summary>
     private static readonly byte[] HeartbeatAckPacket = [(byte)PacketType.NatHeartbeatAck];
-
     /// <summary>
     /// Immutable single-byte payload for <see cref="PacketType.NatSessionFull"/>. Shared across all sends.
     /// </summary>
     private static readonly byte[] SessionFullPacket = [(byte)PacketType.NatSessionFull];
-
     /// <summary>
     /// Immutable single-byte payload for <see cref="PacketType.NatSessionUnavailable"/>. Shared across all sends.
     /// </summary>
     private static readonly byte[] SessionUnavailablePacket = [(byte)PacketType.NatSessionUnavailable];
-
-    private readonly UdpClient _socket;
-    private readonly NatSessionRegistry _registry;
-    private readonly Timer _evictionTimer;
-
+    
     /// <summary>
     /// Initialises the server bound to <paramref name="port"/> on all interfaces.
     /// </summary>
@@ -55,8 +50,7 @@ public sealed class NatServer : IDisposable
     {
         _socket = new(port);
         _registry = new(sessionTimeoutMilliseconds, maxConcurrentSessions);
-        _evictionTimer = new(_ => _registry.EvictExpired(), null,
-            TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+        _evictionTimer = new(_ => _registry.EvictExpired(), null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
     }
 
     /// <summary>
@@ -74,7 +68,10 @@ public sealed class NatServer : IDisposable
             {
                 result = await _socket.ReceiveAsync(cancellationToken).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) { break; }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
             catch (SocketException ex)
             {
                 Console.Error.WriteLine($"[NatServer] Socket error: {ex.Message}");
@@ -122,7 +119,7 @@ public sealed class NatServer : IDisposable
     /// </summary>
     private void HandleRequestSession(IPEndPoint from)
     {
-        if (!_registry.TryCreateSession(from, out string sessionId))
+        if (!_registry.TryCreateSession(from, out uint sessionId))
         {
             Console.WriteLine($"[NatServer] Session limit reached — rejecting request from {from}.");
             SendSessionUnavailable(from);
@@ -139,9 +136,7 @@ public sealed class NatServer : IDisposable
     /// </summary>
     private void HandleRegister(byte[] data, IPEndPoint from)
     {
-        string? sessionId = NatSessionRegistry.ParseSessionId(data, offset: 1, length: SessionIdBytes);
-
-        if (sessionId is null)
+        if (!NatSessionRegistry.TryParseSessionId(data, offset: 1, out uint sessionId))
             return;
 
         (bool matched, bool notFound, IPEndPoint? host, IPEndPoint? joiner) = _registry.Register(sessionId, from);
@@ -166,9 +161,7 @@ public sealed class NatServer : IDisposable
     /// </summary>
     private void HandleHeartbeat(byte[] data, IPEndPoint from)
     {
-        string? sessionId = NatSessionRegistry.ParseSessionId(data, offset: 1, length: SessionIdBytes);
-
-        if (sessionId is null)
+        if (!NatSessionRegistry.TryParseSessionId(data, offset: 1, out uint sessionId))
             return;
 
         _registry.Heartbeat(sessionId, from);
@@ -180,9 +173,7 @@ public sealed class NatServer : IDisposable
     /// </summary>
     private void HandleCloseSession(byte[] data, IPEndPoint from)
     {
-        string? sessionId = NatSessionRegistry.ParseSessionId(data, offset: 1, length: SessionIdBytes);
-
-        if (sessionId is null)
+        if (!NatSessionRegistry.TryParseSessionId(data, offset: 1, out uint sessionId))
             return;
 
         if (_registry.CloseSession(sessionId, from))
@@ -196,13 +187,15 @@ public sealed class NatServer : IDisposable
     /// <summary>
     /// Sends a <see cref="PacketType.NatSessionCreated"/> packet carrying the server-assigned session ID.
     /// </summary>
-    private void SendNatSessionCreated(IPEndPoint to, string sessionId)
+    private void SendNatSessionCreated(IPEndPoint to, uint sessionId)
     {
-        int size = 1 + SessionIdBytes;
-        byte[] packet = ArrayPool<byte>.Shared.Rent(size);
+        int fullSize = 1 + NatWireFormat.SessionIdBytes;
+        byte[] packet = ArrayPool<byte>.Shared.Rent(fullSize);
         packet[0] = (byte)PacketType.NatSessionCreated;
-        System.Text.Encoding.ASCII.GetBytes(sessionId, 0, SessionIdBytes, packet, 1);
-        _ = SendAndReturnAsync(packet, size, to);
+
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(packet.AsSpan(1, NatWireFormat.SessionIdBytes), sessionId);
+
+        _ = SendAndReturnAsync(packet, fullSize, to);
     }
 
     /// <summary>
@@ -212,9 +205,9 @@ public sealed class NatServer : IDisposable
     {
         // Maximum packet size: type (1) + address family (1) + IPv6 address (16) + port (2) = 20 bytes.
         byte[] packet = ArrayPool<byte>.Shared.Rent(20);
+
         int offset = 0;
         packet[offset++] = (byte)PacketType.NatPeerReady;
-
         int addressFamilyOffset = offset++;
 
         if (!peer.Address.TryWriteBytes(packet.AsSpan(offset), out int addressLength))

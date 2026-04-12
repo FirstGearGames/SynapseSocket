@@ -171,6 +171,7 @@ public sealed partial class SynapseManager
 
                 pendingReliable.Retries++;
                 pendingReliable.SentTicks = nowTicks;
+                
                 Telemetry.OnReliableResend();
 
                 if (pendingReliable.Segments is not null)

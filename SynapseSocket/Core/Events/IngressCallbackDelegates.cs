@@ -37,7 +37,7 @@ public delegate void NatSessionFullDelegate();
 /// <summary>
 /// Internal callback: a NAT rendezvous server assigned a new session ID in response to a session request.
 /// </summary>
-public delegate void NatSessionCreatedDelegate(string sessionId);
+public delegate void NatSessionCreatedDelegate(uint sessionId);
 
 /// <summary>
 /// Internal callback: a NAT rendezvous server rejected a session-creation request because its concurrent session limit has been reached.

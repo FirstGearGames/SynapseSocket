@@ -15,7 +15,7 @@ public sealed class ServerNatConfig
     /// Must be set before calling <see cref="SynapseSocket.Core.SynapseManager.HostViaNatServerAsync"/>
     /// or <see cref="SynapseSocket.Core.SynapseManager.JoinViaNatServerAsync"/>.
     /// </summary>
-    public IPEndPoint? ServerEndPoint;
+    public IPEndPoint? ServerEndPoint; //Unused?
 
     /// <summary>
     /// Milliseconds to wait for the peer to register before the attempt is abandoned.
@@ -26,9 +26,4 @@ public sealed class ServerNatConfig
     /// Milliseconds between heartbeat packets sent to the rendezvous server while waiting for a peer.
     /// </summary>
     public uint HeartbeatIntervalMilliseconds = 3000;
-
-    /// <summary>
-    /// Length of a session ID in characters.
-    /// </summary>
-    public const int SessionIdLength = 6;
 }

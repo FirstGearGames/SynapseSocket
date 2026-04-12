@@ -1,5 +1,6 @@
 using System;
 using System.Buffers;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
@@ -117,11 +118,8 @@ public sealed partial class TransmissionEngine
         int written = PacketHeader.BuildPacket(packetBuffer.AsSpan(), Type, sequence, 0, 0, 0, payload.AsSpan());
 
         SynapseConnection.PendingReliable pendingReliable = ResettableObjectPool<SynapseConnection.PendingReliable>.Rent();
-        pendingReliable.Sequence = sequence;
-        pendingReliable.Payload = packetBuffer;
-        pendingReliable.PacketLength = written;
-        pendingReliable.SentTicks = DateTime.UtcNow.Ticks;
-        pendingReliable.Retries = 0;
+        pendingReliable.Initialize(sequence, packetBuffer, written, DateTime.UtcNow.Ticks);
+
         synapseConnection.PendingReliableQueue[sequence] = pendingReliable;
 
         await SendRawAsync(new(packetBuffer, 0, written), synapseConnection.RemoteEndPoint, cancellationToken).ConfigureAwait(false);
@@ -151,22 +149,20 @@ public sealed partial class TransmissionEngine
                 sequence = synapseConnection.NextOutgoingSequence++;
         }
 
-        ArraySegment<byte>[] segments = splitter.Split(payload.AsSpan(), isReliable, out int segmentCount, sequence);
+        List<ArraySegment<byte>> segments = splitter.Split(payload.AsSpan(), isReliable, out int segmentCount, sequence, out byte[] backingBuffer);
 
         if (isReliable)
         {
             SynapseConnection.PendingReliable pendingReliable = ResettableObjectPool<SynapseConnection.PendingReliable>.Rent();
-            pendingReliable.Sequence = sequence;
-            pendingReliable.Segments = segments;
-            pendingReliable.SegmentCount = segmentCount;
-            pendingReliable.SentTicks = DateTime.UtcNow.Ticks;
-            pendingReliable.Retries = 0;
+            pendingReliable.Initialize(sequence, segments, segmentCount, DateTime.UtcNow.Ticks);
+
             synapseConnection.PendingReliableQueue[sequence] = pendingReliable;
 
             // Segments are now owned by PendingReliable; do NOT return them here.
             for (int i = 0; i < segmentCount; i++)
                 await SendRawAsync(segments[i], synapseConnection.RemoteEndPoint, cancellationToken).ConfigureAwait(false);
         }
+        // Unreliable does not need to retain buffers.
         else
         {
             try
@@ -176,11 +172,7 @@ public sealed partial class TransmissionEngine
             }
             finally
             {
-                // All segments share one backing buffer — only segments[0].Array needs returning.
-                if (segmentCount > 0 && segments[0].Array is not null)
-                    ArrayPool<byte>.Shared.Return(segments[0].Array!);
-
-                ArrayPool<ArraySegment<byte>>.Shared.Return(segments);
+                ArrayPool<byte>.Shared.Return(backingBuffer);
             }
         }
     }

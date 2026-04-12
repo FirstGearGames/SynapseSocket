@@ -37,18 +37,15 @@ public sealed partial class SynapseManager
     /// Null when not hosting.
     /// </summary>
     private Action<IPEndPoint>? _natHostPeerHandler;
-
     /// <summary>
     /// In join mode: resolved once when <see cref="OnNatPeerReady"/> fires.
     /// Null when not joining.
     /// </summary>
     private TaskCompletionSource<IPEndPoint>? _natJoinSource;
-
     /// <summary>
     /// Resolved by <see cref="OnNatSessionCreated"/> during <see cref="HostViaNatServerAsync"/>.
     /// </summary>
-    private TaskCompletionSource<string>? _natSessionSource;
-
+    private TaskCompletionSource<uint>? _natSessionSource;
     /// <summary>
     /// Guards <see cref="_natHostPeerHandler"/> and <see cref="_natJoinSource"/> assignment.
     /// </summary>
@@ -81,47 +78,54 @@ public sealed partial class SynapseManager
             throw new InvalidOperationException("NatTraversal.Server.ServerEndPoint must be set.");
 
         IPEndPoint serverEndPoint = Config.NatTraversal.Server.ServerEndPoint;
-        TaskCompletionSource<string> sessionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        CancellationTokenSource heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(
-            cancellationToken, _cancellationTokenSource?.Token ?? CancellationToken.None);
+        TaskCompletionSource<uint> sessionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationTokenSource heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _cancellationTokenSource?.Token ?? CancellationToken.None);
 
         lock (_natRendezvousLock)
         {
-            if (_natHostPeerHandler is not null || _natJoinSource is not null)
+            if (_natHostPeerHandler is not null || _natJoinSource is not null || _natSessionSource is not null)
                 throw new InvalidOperationException("A NAT rendezvous is already in progress.");
 
-            // Pre-assign so any NatPeerReady that races in before we return is handled correctly.
-            _natHostPeerHandler = peerEndPoint =>
-                _ = Task.Run(() => ConnectAfterRendezvousAsync(peerEndPoint, heartbeatCts.Token));
+            _natSessionSource = sessionSource;
         }
-
-        _natSessionSource = sessionSource;
 
         try
         {
-            await _sender.SendNatRequestSessionAsync(serverEndPoint, cancellationToken).ConfigureAwait(false);
+            await _sender.SendNatRequestSessionAsync(serverEndPoint, heartbeatCts.Token).ConfigureAwait(false);
 
-            Task<string> sessionTask = sessionSource.Task;
-            Task timeoutTask = Task.Delay((int)Config.NatTraversal.Server.RegistrationTimeoutMilliseconds, cancellationToken);
+            Task<uint> sessionTask = sessionSource.Task;
+            Task timeoutTask = Task.Delay((int)Config.NatTraversal.Server.RegistrationTimeoutMilliseconds, heartbeatCts.Token);
 
             if (await Task.WhenAny(sessionTask, timeoutTask).ConfigureAwait(false) != sessionTask)
             {
                 lock (_natRendezvousLock)
-                    _natHostPeerHandler = null;
+                    _natSessionSource = null;
 
                 heartbeatCts.Dispose();
                 throw new TimeoutException("NAT rendezvous timed out: server did not assign a session ID.");
             }
 
-            string sessionId = await sessionTask.ConfigureAwait(false);
+            uint sessionId = await sessionTask.ConfigureAwait(false);
+            CancellationToken heartbeatToken = heartbeatCts.Token;
+
+            // Assign the peer handler only after we own a valid session. NatPeerReady cannot arrive
+            // before the session ID is received (the server will not match joiners against a session
+            // that does not yet exist), so pre-assignment is unnecessary and would leave the lambda
+            // holding a heartbeatCts that could be disposed on an error path.
+            lock (_natRendezvousLock)
+                _natHostPeerHandler = peerEndPoint => _ = Task.Run(() => ConnectAfterRendezvousAsync(peerEndPoint, heartbeatToken));
+
             NatHostSession session = new(sessionId, this, heartbeatCts);
-            _ = Task.Run(() => NatServerHeartbeatAsync(sessionId, heartbeatCts.Token));
+            _ = Task.Run(() => NatServerHeartbeatAsync(sessionId, heartbeatToken));
             return session;
         }
         catch
         {
             lock (_natRendezvousLock)
+            {
+                _natSessionSource = null;
                 _natHostPeerHandler = null;
+            }
 
             heartbeatCts.Dispose();
             throw;
@@ -134,7 +138,7 @@ public sealed partial class SynapseManager
     /// Requires <see cref="NatTraversalConfig.Mode"/> == <see cref="NatTraversalMode.Server"/> and
     /// <see cref="ServerNatConfig.ServerEndPoint"/> set.
     /// </summary>
-    public async Task<SynapseConnection> JoinViaNatServerAsync(string sessionId, CancellationToken cancellationToken = default)
+    public async Task<SynapseConnection> JoinViaNatServerAsync(uint sessionId, CancellationToken cancellationToken = default)
     {
         if (!_isStarted || _sender is null)
             throw new InvalidOperationException("Engine not started.");
@@ -176,7 +180,7 @@ public sealed partial class SynapseManager
     // Internal API — called by NatHostSession
     // -------------------------------------------------------------------------
 
-    internal async Task CloseNatHostSessionAsync(string sessionId, CancellationToken cancellationToken)
+    internal async Task CloseNatHostSessionAsync(uint sessionId, CancellationToken cancellationToken)
     {
         lock (_natRendezvousLock)
             _natHostPeerHandler = null;
@@ -195,16 +199,17 @@ public sealed partial class SynapseManager
     /// </summary>
     internal void OnNatPeerReady(IPEndPoint peerEndPoint)
     {
-        _natHostPeerHandler?.Invoke(peerEndPoint);
-
+        Action<IPEndPoint>? hostHandler;
         TaskCompletionSource<IPEndPoint>? joinSource;
 
         lock (_natRendezvousLock)
         {
+            hostHandler = _natHostPeerHandler;
             joinSource = _natJoinSource;
             _natJoinSource = null;
         }
 
+        hostHandler?.Invoke(peerEndPoint);
         joinSource?.TrySetResult(peerEndPoint);
     }
 
@@ -221,17 +226,22 @@ public sealed partial class SynapseManager
             _natJoinSource = null;
         }
 
-        joinSource?.TrySetException(
-            new InvalidOperationException("NAT rendezvous failed: session is full or the session ID was not found."));
+        joinSource?.TrySetException(new InvalidOperationException("NAT rendezvous failed: session is full or the session ID was not found."));
     }
 
     /// <summary>
     /// Resolves the pending session-creation wait with the server-assigned session ID.
     /// </summary>
-    internal void OnNatSessionCreated(string sessionId)
+    internal void OnNatSessionCreated(uint sessionId)
     {
-        TaskCompletionSource<string>? source = _natSessionSource;
-        _natSessionSource = null;
+        TaskCompletionSource<uint>? source;
+
+        lock (_natRendezvousLock)
+        {
+            source = _natSessionSource;
+            _natSessionSource = null;
+        }
+
         source?.TrySetResult(sessionId);
     }
 
@@ -240,8 +250,14 @@ public sealed partial class SynapseManager
     /// </summary>
     internal void OnNatSessionUnavailable()
     {
-        TaskCompletionSource<string>? source = _natSessionSource;
-        _natSessionSource = null;
+        TaskCompletionSource<uint>? source;
+
+        lock (_natRendezvousLock)
+        {
+            source = _natSessionSource;
+            _natSessionSource = null;
+        }
+
         source?.TrySetException(new InvalidOperationException("NAT server has no available session slots."));
     }
 
@@ -252,7 +268,7 @@ public sealed partial class SynapseManager
     /// <summary>
     /// Sends periodic heartbeats to the rendezvous server to keep the host session alive until closed.
     /// </summary>
-    private async Task NatServerHeartbeatAsync(string sessionId, CancellationToken cancellationToken)
+    private async Task NatServerHeartbeatAsync(uint sessionId, CancellationToken cancellationToken)
     {
         IPEndPoint serverEndPoint = Config.NatTraversal.Server.ServerEndPoint!;
 
@@ -267,13 +283,16 @@ public sealed partial class SynapseManager
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
         catch (SocketException) { }
-        catch (Exception unexpectedException) { UnhandledException?.Invoke(unexpectedException); }
+        catch (Exception unexpectedException)
+        {
+            UnhandledException?.Invoke(unexpectedException);
+        }
     }
 
     /// <summary>
     /// Registers with the rendezvous server as the joining peer and sends periodic heartbeats until the host is matched.
     /// </summary>
-    private async Task NatServerJoinAsync(string sessionId, CancellationToken cancellationToken)
+    private async Task NatServerJoinAsync(uint sessionId, CancellationToken cancellationToken)
     {
         IPEndPoint serverEndPoint = Config.NatTraversal.Server.ServerEndPoint!;
 
@@ -292,7 +311,10 @@ public sealed partial class SynapseManager
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
         catch (SocketException) { }
-        catch (Exception unexpectedException) { UnhandledException?.Invoke(unexpectedException); }
+        catch (Exception unexpectedException)
+        {
+            UnhandledException?.Invoke(unexpectedException);
+        }
     }
 
     /// <summary>
@@ -346,6 +368,9 @@ public sealed partial class SynapseManager
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
         catch (SocketException) { }
-        catch (Exception unexpectedException) { UnhandledException?.Invoke(unexpectedException); }
+        catch (Exception unexpectedException)
+        {
+            UnhandledException?.Invoke(unexpectedException);
+        }
     }
 }

@@ -4,7 +4,6 @@ using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 using SynapseSocket.Packets;
-using SynapseSocket.Core.Configuration;
 
 namespace SynapseSocket.Transport;
 
@@ -18,7 +17,7 @@ public sealed partial class TransmissionEngine
     /// <summary>
     /// Sends a NAT registration packet to the rendezvous server for the given session.
     /// </summary>
-    public Task SendNatRegisterAsync(IPEndPoint target, string sessionId, CancellationToken cancellationToken)
+    public Task SendNatRegisterAsync(IPEndPoint target, uint sessionId, CancellationToken cancellationToken)
     {
         return SendNatServerPacketAsync(target, PacketType.NatRegister, sessionId, cancellationToken);
     }
@@ -26,22 +25,23 @@ public sealed partial class TransmissionEngine
     /// <summary>
     /// Sends a NAT heartbeat packet to the rendezvous server to keep the session alive.
     /// </summary>
-    public Task SendNatHeartbeatAsync(IPEndPoint target, string sessionId, CancellationToken cancellationToken)
+    public Task SendNatHeartbeatAsync(IPEndPoint target, uint sessionId, CancellationToken cancellationToken)
     {
         return SendNatServerPacketAsync(target, PacketType.NatHeartbeat, sessionId, cancellationToken);
     }
 
     /// <summary>
-    /// Builds and sends a NAT server packet with the session identifier encoded as a fixed-length ASCII payload.
+    /// Builds and sends a NAT server packet with the session identifier encoded as a 4-byte big-endian uint payload.
     /// </summary>
-    private Task SendNatServerPacketAsync(IPEndPoint target, PacketType packetType, string sessionId, CancellationToken cancellationToken)
+    private Task SendNatServerPacketAsync(IPEndPoint target, PacketType packetType, uint sessionId, CancellationToken cancellationToken)
     {
-        const int SessionIdBytes = ServerNatConfig.SessionIdLength;
         int headerSize = PacketHeader.ComputeHeaderSize(packetType);
-        int totalSize = headerSize + SessionIdBytes;
+        int totalSize = headerSize + NatWireFormat.SessionIdBytes;
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(totalSize);
+
         int offset = PacketHeader.Write(rentedBuffer.AsSpan(), packetType, 0, 0, 0, 0);
-        System.Text.Encoding.ASCII.GetBytes(sessionId, 0, SessionIdBytes, rentedBuffer, offset);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(rentedBuffer.AsSpan(offset), sessionId);
+
         return SendAndPoolBufferAsync(new(rentedBuffer, 0, totalSize), target, cancellationToken);
     }
 
@@ -61,7 +61,7 @@ public sealed partial class TransmissionEngine
     /// <summary>
     /// Sends a session-close packet to the NAT rendezvous server, stopping further joiners from being accepted.
     /// </summary>
-    public Task SendNatCloseSessionAsync(IPEndPoint target, string sessionId, CancellationToken cancellationToken)
+    public Task SendNatCloseSessionAsync(IPEndPoint target, uint sessionId, CancellationToken cancellationToken)
     {
         return SendNatServerPacketAsync(target, PacketType.NatCloseSession, sessionId, cancellationToken);
     }
@@ -72,8 +72,10 @@ public sealed partial class TransmissionEngine
     public Task SendNatProbeAsync(IPEndPoint target, CancellationToken cancellationToken)
     {
         const PacketType Type = PacketType.NatProbe;
+        
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
+        
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
         return SendAndPoolBufferAsync(new(rentedBuffer, 0, headerSize), target, cancellationToken);
     }
@@ -85,11 +87,14 @@ public sealed partial class TransmissionEngine
     public Task SendNatChallengeAsync(IPEndPoint target, ReadOnlySpan<byte> token, CancellationToken cancellationToken)
     {
         const PacketType Type = PacketType.NatChallenge;
+        
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
         int totalSize = headerSize + token.Length;
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(totalSize);
+        
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
         token.CopyTo(rentedBuffer.AsSpan(headerSize));
+        
         return SendAndPoolBufferAsync(new(rentedBuffer, 0, totalSize), target, cancellationToken);
     }
 }

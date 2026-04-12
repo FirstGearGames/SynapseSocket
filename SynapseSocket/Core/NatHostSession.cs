@@ -23,9 +23,9 @@ public sealed class NatHostSession : IAsyncDisposable
     /// The session ID assigned by the rendezvous server.
     /// Share this out-of-band with peers so they can call <see cref="SynapseManager.JoinViaNatServerAsync"/>.
     /// </summary>
-    public string SessionId { get; }
+    public uint SessionId { get; }
 
-    internal NatHostSession(string sessionId, SynapseManager manager, CancellationTokenSource heartbeatCts)
+    internal NatHostSession(uint sessionId, SynapseManager manager, CancellationTokenSource heartbeatCts)
     {
         SessionId = sessionId;
         _manager = manager;
@@ -47,5 +47,9 @@ public sealed class NatHostSession : IAsyncDisposable
     }
 
     /// <inheritdoc/>
-    public ValueTask DisposeAsync() => new(CloseAsync());
+    public async ValueTask DisposeAsync()
+    {
+        await CloseAsync().ConfigureAwait(false);
+        _heartbeatCts.Dispose();
+    }
 }
