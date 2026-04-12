@@ -93,7 +93,7 @@ public sealed class SynapseConfig
     /// Copy payload data within the handler if it is needed beyond the callback.
     /// Note: reliable and segmented receives always copy internally regardless of this setting.
     /// </summary>
-    public bool CopyReceivedPayloads = true;
+    public bool CopyReceivedPayloads = false;
 
     /// <summary>
     /// Enables telemetry counters.

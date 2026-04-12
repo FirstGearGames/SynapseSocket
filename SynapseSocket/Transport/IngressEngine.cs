@@ -180,6 +180,7 @@ public sealed partial class IngressEngine
 
                 IPEndPoint fromEndPoint = (IPEndPoint)socketReceiveResult.RemoteEndPoint;
                 int receivedLength = socketReceiveResult.ReceivedBytes;
+                long nowTicks = DateTime.UtcNow.Ticks;
 
                 // Lowest-level mitigation first, before any copy.
                 // Established connections skip signature recomputation and blacklist lookup — those only apply at handshake time. Size and rate-limit checks still run for all senders.
@@ -218,7 +219,7 @@ public sealed partial class IngressEngine
 
                 _telemetry.OnReceived(receivedLength);
 
-                ProcessPacket(rentedBuffer, receivedLength, fromEndPoint, cancellationToken, ref isPayloadCopied);
+                ProcessPacket(rentedBuffer, receivedLength, fromEndPoint, nowTicks, cancellationToken, ref isPayloadCopied);
             }
             catch (OperationCanceledException)
             {
@@ -250,7 +251,7 @@ public sealed partial class IngressEngine
     /// <param name="isPayloadCopied">
     /// Set to false when ownership of <paramref name="buffer"/> is transferred to a <see cref="PayloadDelivered"/> subscriber so the receive loop does not return it to the pool.
     /// </param>
-    private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, CancellationToken cancellationToken, ref bool isPayloadCopied)
+    private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, long nowTicks, CancellationToken cancellationToken, ref bool isPayloadCopied)
     {
         PacketType type;
         ushort sequence;
@@ -301,7 +302,7 @@ public sealed partial class IngressEngine
             return;
         }
 
-        synapseConnection.LastReceivedTicks = DateTime.UtcNow.Ticks;
+        synapseConnection.LastReceivedTicks = nowTicks;
 
         switch (type)
         {

@@ -25,7 +25,7 @@ public sealed class ReliableConfig
     /// Reduces ACK traffic under burst receive conditions at the cost of a small delivery delay.
     /// Flush interval is controlled by <see cref="AckBatchIntervalMilliseconds"/>.
     /// </summary>
-    public bool AckBatchingEnabled = false;
+    public bool AckBatchingEnabled = true;
 
     /// <summary>
     /// Milliseconds between ACK batch flushes when <see cref="AckBatchingEnabled"/> is true.

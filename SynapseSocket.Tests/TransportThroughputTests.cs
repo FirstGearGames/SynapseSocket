@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Diagnostics;
 using System.Net;
 using System.Threading;
@@ -17,7 +18,7 @@ public sealed class TransportThroughputTests
     private const int MinimumSendByteCount = 10;
     private const int MaximumSendByteCount = 500;
     private const int SendByteCountStep = 10;
-    private const int SendLoopCount = 2;
+    private const int SendLoopCount = 30;
     private const int StepCount = (MaximumSendByteCount - MinimumSendByteCount) / SendByteCountStep + 1; // 50
 
     private static readonly byte[] SendBuffer;
@@ -36,15 +37,29 @@ public sealed class TransportThroughputTests
     }
 
     [Fact(Timeout = ThroughputTestTimeout)]
-    public async Task MeasureSendReceiveThroughput()
+    public async Task MeasureSendReceiveThroughput_Reliable()
+    {
+        await RunThroughputTestAsync(isReliable: true);
+    }
+
+    [Fact(Timeout = ThroughputTestTimeout)]
+    public async Task MeasureSendReceiveThroughput_Unreliable()
+    {
+        await RunThroughputTestAsync(isReliable: false);
+    }
+
+    private async Task RunThroughputTestAsync(bool isReliable)
     {
         int port = TestHarness.GetFreePort();
+        // MaximumPending must exceed the total burst per client (SendLoopCount * StepCount) so fire-and-forget sends do not silently fail.
+        const uint MaximumPendingForBurst = SendLoopCount * StepCount * 2;
+
         SynapseManager server = new(TestHarness.ServerConfig(port));
         SynapseManager[] clients = new SynapseManager[ClientCount];
         SynapseConnection[] clientToServerConnections = new SynapseConnection[ClientCount];
 
         for (int i = 0; i < ClientCount; i++)
-            clients[i] = new(TestHarness.ClientConfig());
+            clients[i] = new(TestHarness.ClientConfig(c => c.Reliable.MaximumPending = MaximumPendingForBurst));
 
         try
         {
@@ -55,6 +70,20 @@ public sealed class TransportThroughputTests
 
             for (int i = 0; i < ClientCount; i++)
             {
+                clients[i].PacketReceived += packetReceivedEventArgs =>
+                {
+                    int size = packetReceivedEventArgs.Payload.Count;
+                    byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(size);
+                    try
+                    {
+                        packetReceivedEventArgs.Payload.AsSpan().CopyTo(rentedBuffer);
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(rentedBuffer);
+                    }
+                };
+
                 await clients[i].StartAsync();
                 clientToServerConnections[i] = await clients[i].ConnectAsync(new(IPAddress.Loopback, port));
             }
@@ -68,8 +97,18 @@ public sealed class TransportThroughputTests
 
             server.PacketReceived += packetReceivedEventArgs =>
             {
-                Interlocked.Add(ref receivedByteCount, (ulong)packetReceivedEventArgs.Payload.Count);
-                Interlocked.Increment(ref receivedMessageCount);
+                int size = packetReceivedEventArgs.Payload.Count;
+                byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(size);
+                try
+                {
+                    packetReceivedEventArgs.Payload.AsSpan().CopyTo(rentedBuffer);
+                    Interlocked.Add(ref receivedByteCount, (ulong)size);
+                    Interlocked.Increment(ref receivedMessageCount);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(rentedBuffer);
+                }
             };
 
             Stopwatch stopwatch = Stopwatch.StartNew();
@@ -81,7 +120,7 @@ public sealed class TransportThroughputTests
                     ArraySegment<byte> segment = new(SendBuffer, 0, byteCount);
 
                     for (int i = 0; i < ClientCount; i++)
-                        _ = clients[i].SendAsync(clientToServerConnections[i], segment, isReliable: true);
+                        _ = clients[i].SendAsync(clientToServerConnections[i], segment, isReliable);
                 }
             }
 
@@ -91,8 +130,8 @@ public sealed class TransportThroughputTests
             // Sum of byte counts per loop per client: (10+500)*50/2 = 12750; total across loops and clients: 2*12750*10 = 255000
             ulong expectedByteCount = SendLoopCount * (ulong)((MinimumSendByteCount + MaximumSendByteCount) * StepCount / 2) * ClientCount;
 
-            Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref receivedMessageCount) >= expectedMessageCount, 30000),
-                $"Not all messages were received. Got {receivedMessageCount} of {expectedMessageCount}.");
+            while (Volatile.Read(ref receivedMessageCount) < expectedMessageCount)
+                await Task.Delay(1).ConfigureAwait(false);
 
             stopwatch.Stop();
 
@@ -101,6 +140,7 @@ public sealed class TransportThroughputTests
             double megabytesPerSecond = receivedByteCount / elapsedSeconds / (1024.0 * 1024.0);
             double messagesPerSecond = receivedMessageCount / elapsedSeconds;
 
+            _output.WriteLine($"Delivery method   : {(isReliable ? "Reliable" : "Unreliable")}");
             _output.WriteLine($"Messages received : {receivedMessageCount:N0} / {expectedMessageCount:N0}");
             _output.WriteLine($"Bytes received    : {receivedByteCount:N0} / {expectedByteCount:N0}");
             _output.WriteLine($"Elapsed           : {elapsedMilliseconds:F2} ms");
