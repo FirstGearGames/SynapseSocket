@@ -113,10 +113,10 @@ public sealed partial class SynapseManager
             // that does not yet exist), so pre-assignment is unnecessary and would leave the lambda
             // holding a heartbeatCts that could be disposed on an error path.
             lock (_natRendezvousLock)
-                _natHostPeerHandler = peerEndPoint => _ = Task.Run(() => ConnectAfterRendezvousAsync(peerEndPoint, heartbeatToken));
+                _natHostPeerHandler = peerEndPoint => _ = Task.Run(() => ConnectAfterRendezvousAsync(peerEndPoint, heartbeatToken), heartbeatToken);
 
             NatHostSession session = new(sessionId, this, heartbeatCts);
-            _ = Task.Run(() => NatServerHeartbeatAsync(sessionId, heartbeatToken));
+            _ = Task.Run(() => NatServerHeartbeatAsync(sessionId, heartbeatToken), heartbeatToken);
             return session;
         }
         catch
