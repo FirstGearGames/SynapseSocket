@@ -1,6 +1,5 @@
 ﻿using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Net;
 
 namespace SynapseSocket.Security;
@@ -19,10 +18,6 @@ public sealed class SecurityProvider
     /// Set of blacklisted peer signatures. Values are unused placeholders.
     /// </summary>
     private readonly ConcurrentDictionary<ulong, byte> _blacklist = [];
-    /// <summary>
-    /// Per-signature sliding-window rate buckets, keyed by peer signature.
-    /// </summary>
-    private readonly ConcurrentDictionary<ulong, RateBucket> _rateBuckets = [];
     /// <summary>
     /// Maximum number of packets a single peer may send per second. Zero disables packet rate limiting.
     /// </summary>
@@ -101,15 +96,22 @@ public sealed class SecurityProvider
     /// <param name="packetLength">Length of the received packet in bytes.</param>
     /// <param name="cachedSignature">The pre-computed signature stored on the connection.</param>
     /// <returns>A <see cref="FilterResult"/> indicating whether the packet should be processed or dropped.</returns>
-    public FilterResult InspectEstablished(int packetLength, ulong cachedSignature)
+    /// <summary>
+    /// Creates a rate bucket for a new connection, or returns null if both rate limits are disabled.
+    /// Assign the result to <see cref="SynapseSocket.Connections.SynapseConnection.RateBucket"/> when a connection is established.
+    /// </summary>
+    /// <returns>A new <see cref="RateBucket"/>, or null if rate limiting is disabled.</returns>
+    internal RateBucket? CreateRateBucket() =>
+        _maximumPacketsPerSecond == 0 && _maximumBytesPerSecond == 0 ? null : new RateBucket();
+
+    internal FilterResult InspectEstablished(int packetLength, RateBucket? rateBucket)
     {
         if (packetLength <= 0 || (uint)packetLength > _maximumPacketSize)
             return FilterResult.Oversized;
 
-        if (_maximumPacketsPerSecond == 0 && _maximumBytesPerSecond == 0)
+        if (rateBucket is null)
             return FilterResult.Allowed;
 
-        RateBucket rateBucket = _rateBuckets.GetOrAdd(cachedSignature, static _ => new());
         return rateBucket.Allow(packetLength, _maximumPacketsPerSecond, _maximumBytesPerSecond) ? FilterResult.Allowed : FilterResult.RateLimited;
     }
 
@@ -134,29 +136,15 @@ public sealed class SecurityProvider
         if (_blacklist.ContainsKey(signature))
             return FilterResult.Blacklisted;
 
-        return InspectEstablished(packetLength, signature);
+        return InspectEstablished(packetLength, null);
     }
 
     /// <summary>
-    /// Removes rate buckets that have not seen traffic in longer than <paramref name="expiryTicks"/>.
-    /// Call from the maintenance loop to bound <c>_rateBuckets</c> growth.
-    /// </summary>
-    /// <param name="nowTicks">The current UTC tick count.</param>
-    /// <param name="expiryTicks">The number of ticks of inactivity after which a bucket is removed.</param>
-    public void RemoveExpiredRateBuckets(long nowTicks, long expiryTicks)
-    {
-        foreach (KeyValuePair<ulong, RateBucket> entry in _rateBuckets)
-        {
-            if (nowTicks - entry.Value.LastAccessTicks > expiryTicks)
-                _rateBuckets.TryRemove(entry.Key, out _);
-        }
-    }
-
-    /// <summary>
-    /// Sliding-window rate limiter for a single endpoint signature.
+    /// Sliding-window rate limiter for a single connection.
     /// Resets the packet counter once the current one-second window elapses.
+    /// Owned by the <see cref="SynapseSocket.Connections.SynapseConnection"/> it was created for; lifetime is tied to the connection.
     /// </summary>
-    private sealed class RateBucket
+    internal sealed class RateBucket
     {
         /// <summary>
         /// Tick timestamp of the most recent access, used for stale-entry eviction.

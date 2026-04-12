@@ -8,6 +8,7 @@
     <RootNamespace>SynapseSocket.Tests</RootNamespace>
     <AssemblyName>SynapseSocket.Tests</AssemblyName>
     <TargetFramework>net8.0</TargetFramework>
+    <DefineConstants>$(DefineConstants);XPERFTEST</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>

@@ -7,6 +7,7 @@ using CodeBoost.CodeAnalysis;
 using CodeBoost.Extensions;
 using CodeBoost.Performance;
 using SynapseSocket.Packets;
+using SynapseSocket.Security;
 
 namespace SynapseSocket.Connections;
 
@@ -61,6 +62,11 @@ public sealed class SynapseConnection
     /// Gate for reorder buffer and sequence manipulation.
     /// </summary>
     internal readonly object ReliableLock = new();
+    /// <summary>
+    /// Rate bucket for this connection. Assigned on establishment when rate limiting is enabled; null otherwise.
+    /// Lifetime is tied to the connection — no separate eviction needed.
+    /// </summary>
+    internal SecurityProvider.RateBucket? RateBucket;
     /// <summary>
     /// Send-side splitter, rented from <see cref="CodeBoost.Performance.ResettableObjectPool{T}"/>
     /// on the first segmented send and returned to the pool on disconnect.

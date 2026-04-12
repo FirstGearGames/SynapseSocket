@@ -10,19 +10,17 @@ namespace SynapseSocket.Core.Events;
 /// Obtain instances via <see cref="ResettableObjectPool{T}"/>; do not retain after the handler returns.
 /// The <see cref="Payload"/> is backed by a pooled buffer and is only valid for the duration of the handler — copy the data if you need to retain it beyond the callback.
 /// </summary>
-public sealed class PacketReceivedEventArgs : EventArgs, IPoolResettable
+public struct PacketReceivedEventArgs// : EventArgs, IPoolResettable
 {
     /// <summary>
     /// The connection that sent the payload.
     /// </summary>
-    [PoolResettableMember]
     public SynapseConnection Connection { get; private set; }
 
     /// <summary>
     /// The received payload. Backed by a pooled buffer — valid only for the duration of the handler.
     /// Copy if you need to retain the data beyond the callback.
     /// </summary>
-    [PoolResettableMember]
     public ArraySegment<byte> Payload { get; private set; }
 
     /// <summary>
@@ -33,27 +31,11 @@ public sealed class PacketReceivedEventArgs : EventArgs, IPoolResettable
     /// <summary>
     /// Initialises a new instance of <see cref="PacketReceivedEventArgs"/>.
     /// </summary>
-    public PacketReceivedEventArgs() { }
-
-    /// <summary>
-    /// Initialises the instance for reuse via the object pool.
-    /// </summary>
-    public void Initialize(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable)
+    public PacketReceivedEventArgs(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable)
     {
         Connection = synapseConnection;
         Payload = payload;
         IsReliable = isReliable;
-    }
+    }        
 
-    /// <inheritdoc/>
-    public void OnReturn()
-    {
-        Connection = null;
-        Payload = default;
-    }
-
-    /// <inheritdoc/>
-    public void OnRent()
-    {
-    }
 }

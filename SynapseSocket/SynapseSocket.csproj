@@ -11,9 +11,16 @@
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
         <!-- Suppress warnings that originate in CodeBoost source files. -->
         <NoWarn>$(NoWarn);CS8618;CS8625;CS0067</NoWarn>
+        <DefineConstants>$(DefineConstants);XPERFTEST</DefineConstants>
         <Description>Synapse - High-Performance Multi-Stack UDP Transport Engine</Description>
         <Version>1.0.0</Version>
     </PropertyGroup>
+
+    <ItemGroup Condition="'$(Configuration)' == 'Debug'">
+        <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+            <_Parameter1>SynapseSocket.Tests</_Parameter1>
+        </AssemblyAttribute>
+    </ItemGroup>
 
     <ItemGroup>
         <ProjectReference Include="..\submodules\CodeBoost\CodeBoost.CodeAnalysis.Analyzers\CodeBoost.CodeAnalysis.Analyzers.csproj"

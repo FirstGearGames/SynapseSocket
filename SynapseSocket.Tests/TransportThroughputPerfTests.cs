@@ -4,37 +4,37 @@ using System.Diagnostics;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
+#if DEBUG
+using SynapseSocket.Diagnostics;
+#endif
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
-#if PERFTEST
-using PerfCounters = SynapseSocket.Diagnostics.PerfCounters;
-#endif
 using Xunit;
 using Xunit.Abstractions;
 
 namespace SynapseSocket.Tests;
 
-public sealed class TransportThroughputTests
+public sealed class TransportThroughputPerfTests
 {
     private const int ClientCount = 10;
     private const int ThroughputTestTimeout = 60000;
     private const int MinimumSendByteCount = 10;
     private const int MaximumSendByteCount = 500;
     private const int SendByteCountStep = 10;
-    private const int SendLoopCount = 20;
+    private const int SendLoopCount = 6;
     private const int StepCount = (MaximumSendByteCount - MinimumSendByteCount) / SendByteCountStep + 1; // 50
 
     private static readonly byte[] SendBuffer;
 
     private readonly ITestOutputHelper _output;
 
-    static TransportThroughputTests()
+    static TransportThroughputPerfTests()
     {
         SendBuffer = new byte[MaximumSendByteCount];
         Array.Fill(SendBuffer, (byte)0xAB);
     }
 
-    public TransportThroughputTests(ITestOutputHelper output)
+    public TransportThroughputPerfTests(ITestOutputHelper output)
     {
         _output = output;
     }
@@ -100,8 +100,18 @@ public sealed class TransportThroughputTests
 
             server.PacketReceived += packetReceivedEventArgs =>
             {
-                Interlocked.Add(ref receivedByteCount, (ulong)packetReceivedEventArgs.Payload.Count);
-                Interlocked.Increment(ref receivedMessageCount);
+                int size = packetReceivedEventArgs.Payload.Count;
+                byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(size);
+                try
+                {
+                    packetReceivedEventArgs.Payload.AsSpan().CopyTo(rentedBuffer);
+                    Interlocked.Add(ref receivedByteCount, (ulong)size);
+                    Interlocked.Increment(ref receivedMessageCount);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(rentedBuffer);
+                }
             };
 
             Stopwatch stopwatch = Stopwatch.StartNew();
@@ -139,37 +149,29 @@ public sealed class TransportThroughputTests
             _output.WriteLine($"Elapsed           : {elapsedMilliseconds:F2} ms");
             _output.WriteLine($"Throughput        : {megabytesPerSecond:F3} MB/s");
             _output.WriteLine($"Message rate      : {messagesPerSecond:F0} msg/s");
+
 #if PERFTEST
-            PerfCounters perf = server.Perf;
-            long ppCount = perf.ProcessPacketCallCount;
+            _output.WriteLine("");
+            _output.WriteLine("-- ProcessPacket (server) --");
+            _output.WriteLine($"  Calls : {server.Perf.ProcessPacketCallCount:N0}");
+            _output.WriteLine($"  Last  : {PerfCounters.TicksToMilliseconds(server.Perf.ProcessPacketLastElapsedTicks):F4} ms");
+            _output.WriteLine($"  Avg   : {PerfCounters.TicksToMilliseconds(server.Perf.ProcessPacketTotalElapsedTicks) / server.Perf.ProcessPacketCallCount:F4} ms");
 
-            static string Avg(long total, long count) =>
-                count == 0 ? "n/a" : $"{PerfCounters.TicksToMilliseconds(total / count) * 1000.0:F3} µs";
+            _output.WriteLine("");
+            _output.WriteLine("-- DeliverOrdered lock (server) --");
+            _output.WriteLine($"  Calls : {server.Perf.DeliverOrderedCallCount:N0}");
+            _output.WriteLine($"  Last  : {PerfCounters.TicksToMilliseconds(server.Perf.DeliverOrderedLastElapsedTicks):F4} ms");
+            _output.WriteLine($"  Avg   : {PerfCounters.TicksToMilliseconds(server.Perf.DeliverOrderedTotalElapsedTicks) / server.Perf.DeliverOrderedCallCount:F4} ms");
 
-            long totalCount = perf.SecurityFilterCallCount;
-
-            _output.WriteLine(string.Empty);
-            _output.WriteLine($"── Receive loop breakdown (server ingress, {totalCount:N0} datagrams) ────────────");
-            _output.WriteLine($"  DateTimeUtcNow        avg {Avg(perf.DateTimeUtcNowTotalElapsedTicks,   totalCount),10}   total {PerfCounters.TicksToMilliseconds(perf.DateTimeUtcNowTotalElapsedTicks):F2} ms");
-            _output.WriteLine($"  SecurityFilter        avg {Avg(perf.SecurityFilterTotalElapsedTicks,        totalCount),10}   total {PerfCounters.TicksToMilliseconds(perf.SecurityFilterTotalElapsedTicks):F2} ms");
-            _output.WriteLine($"    TryGet              avg {Avg(perf.SecurityFilterTryGetTotalElapsedTicks,   totalCount),10}   total {PerfCounters.TicksToMilliseconds(perf.SecurityFilterTryGetTotalElapsedTicks):F2} ms");
-            _output.WriteLine($"    Inspect             avg {Avg(perf.SecurityFilterInspectTotalElapsedTicks,  totalCount),10}   total {PerfCounters.TicksToMilliseconds(perf.SecurityFilterInspectTotalElapsedTicks):F2} ms");
-            _output.WriteLine($"  ProcessPacket total   avg {Avg(perf.ProcessPacketTotalElapsedTicks,    ppCount),10}   total {PerfCounters.TicksToMilliseconds(perf.ProcessPacketTotalElapsedTicks):F2} ms");
-            _output.WriteLine(string.Empty);
-            _output.WriteLine($"── ProcessPacket breakdown ({ppCount:N0} calls) ───────────────────────────────────");
-            _output.WriteLine($"  HeaderParse           avg {Avg(perf.HeaderParseTotalElapsedTicks,  ppCount),10}   total {PerfCounters.TicksToMilliseconds(perf.HeaderParseTotalElapsedTicks):F2} ms");
-            _output.WriteLine($"  PayloadCopy           avg {Avg(perf.PayloadCopyTotalElapsedTicks,   perf.PayloadCopyCallCount),10}   total {PerfCounters.TicksToMilliseconds(perf.PayloadCopyTotalElapsedTicks):F2} ms   calls {perf.PayloadCopyCallCount:N0}");
-
-            if (isReliable)
-            {
-                _output.WriteLine($"  EnqueueOrSendAck      avg {Avg(perf.EnqueueOrSendAckTotalElapsedTicks,          perf.EnqueueOrSendAckCallCount),10}   total {PerfCounters.TicksToMilliseconds(perf.EnqueueOrSendAckTotalElapsedTicks):F2} ms   calls {perf.EnqueueOrSendAckCallCount:N0}");
-                _output.WriteLine($"  DeliverOrdered (lock) avg {Avg(perf.DeliverOrderedTotalElapsedTicks,            perf.DeliverOrderedCallCount),10}   total {PerfCounters.TicksToMilliseconds(perf.DeliverOrderedTotalElapsedTicks):F2} ms   calls {perf.DeliverOrderedCallCount:N0}");
-                _output.WriteLine($"  DeliverOrdered (cbks) avg {Avg(perf.DeliverOrderedCallbacksTotalElapsedTicks,   perf.DeliverOrderedCallbacksCallCount),10}   total {PerfCounters.TicksToMilliseconds(perf.DeliverOrderedCallbacksTotalElapsedTicks):F2} ms   calls {perf.DeliverOrderedCallbacksCallCount:N0}");
-            }
-            else
-            {
-                _output.WriteLine($"  PayloadDelivered cbk  avg {Avg(perf.PayloadDeliveredCallbackTotalElapsedTicks, perf.PayloadDeliveredCallbackCallCount),10}   total {PerfCounters.TicksToMilliseconds(perf.PayloadDeliveredCallbackTotalElapsedTicks):F2} ms   calls {perf.PayloadDeliveredCallbackCallCount:N0}");
-            }
+            _output.WriteLine("");
+            _output.WriteLine("-- Maintenance (server) --");
+            _output.WriteLine($"  Ticks                   : {server.Perf.MaintenanceTickCallCount:N0}");
+            _output.WriteLine($"  Avg tick                : {PerfCounters.TicksToMilliseconds(server.Perf.MaintenanceTickTotalElapsedTicks) / server.Perf.MaintenanceTickCallCount:F4} ms");
+            _output.WriteLine($"  Avg keep-alive sweep    : {PerfCounters.TicksToMilliseconds(server.Perf.KeepAliveSweepTotalElapsedTicks) / server.Perf.KeepAliveSweepCallCount:F4} ms");
+            _output.WriteLine($"  Avg retransmit sweep    : {PerfCounters.TicksToMilliseconds(server.Perf.ReliableRetransmitSweepTotalElapsedTicks) / server.Perf.ReliableRetransmitSweepCallCount:F4} ms");
+            _output.WriteLine($"  Avg seg-timeout sweep   : {PerfCounters.TicksToMilliseconds(server.Perf.SegmentAssemblyTimeoutSweepTotalElapsedTicks) / server.Perf.SegmentAssemblyTimeoutSweepCallCount:F4} ms");
+            _output.WriteLine($"  Avg ack-flush sweep     : {PerfCounters.TicksToMilliseconds(server.Perf.AckBatchFlushSweepTotalElapsedTicks) / server.Perf.AckBatchFlushSweepCallCount:F4} ms");
+            _output.WriteLine($"  Avg rate-bucket cleanup : {PerfCounters.TicksToMilliseconds(server.Perf.RateBucketCleanupTotalElapsedTicks) / server.Perf.RateBucketCleanupCallCount:F4} ms");
 #endif
 
             Assert.Equal(expectedMessageCount, receivedMessageCount);

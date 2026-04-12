@@ -7,6 +7,9 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
+#if PERFTEST
+using System.Diagnostics;
+#endif
 using CodeBoost.Performance;
 using SynapseSocket.Connections;
 using SynapseSocket.Diagnostics;
@@ -52,6 +55,12 @@ public sealed partial class IngressEngine
     /// Telemetry counters for this engine.
     /// </summary>
     private readonly Telemetry _telemetry;
+#if PERFTEST
+    /// <summary>
+    /// Performance counters for hot-path timing. DEBUG builds only.
+    /// </summary>
+    private readonly PerfCounters _perfCounters;
+#endif
     /// <summary>
     /// Tracks the last probe-response tick per source IP to enforce the per-address rate limit.
     /// </summary>
@@ -116,7 +125,11 @@ public sealed partial class IngressEngine
     /// <param name="connections">Active connection table shared with the rest of the engine.</param>
     /// <param name="sender">Transmission engine used to emit acknowledgements and handshake responses.</param>
     /// <param name="telemetry">Telemetry counters for this engine instance.</param>
-    public IngressEngine(Socket socket, SynapseConfig config, SecurityProvider security, ConnectionManager connections, TransmissionEngine sender, Telemetry telemetry)
+    internal IngressEngine(Socket socket, SynapseConfig config, SecurityProvider security, ConnectionManager connections, TransmissionEngine sender, Telemetry telemetry
+#if PERFTEST
+        , PerfCounters perfCounters
+#endif
+    )
     {
         _socket = socket;
         _config = config;
@@ -125,6 +138,9 @@ public sealed partial class IngressEngine
         _sender = sender;
         _telemetry = telemetry;
         System.Security.Cryptography.RandomNumberGenerator.Fill(_natChallengeSecret);
+#if PERFTEST
+        _perfCounters = perfCounters;
+#endif
     }
 
     /// <summary>
@@ -180,20 +196,38 @@ public sealed partial class IngressEngine
 
                 IPEndPoint fromEndPoint = (IPEndPoint)socketReceiveResult.RemoteEndPoint;
                 int receivedLength = socketReceiveResult.ReceivedBytes;
+#if PERFTEST
+                long utcNowStart = Stopwatch.GetTimestamp();
+#endif
                 long nowTicks = DateTime.UtcNow.Ticks;
+#if PERFTEST
+                _perfCounters.RecordDateTimeUtcNow(Stopwatch.GetTimestamp() - utcNowStart);
+#endif
 
                 // Lowest-level mitigation first, before any copy.
                 // Established connections skip signature recomputation and blacklist lookup — those only apply at handshake time. Size and rate-limit checks still run for all senders.
                 FilterResult filterResult;
                 ulong signature;
-
-                if (_connections.TryGet(fromEndPoint, out SynapseConnection? synapseConnection) && synapseConnection is not null)
+#if PERFTEST
+                long securityFilterStart = Stopwatch.GetTimestamp();
+                long securityTryGetStart = Stopwatch.GetTimestamp();
+#endif
+                bool isEstablished = _connections.TryGet(fromEndPoint, out SynapseConnection? synapseConnection) && synapseConnection is not null;
+#if PERFTEST
+                _perfCounters.RecordSecurityFilterTryGet(Stopwatch.GetTimestamp() - securityTryGetStart);
+                long securityInspectStart = Stopwatch.GetTimestamp();
+#endif
+                if (isEstablished)
                 {
-                    signature = synapseConnection.Signature;
-                    filterResult = _security.InspectEstablished(receivedLength, signature);
+                    signature = synapseConnection!.Signature;
+                    filterResult = _security.InspectEstablished(receivedLength, synapseConnection.RateBucket);
                 }
                 else
                     filterResult = _security.InspectNew(fromEndPoint, receivedLength, out signature);
+#if PERFTEST
+                _perfCounters.RecordSecurityFilterInspect(Stopwatch.GetTimestamp() - securityInspectStart);
+                _perfCounters.RecordSecurityFilter(Stopwatch.GetTimestamp() - securityFilterStart);
+#endif
 
                 if (filterResult != FilterResult.Allowed)
                 {
@@ -218,8 +252,13 @@ public sealed partial class IngressEngine
                 }
 
                 _telemetry.OnReceived(receivedLength);
-
-                ProcessPacket(rentedBuffer, receivedLength, fromEndPoint, nowTicks, cancellationToken, ref isPayloadCopied);
+#if PERFTEST
+                long processPacketStart = Stopwatch.GetTimestamp();
+#endif
+                ProcessPacket(rentedBuffer, receivedLength, fromEndPoint, synapseConnection, nowTicks, cancellationToken, ref isPayloadCopied);
+#if PERFTEST
+                _perfCounters.RecordProcessPacket(Stopwatch.GetTimestamp() - processPacketStart);
+#endif
             }
             catch (OperationCanceledException)
             {
@@ -251,7 +290,7 @@ public sealed partial class IngressEngine
     /// <param name="isPayloadCopied">
     /// Set to false when ownership of <paramref name="buffer"/> is transferred to a <see cref="PayloadDelivered"/> subscriber so the receive loop does not return it to the pool.
     /// </param>
-    private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, long nowTicks, CancellationToken cancellationToken, ref bool isPayloadCopied)
+    private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, SynapseConnection? synapseConnection, long nowTicks, CancellationToken cancellationToken, ref bool isPayloadCopied)
     {
         PacketType type;
         ushort sequence;
@@ -262,7 +301,13 @@ public sealed partial class IngressEngine
 
         try
         {
+#if PERFTEST
+            long headerParseStart = Stopwatch.GetTimestamp();
+#endif
             headerSize = PacketHeader.Read(buffer.AsSpan(0, length), out type, out sequence, out segmentId, out segmentIndex, out segmentCount);
+#if PERFTEST
+            _perfCounters.RecordHeaderParse(Stopwatch.GetTimestamp() - headerParseStart);
+#endif
         }
         catch
         {
@@ -296,7 +341,7 @@ public sealed partial class IngressEngine
                 return;
         }
 
-        if (!_connections.TryGet(fromEndPoint, out SynapseConnection? synapseConnection) || synapseConnection is null)
+        if (synapseConnection is null)
         {
             _telemetry.OnDroppedIn();
             return;
@@ -349,9 +394,21 @@ public sealed partial class IngressEngine
             case PacketType.Reliable:
             {
                 byte[] payloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
+#if PERFTEST
+                long payloadCopyStart = Stopwatch.GetTimestamp();
+#endif
                 Buffer.BlockCopy(buffer, headerSize, payloadBuffer, 0, payloadLength);
+#if PERFTEST
+                _perfCounters.RecordPayloadCopy(Stopwatch.GetTimestamp() - payloadCopyStart);
+#endif
                 ArraySegment<byte> payload = new(payloadBuffer, 0, payloadLength);
+#if PERFTEST
+                long ackStart = Stopwatch.GetTimestamp();
+#endif
                 EnqueueOrSendAck(synapseConnection, sequence, cancellationToken);
+#if PERFTEST
+                _perfCounters.RecordEnqueueOrSendAck(Stopwatch.GetTimestamp() - ackStart);
+#endif
                 DeliverOrdered(synapseConnection, sequence, payload, isReliable: true);
                 return;
             }
@@ -421,13 +478,29 @@ public sealed partial class IngressEngine
                 if (!_config.CopyReceivedPayloads)
                 {
                     isPayloadCopied = false;
+#if PERFTEST
+                    long callbackStart = Stopwatch.GetTimestamp();
+#endif
                     PayloadDelivered?.Invoke(synapseConnection, new(buffer, headerSize, payloadLength), false);
+#if PERFTEST
+                    _perfCounters.RecordPayloadDeliveredCallback(Stopwatch.GetTimestamp() - callbackStart);
+#endif
                 }
                 else
                 {
                     byte[] payloadCopyBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
+#if PERFTEST
+                    long payloadCopyStart = Stopwatch.GetTimestamp();
+#endif
                     Buffer.BlockCopy(buffer, headerSize, payloadCopyBuffer, 0, payloadLength);
+#if PERFTEST
+                    _perfCounters.RecordPayloadCopy(Stopwatch.GetTimestamp() - payloadCopyStart);
+                    long callbackStart = Stopwatch.GetTimestamp();
+#endif
                     PayloadDelivered?.Invoke(synapseConnection, new(payloadCopyBuffer, 0, payloadLength), false);
+#if PERFTEST
+                    _perfCounters.RecordPayloadDeliveredCallback(Stopwatch.GetTimestamp() - callbackStart);
+#endif
                 }
 
                 return;
@@ -470,6 +543,9 @@ public sealed partial class IngressEngine
     private void DeliverOrdered(SynapseConnection synapseConnection, ushort sequence, ArraySegment<byte> payload, bool isReliable)
     {
         List<ArraySegment<byte>>? toDeliver = null;
+#if PERFTEST
+        long lockStart = Stopwatch.GetTimestamp();
+#endif
 
         lock (synapseConnection.ReliableLock)
         {
@@ -508,11 +584,21 @@ public sealed partial class IngressEngine
             }
         }
 
+#if PERFTEST
+        _perfCounters.RecordDeliverOrdered(Stopwatch.GetTimestamp() - lockStart);
+#endif
+
         // Callbacks happen OUTSIDE the lock so user handlers are free to call back into the engine (e.g., SendReliableAsync) safely.
         if (toDeliver is not null)
         {
+#if PERFTEST
+            long callbacksStart = Stopwatch.GetTimestamp();
+#endif
             foreach (ArraySegment<byte> deliverPayload in toDeliver)
                 PayloadDelivered?.Invoke(synapseConnection, deliverPayload, isReliable);
+#if PERFTEST
+            _perfCounters.RecordDeliverOrderedCallbacks(Stopwatch.GetTimestamp() - callbacksStart);
+#endif
         }
     }
 
@@ -583,6 +669,7 @@ public sealed partial class IngressEngine
         {
             synapseConnection.State = ConnectionState.Connected;
             synapseConnection.LastReceivedTicks = DateTime.UtcNow.Ticks;
+            synapseConnection.RateBucket = _security.CreateRateBucket();
             _ = _sender.SendHandshakeAsync(fromEndPoint, cancellationToken); // handshake-ack = another handshake packet
             ConnectionEstablished?.Invoke(synapseConnection);
         }

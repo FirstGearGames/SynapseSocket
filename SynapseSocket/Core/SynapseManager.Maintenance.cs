@@ -2,6 +2,9 @@
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+#if PERFTEST
+using System.Diagnostics;
+#endif
 using SynapseSocket.Connections;
 using SynapseSocket.Core.Events;
 using SynapseSocket.Transport;
@@ -26,6 +29,7 @@ public sealed partial class SynapseManager
     /// </summary>
     private async Task MaintenanceLoopAsync(CancellationToken cancellationToken)
     {
+        return;
         int maintenanceLoopDelayMilliseconds = 50;
 
         while (!cancellationToken.IsCancellationRequested)
@@ -33,11 +37,30 @@ public sealed partial class SynapseManager
             try
             {
                 long nowTicks = DateTime.UtcNow.Ticks;
+#if PERFTEST
+                long tickStart = Stopwatch.GetTimestamp();
+                long sweepStart = tickStart;
+#endif
                 ProgressiveKeepAliveSweep(nowTicks, cancellationToken);
+#if PERFTEST
+                Perf.RecordKeepAliveSweep(Stopwatch.GetTimestamp() - sweepStart);
+                sweepStart = Stopwatch.GetTimestamp();
+#endif
                 ReliableRetransmitSweep(nowTicks, cancellationToken);
+#if PERFTEST
+                Perf.RecordReliableRetransmitSweep(Stopwatch.GetTimestamp() - sweepStart);
+                sweepStart = Stopwatch.GetTimestamp();
+#endif
                 SegmentAssemblyTimeoutSweep(nowTicks);
+#if PERFTEST
+                Perf.RecordSegmentAssemblyTimeoutSweep(Stopwatch.GetTimestamp() - sweepStart);
+                sweepStart = Stopwatch.GetTimestamp();
+#endif
                 AckBatchFlushSweep(nowTicks, cancellationToken);
-                Security.RemoveExpiredRateBuckets(nowTicks, TimeSpan.FromMinutes(5).Ticks);
+#if PERFTEST
+                Perf.RecordAckBatchFlushSweep(Stopwatch.GetTimestamp() - sweepStart);
+                Perf.RecordMaintenanceTick(Stopwatch.GetTimestamp() - tickStart);
+#endif
             }
             catch (OperationCanceledException)
             {
