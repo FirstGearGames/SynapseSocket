@@ -15,7 +15,7 @@ public sealed class ServerNatConfig
     /// Must be set before calling <see cref="SynapseSocket.Core.SynapseManager.HostViaNatServerAsync"/>
     /// or <see cref="SynapseSocket.Core.SynapseManager.JoinViaNatServerAsync"/>.
     /// </summary>
-    public IPEndPoint? ServerEndPoint; //Unused?
+    public IPEndPoint? ServerEndPoint;
 
     /// <summary>
     /// Milliseconds to wait for the peer to register before the attempt is abandoned.

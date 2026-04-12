@@ -98,11 +98,6 @@ public sealed class SynapseConnection
     internal sealed class PendingReliable : IPoolResettable
     {
         /// <summary>
-        /// Sequence number of the pending packet.
-        /// </summary>
-        [PoolResettableMember]
-        public ushort Sequence { get; private set; } // Unused?
-        /// <summary>
         /// Rented packet buffer (header + payload) for unsegmented reliable sends. Null for segmented sends.
         /// Returned to <see cref="ArrayPool{T}.Shared"/> by <see cref="ReleasePendingReliable"/>.
         /// </summary>
@@ -134,19 +129,29 @@ public sealed class SynapseConnection
         [PoolResettableMember]
         public int Retries;
 
+        /// <summary>
+        /// Initialises this instance for a segmented reliable send.
+        /// </summary>
+        /// <param name="segments">Rented list of per-segment wire buffers.</param>
+        /// <param name="segmentCount">Logical count of valid entries in <paramref name="segments"/>.</param>
+        /// <param name="sentTicks">UTC ticks at the time of the initial send.</param>
         [PoolResettableMethod]
-        public void Initialize(ushort sequence, List<ArraySegment<byte>> segments, int segmentCount, long sentTicks)
+        public void Initialize(List<ArraySegment<byte>> segments, int segmentCount, long sentTicks)
         {
-            Sequence = sequence;
             Segments = segments;
             SegmentCount = segmentCount;
             SentTicks = sentTicks;
         }
 
+        /// <summary>
+        /// Initialises this instance for an unsegmented reliable send.
+        /// </summary>
+        /// <param name="payload">Rented buffer containing the full wire packet (header + payload).</param>
+        /// <param name="packetLength">Logical byte length of the wire packet within <paramref name="payload"/>.</param>
+        /// <param name="sentTicks">UTC ticks at the time of the initial send.</param>
         [PoolResettableMethod]
-        public void Initialize(ushort sequence, byte[] payload, int packetLength, long sentTicks)
+        public void Initialize(byte[] payload, int packetLength, long sentTicks)
         {
-            Sequence = sequence;
             Payload = payload;
             PacketLength = packetLength;
             SentTicks = sentTicks;
@@ -158,7 +163,6 @@ public sealed class SynapseConnection
         /// <inheritdoc/>
         public void OnReturn()
         {
-            Sequence = 0;
             Retries = 0;
             PacketLength = 0;
             SegmentCount = 0;

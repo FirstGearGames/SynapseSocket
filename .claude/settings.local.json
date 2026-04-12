@@ -14,7 +14,8 @@
       "Bash(python3 -c \"import sys,json; [print\\(f['name']\\) for f in json.load\\(sys.stdin\\)]\")",
       "WebFetch(domain:api.github.com)",
       "Bash(xargs grep:*)",
-      "Bash(dotnet build:*)"
+      "Bash(dotnet build:*)",
+      "Bash(grep:*)"
     ]
   }
 }

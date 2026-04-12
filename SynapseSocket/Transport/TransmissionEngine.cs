@@ -118,7 +118,7 @@ public sealed partial class TransmissionEngine
         int written = PacketHeader.BuildPacket(packetBuffer.AsSpan(), Type, sequence, 0, 0, 0, payload.AsSpan());
 
         SynapseConnection.PendingReliable pendingReliable = ResettableObjectPool<SynapseConnection.PendingReliable>.Rent();
-        pendingReliable.Initialize(sequence, packetBuffer, written, DateTime.UtcNow.Ticks);
+        pendingReliable.Initialize(packetBuffer, written, DateTime.UtcNow.Ticks);
 
         synapseConnection.PendingReliableQueue[sequence] = pendingReliable;
 
@@ -154,7 +154,7 @@ public sealed partial class TransmissionEngine
         if (isReliable)
         {
             SynapseConnection.PendingReliable pendingReliable = ResettableObjectPool<SynapseConnection.PendingReliable>.Rent();
-            pendingReliable.Initialize(sequence, segments, segmentCount, DateTime.UtcNow.Ticks);
+            pendingReliable.Initialize(segments, segmentCount, DateTime.UtcNow.Ticks);
 
             synapseConnection.PendingReliableQueue[sequence] = pendingReliable;
 
