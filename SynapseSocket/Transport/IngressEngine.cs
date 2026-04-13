@@ -84,7 +84,7 @@ public sealed partial class IngressEngine
     private readonly byte[] _natChallengeSecret = new byte[32];
     /// <summary>
     /// Pending ACKs queued for batch delivery when <see cref="SynapseSocket.Core.Configuration.ReliableConfig.AckBatchingEnabled"/> is true.
-    /// Drained by <see cref="FlushPendingAcks"/>.
+    /// Drained by <see cref="SendPendingAcks"/>.
     /// </summary>
     private readonly ConcurrentQueue<(SynapseConnection Connection, ushort Sequence)> _pendingAcks = new();
     /// <summary>
@@ -232,7 +232,7 @@ public sealed partial class IngressEngine
                 _perfCounters.RecordSecurityFilter(Stopwatch.GetTimestamp() - securityFilterStart);
                 #endif
 
-                if (filterResult is not FilterResult.Allowed) 
+                if (filterResult is not FilterResult.Allowed)
                 {
                     _telemetry.OnDroppedIn();
 
@@ -395,22 +395,13 @@ public sealed partial class IngressEngine
             case PacketType.Reliable:
             {
                 byte[] payloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
-                #if PERFTEST
-                long payloadCopyStart = Stopwatch.GetTimestamp();
-                #endif
                 Buffer.BlockCopy(buffer, headerSize, payloadBuffer, 0, payloadLength);
-                #if PERFTEST
-                _perfCounters.RecordPayloadCopy(Stopwatch.GetTimestamp() - payloadCopyStart);
-                #endif
-                ArraySegment<byte> payload = new(payloadBuffer, 0, payloadLength);
-                #if PERFTEST
-                long ackStart = Stopwatch.GetTimestamp();
-                #endif
+
                 EnqueueOrSendAck(synapseConnection, sequence, cancellationToken);
-                #if PERFTEST
-                _perfCounters.RecordEnqueueOrSendAck(Stopwatch.GetTimestamp() - ackStart);
-                #endif
+
+                ArraySegment<byte> payload = new(payloadBuffer, 0, payloadLength);
                 DeliverOrdered(synapseConnection, sequence, payload, isReliable: true);
+                
                 return;
             }
 
@@ -618,7 +609,7 @@ public sealed partial class IngressEngine
         }
 
         // Connection cap: reject new peers when the engine is full.
-        if (_config.MaximumConcurrentConnections > 0 && _connections.Count >= _config.MaximumConcurrentConnections && !_connections.TryGet(fromEndPoint, out _))
+        if (_config.MaximumConcurrentConnections > 0 && _connections.Count >= _config.MaximumConcurrentConnections && !_connections.ConnectionsByEndPoint.TryGetValue(fromEndPoint, out _))
         {
             ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.ServerFull, "Connection limit reached");
             return;
@@ -653,11 +644,9 @@ public sealed partial class IngressEngine
             return;
         }
 
-        bool isNewConnection = !_connections.TryGet(fromEndPoint, out SynapseConnection? _);
+        SynapseConnection synapseConnection = _connections.GetOrAdd(fromEndPoint, signature, out bool isExistingConnection);
 
-        SynapseConnection synapseConnection = _connections.GetOrAdd(fromEndPoint, signature, (remoteEndPoint, remoteSignature) => new(remoteEndPoint, remoteSignature));
-
-        if (isNewConnection || synapseConnection.State != ConnectionState.Connected)
+        if (!isExistingConnection || synapseConnection.State != ConnectionState.Connected)
         {
             synapseConnection.State = ConnectionState.Connected;
             synapseConnection.LastReceivedTicks = DateTime.UtcNow.Ticks;
@@ -698,15 +687,16 @@ public sealed partial class IngressEngine
     /// Generic helper that removes entries from a <see cref="ConcurrentDictionary{TKey, Long}"/>
     /// whose tick-valued values are older than <paramref name="staleTicks"/> relative to <paramref name="nowTicks"/>.
     /// </summary>
-    /// <param name="dictionary">The dictionary to prune.</param>
-    /// <param name="nowTicks">Current timestamp in <see cref="System.DateTime.Ticks"/>.</param>
-    /// <param name="staleTicks">Age in ticks beyond which an entry is removed.</param>
-    /// <typeparam name="TKey">The dictionary key type.</typeparam>
+    /// <param name = "synapseConnection"></param>
+    /// <param name = "sequence"></param>
+    /// <param name = "cancellationToken"></param>
     /// <summary>
     /// Queues an ACK for batch delivery when batching is enabled, or sends it immediately when disabled.
     /// </summary>
     private void EnqueueOrSendAck(SynapseConnection synapseConnection, ushort sequence, CancellationToken cancellationToken)
     {
+        //hotpath -- batching enabled should be cached.
+        //todo Should add to connection pending not global
         if (_config.Reliable.AckBatchingEnabled)
             _pendingAcks.Enqueue((synapseConnection, sequence));
         else
@@ -717,7 +707,7 @@ public sealed partial class IngressEngine
     /// Drains the pending ACK queue and sends all queued acknowledgements.
     /// Called by the maintenance loop at the configured <see cref="SynapseSocket.Core.Configuration.ReliableConfig.AckBatchIntervalMilliseconds"/> interval.
     /// </summary>
-    public void FlushPendingAcks(CancellationToken cancellationToken)
+    public void SendPendingAcks(CancellationToken cancellationToken)
     {
         while (_pendingAcks.TryDequeue(out (SynapseConnection Connection, ushort Sequence) item))
             _ = _sender.SendAckAsync(item.Connection, item.Sequence, cancellationToken);

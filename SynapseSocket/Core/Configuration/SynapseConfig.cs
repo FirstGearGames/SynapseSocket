@@ -151,4 +151,9 @@ public sealed class SynapseConfig
     /// Sentinel value: pass as <see cref="MaximumBytesPerSecond"/> to disable byte rate limiting.
     /// </summary>
     public const uint UnsetMaximumBytesPerSecond = 0;
+
+    /// <summary>
+    /// Sentinel value: pass as <see cref="SegmentAssemblyTimeoutMilliseconds"/> to disable assembly timeout.
+    /// </summary>
+    public const uint UnsetSegmentAssemblyTimeout = 0;
 }

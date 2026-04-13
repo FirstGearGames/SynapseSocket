@@ -68,7 +68,7 @@ public sealed partial class SynapseManager
     /// </summary>
     public async Task<NatHostSession> HostViaNatServerAsync(CancellationToken cancellationToken = default)
     {
-        if (!_isStarted || _sender is null)
+        if (!_isStarted || _transmissionEngine is null)
             throw new InvalidOperationException("Engine not started.");
 
         if (Config.NatTraversal.Mode != NatTraversalMode.Server)
@@ -91,7 +91,7 @@ public sealed partial class SynapseManager
 
         try
         {
-            await _sender.SendNatRequestSessionAsync(serverEndPoint, heartbeatCts.Token).ConfigureAwait(false);
+            await _transmissionEngine.SendNatRequestSessionAsync(serverEndPoint, heartbeatCts.Token).ConfigureAwait(false);
 
             Task<uint> sessionTask = sessionSource.Task;
             Task timeoutTask = Task.Delay((int)Config.NatTraversal.Server.RegistrationTimeoutMilliseconds, heartbeatCts.Token);
@@ -140,7 +140,7 @@ public sealed partial class SynapseManager
     /// </summary>
     public async Task<SynapseConnection> JoinViaNatServerAsync(uint sessionId, CancellationToken cancellationToken = default)
     {
-        if (!_isStarted || _sender is null)
+        if (!_isStarted || _transmissionEngine is null)
             throw new InvalidOperationException("Engine not started.");
 
         if (Config.NatTraversal.Mode != NatTraversalMode.Server)
@@ -185,8 +185,8 @@ public sealed partial class SynapseManager
         lock (_natRendezvousLock)
             _natHostPeerHandler = null;
 
-        if (_sender is not null && Config.NatTraversal.Server.ServerEndPoint is not null)
-            await _sender.SendNatCloseSessionAsync(Config.NatTraversal.Server.ServerEndPoint, sessionId, cancellationToken).ConfigureAwait(false);
+        if (_transmissionEngine is not null && Config.NatTraversal.Server.ServerEndPoint is not null)
+            await _transmissionEngine.SendNatCloseSessionAsync(Config.NatTraversal.Server.ServerEndPoint, sessionId, cancellationToken).ConfigureAwait(false);
     }
 
     // -------------------------------------------------------------------------
@@ -277,7 +277,7 @@ public sealed partial class SynapseManager
             while (!cancellationToken.IsCancellationRequested)
             {
                 await Task.Delay((int)Config.NatTraversal.Server.HeartbeatIntervalMilliseconds, cancellationToken).ConfigureAwait(false);
-                await _sender!.SendNatHeartbeatAsync(serverEndPoint, sessionId, cancellationToken).ConfigureAwait(false);
+                await _transmissionEngine!.SendNatHeartbeatAsync(serverEndPoint, sessionId, cancellationToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) { }
@@ -298,14 +298,14 @@ public sealed partial class SynapseManager
 
         try
         {
-            await _sender!.SendNatRegisterAsync(serverEndPoint, sessionId, cancellationToken).ConfigureAwait(false);
+            await _transmissionEngine!.SendNatRegisterAsync(serverEndPoint, sessionId, cancellationToken).ConfigureAwait(false);
 
             while (!cancellationToken.IsCancellationRequested && _natJoinSource is not null)
             {
                 await Task.Delay((int)Config.NatTraversal.Server.HeartbeatIntervalMilliseconds, cancellationToken).ConfigureAwait(false);
 
                 if (_natJoinSource is not null)
-                    await _sender!.SendNatHeartbeatAsync(serverEndPoint, sessionId, cancellationToken).ConfigureAwait(false);
+                    await _transmissionEngine!.SendNatHeartbeatAsync(serverEndPoint, sessionId, cancellationToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) { }
@@ -324,8 +324,8 @@ public sealed partial class SynapseManager
     private async Task<SynapseConnection> ConnectAfterRendezvousAsync(IPEndPoint peerEndPoint, CancellationToken cancellationToken)
     {
         ulong signature = Security.ComputeSignature(peerEndPoint, ReadOnlySpan<byte>.Empty);
-        SynapseConnection synapseConnection = Connections.GetOrAdd(peerEndPoint, signature, (endPoint, remoteSignature) => new(endPoint, remoteSignature));
-        await _sender!.SendHandshakeAsync(peerEndPoint, cancellationToken).ConfigureAwait(false);
+        SynapseConnection synapseConnection = Connections.GetOrAdd(peerEndPoint, signature, out _);
+        await _transmissionEngine!.SendHandshakeAsync(peerEndPoint, cancellationToken).ConfigureAwait(false);
         _ = Task.Run(() => NatPunchAsync(synapseConnection, peerEndPoint, cancellationToken), cancellationToken);
         return synapseConnection;
     }
@@ -354,9 +354,9 @@ public sealed partial class SynapseManager
                     return;
 
                 for (uint probe = 0; probe < Config.NatTraversal.ProbeCount; probe++)
-                    await _sender!.SendNatProbeAsync(endPoint, cancellationToken).ConfigureAwait(false);
+                    await _transmissionEngine!.SendNatProbeAsync(endPoint, cancellationToken).ConfigureAwait(false);
 
-                await _sender!.SendHandshakeAsync(endPoint, cancellationToken).ConfigureAwait(false);
+                await _transmissionEngine!.SendHandshakeAsync(endPoint, cancellationToken).ConfigureAwait(false);
 
                 if (attempt + 1 < Config.NatTraversal.MaximumAttempts)
                     await Task.Delay((int)Config.NatTraversal.IntervalMilliseconds, cancellationToken).ConfigureAwait(false);

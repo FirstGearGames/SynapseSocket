@@ -93,7 +93,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     private readonly List<Socket> _sockets = [];
     private readonly List<Task> _ingressTasks = [];
     private readonly List<IngressEngine> _ingressEngines = [];
-    private TransmissionEngine? _sender;
+    private TransmissionEngine? _transmissionEngine;
     private CancellationTokenSource? _cancellationTokenSource;
     private Task? _maintenanceTask;
 
@@ -128,6 +128,14 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         _connectionTimeoutTicks = TimeSpan.FromMilliseconds(Config.Connection.TimeoutMilliseconds).Ticks;
         _reliableResendTicks = TimeSpan.FromMilliseconds(Config.Reliable.ResendMilliseconds).Ticks;
         _maximumReliableRetries = Config.Reliable.MaximumRetries;
+        _isAckBatchingEnabled = Config.Reliable.AckBatchingEnabled;
+        // Value is unset is ack batching is not enabled.
+        _ackBatchingIntervalTicks = _isAckBatchingEnabled ? TimeSpan.FromMilliseconds(Config.Reliable.AckBatchIntervalMilliseconds).Ticks : UnsetAckBatchingIntervalTicks;
+        /* Value is unset if segmenting is not enabled or if
+         * a timeout is unset. */
+        uint segmentAssemblyTimeoutMilliseconds = config.SegmentAssemblyTimeoutMilliseconds;
+        _segmentAssemblyTimeoutTicks = _isSegmentingEnabled && segmentAssemblyTimeoutMilliseconds != SynapseConfig.UnsetSegmentAssemblyTimeout ? TimeSpan.FromMilliseconds(segmentAssemblyTimeoutMilliseconds).Ticks : UnsetSegmentAssemblyTimeoutTicks;
+
     }
 
     /// <summary>
@@ -175,11 +183,11 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         if (_sockets.Count == 0)
             throw new InvalidOperationException("Failed to bind any configured endpoints.");
 
-        _sender = new(ipv4Socket ?? _sockets[0], ipv6Socket, Config, Telemetry, _latencySimulator);
+        _transmissionEngine = new(ipv4Socket ?? _sockets[0], ipv6Socket, Config, Telemetry, _latencySimulator);
 
         foreach (Socket socket in _sockets)
         {
-            IngressEngine ingressEngine = new(socket, Config, Security, Connections, _sender, Telemetry
+            IngressEngine ingressEngine = new(socket, Config, Security, Connections, _transmissionEngine, Telemetry
                 #if PERFTEST
                 , Perf
                 #endif
@@ -225,7 +233,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     public async Task<SynapseConnection> ConnectAsync(IPEndPoint endPoint, CancellationToken cancellationToken = default)
     {
-        if (!_isStarted || _sender is null)
+        if (!_isStarted || _transmissionEngine is null)
             throw new InvalidOperationException("Engine not started.");
 
         ulong signature = Security.ComputeSignature(endPoint, ReadOnlySpan<byte>.Empty);
@@ -236,10 +244,9 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             throw new InvalidOperationException("Remote endpoint is blacklisted.");
         }
 
-        SynapseConnection synapseConnection = Connections.GetOrAdd(endPoint, signature);
-        synapseConnection.RateBucket ??= Security.CreateRateBucket();
+        SynapseConnection synapseConnection = Connections.GetOrAdd(endPoint, signature, out _);
 
-        await _sender.SendHandshakeAsync(endPoint, cancellationToken).ConfigureAwait(false);
+        await _transmissionEngine.SendHandshakeAsync(endPoint, cancellationToken).ConfigureAwait(false);
 
         if (Config.NatTraversal.Mode == NatTraversalMode.FullCone)
             _ = Task.Run(() => NatPunchAsync(synapseConnection, endPoint, cancellationToken), cancellationToken);
@@ -263,9 +270,9 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         if (payload.Count <= _maximumUnsegmentedPayload)
         {
             if (isReliable)
-                await _sender!.SendReliableUnsegmentedAsync(synapseConnection, payload, cancellationToken).ConfigureAwait(false);
+                await _transmissionEngine!.SendReliableUnsegmentedAsync(synapseConnection, payload, cancellationToken).ConfigureAwait(false);
             else
-                await _sender!.SendUnreliableUnsegmentedAsync(synapseConnection, payload, cancellationToken).ConfigureAwait(false);
+                await _transmissionEngine!.SendUnreliableUnsegmentedAsync(synapseConnection, payload, cancellationToken).ConfigureAwait(false);
 
             RaisePacketSent(synapseConnection.RemoteEndPoint, payload, isReliable);
 
@@ -290,7 +297,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             isReliable = unreliableSegmentMode is UnreliableSegmentMode.SegmentReliable;
         }
 
-        await _sender!.SendSegmentedAsync(synapseConnection, payload, isReliable, GetOrRentSplitter(synapseConnection), cancellationToken).ConfigureAwait(false);
+        await _transmissionEngine!.SendSegmentedAsync(synapseConnection, payload, isReliable, GetOrRentSplitter(synapseConnection), cancellationToken).ConfigureAwait(false);
         RaisePacketSent(synapseConnection.RemoteEndPoint, payload, isReliable);
     }
 
@@ -299,8 +306,8 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     public async Task DisconnectAsync(SynapseConnection synapseConnection, CancellationToken cancellationToken = default)
     {
-        if (_sender is not null)
-            await _sender.SendDisconnectAsync(synapseConnection, cancellationToken).ConfigureAwait(false);
+        if (_transmissionEngine is not null)
+            await _transmissionEngine.SendDisconnectAsync(synapseConnection, cancellationToken).ConfigureAwait(false);
 
         ReturnConnectionSegmenters(synapseConnection);
         ReturnReorderBufferToPool(synapseConnection);
@@ -319,7 +326,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     internal void HandleViolation(IPEndPoint endPoint, ulong signature, ViolationReason violationReason, int packetSize, string? details, ViolationAction initialAction = ViolationAction.KickAndBlacklist)
     {
-        Connections.TryGet(endPoint, out SynapseConnection? synapseConnection);
+        Connections.ConnectionsByEndPoint.TryGetValue(endPoint, out SynapseConnection? synapseConnection);
 
         ViolationEventArgs violationEventArgs = ResettableObjectPool<ViolationEventArgs>.Rent();
         violationEventArgs.Initialize(endPoint, signature, violationReason, synapseConnection, packetSize, details, initialAction);
@@ -478,7 +485,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     private void EnsureRunning()
     {
-        if (!_isStarted || _sender is null || _isDisposed)
+        if (!_isStarted || _transmissionEngine is null || _isDisposed)
             throw new InvalidOperationException("Engine is not running.");
     }
 

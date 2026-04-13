@@ -81,12 +81,6 @@ public sealed class SynapseConnection : IPoolResettable
     /// </summary>
     internal readonly object ReliableLock = new();
     /// <summary>
-    /// Rate bucket for this connection. Assigned on establishment when rate limiting is enabled; null otherwise.
-    /// Lifetime is tied to the connection — no separate eviction needed.
-    /// </summary>
-    [PoolResettableMember]
-    internal SecurityProvider.RateBucket? RateBucket;
-    /// <summary>
     /// Send-side splitter, rented from <see cref="CodeBoost.Performance.ResettableObjectPool{T}"/>
     /// on the first segmented send and returned to the pool on disconnect.
     /// Null until the first segmented send is issued on this connection.
@@ -112,6 +106,7 @@ public sealed class SynapseConnection : IPoolResettable
     /// </summary>
     /// <param name="remoteEndPoint">The peer's remote endpoint.</param>
     /// <param name="signature">The 64-bit signature that uniquely identifies this peer.</param>
+    /// <param name = "connectionsIndex"></param>
     public void Initialize(IPEndPoint remoteEndPoint, ulong signature, int connectionsIndex)
     {
         RemoteEndPoint = remoteEndPoint ?? throw new ArgumentNullException(nameof(remoteEndPoint));

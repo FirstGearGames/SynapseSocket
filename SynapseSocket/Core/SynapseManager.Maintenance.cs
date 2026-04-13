@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 #if PERFTEST
@@ -19,33 +20,41 @@ public sealed partial class SynapseManager
 {
     private const string ViolationReliableExhausted = "Connection exceeded the maximum reliable packet retry limit.";
     /// <summary>
-    /// UTC ticks of the last ACK batch flush. Used by <see cref="AckBatchFlushSweep"/> to enforce the configured interval.
+    /// UTC ticks of the last ACK batch flush. Used by <see cref="SendPendingAcks"/> to enforce the configured interval.
     /// </summary>
     private long _lastAckFlushTicks;
     private long _connectionKeepAliveTicks;
     private long _connectionTimeoutTicks;
     private long _reliableResendTicks;
     private uint _maximumReliableRetries;
-
+    private long _segmentAssemblyTimeoutTicks;
+    private bool _isAckBatchingEnabled;
+    private long _ackBatchingIntervalTicks;
     private int _nextMaintenanceConnectionIndex;
+    private int _nextAckConnectionIndex;
+    private long UnsetSegmentAssemblyTimeoutTicks = 0;
+    private long UnsetAckBatchingIntervalTicks = 0;
 
     /// <summary>
     /// Background loop that periodically runs keep-alive, retransmit, and segment-timeout sweeps.
     /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private async Task MaintenanceLoopAsync(CancellationToken cancellationToken)
     {
-        // How long between performing maintenance on each connection.
-        int maintenanceLoopDelayMilliseconds = 1;
-
+        const int MaintenanceLoopTargetMilliseconds = 50;
+        
         while (!cancellationToken.IsCancellationRequested)
         {
+            if (Connections is null || Connections.Connections.Count == 0)
+            {
+                await Task.Delay(MaintenanceLoopTargetMilliseconds, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
+            int connectionsCount = Connections.Connections.Count;
+
             try
             {
-                int connectionsCount = Connections.Connections.Count;
-
-                if (connectionsCount == 0)
-                    continue;
-
                 if (_nextMaintenanceConnectionIndex >= connectionsCount)
                     _nextMaintenanceConnectionIndex = 0;
 
@@ -53,22 +62,11 @@ public sealed partial class SynapseManager
 
                 long nowTicks = DateTime.UtcNow.Ticks;
 
-                PerformKeepAlive(nowTicks, connection, cancellationToken);
-                ReliableRetransmitSweep(nowTicks, connection, cancellationToken);
-                #if PERFTEST
-                Perf.RecordReliableRetransmitSweep(Stopwatch.GetTimestamp() - sweepStart);
-                sweepStart = Stopwatch.GetTimestamp();
-                #endif
-                SegmentAssemblyTimeoutSweep(nowTicks);
-                #if PERFTEST
-                Perf.RecordSegmentAssemblyTimeoutSweep(Stopwatch.GetTimestamp() - sweepStart);
-                sweepStart = Stopwatch.GetTimestamp();
-                #endif
-                AckBatchFlushSweep(nowTicks, cancellationToken);
-                #if PERFTEST
-                Perf.RecordAckBatchFlushSweep(Stopwatch.GetTimestamp() - sweepStart);
-                Perf.RecordMaintenanceTick(Stopwatch.GetTimestamp() - tickStart);
-                #endif
+                if (!PerformKeepAlive(nowTicks, connection, cancellationToken))
+                    return;
+
+                RetransmitReliable(nowTicks, connection, cancellationToken);
+                SegmentAssemblyTimeoutSweep(nowTicks, connection);
             }
             catch (OperationCanceledException)
             {
@@ -81,7 +79,10 @@ public sealed partial class SynapseManager
 
             try
             {
-                await Task.Delay(maintenanceLoopDelayMilliseconds, cancellationToken).ConfigureAwait(false);
+                /* Wait time is calculated to have iterated all connections
+                 * at roughly the target milliseconds. */
+                int waitMilliseconds = Math.Max(1, MaintenanceLoopTargetMilliseconds / connectionsCount);
+                await Task.Delay(waitMilliseconds, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -94,13 +95,14 @@ public sealed partial class SynapseManager
     /// Progressive keep-alive: iterates a slice of connections per tick so heartbeat traffic is spread across the configured sweep window.
     /// Also detects timeouts and disconnects non-responsive peers.
     /// </summary>
-    private void PerformKeepAlive(long nowTicks, SynapseConnection synapseConnection, CancellationToken cancellationToken)
+    /// <returns>True if the connection is still valid. False will be returned if the connection had been disconnected.</returns>
+    private bool PerformKeepAlive(long nowTicks, SynapseConnection synapseConnection, CancellationToken cancellationToken)
     {
-        if (_sender is null)
-            return;
+        if (_transmissionEngine is null)
+            return false;
 
         if (synapseConnection.State == ConnectionState.Disconnected)
-            return;
+            return false;
 
         // Timeout check - treated as a (benign) violation.
         // Default initial action is Kick (disconnect without blacklisting); a listener can escalate or downgrade.
@@ -113,21 +115,21 @@ public sealed partial class SynapseManager
             RaiseConnectionClosed(synapseConnection);
             HandleViolation(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.Timeout, 0, null, ViolationAction.Kick);
 
-            return;
+            return false;
         }
 
         // Keep-alive: skip when traffic is already flowing; reset backoff when active.
         if (nowTicks - synapseConnection.LastReceivedTicks < _connectionKeepAliveTicks)
         {
             synapseConnection.UnansweredKeepAlives = 0;
-            return;
+            return true;
         }
 
         // Exponential backoff: double the interval for each consecutive unanswered keep-alive, capped at 8×.
         long effectiveIntervalTicks = _connectionKeepAliveTicks << Math.Min(synapseConnection.UnansweredKeepAlives, 3);
 
         if (nowTicks - synapseConnection.LastKeepAliveSentTicks < effectiveIntervalTicks)
-            return;
+            return true;
 
         // Track whether the previous keep-alive was answered.
         if (synapseConnection.LastKeepAliveSentTicks > 0 && synapseConnection.LastReceivedTicks < synapseConnection.LastKeepAliveSentTicks)
@@ -137,37 +139,37 @@ public sealed partial class SynapseManager
 
         synapseConnection.LastKeepAliveSentTicks = nowTicks;
 
-        _ = _sender.SendKeepAliveAsync(synapseConnection, cancellationToken);
+        _ = _transmissionEngine.SendKeepAliveAsync(synapseConnection, cancellationToken);
+
+        return true;
     }
 
     /// <summary>
     /// Flushes queued ACKs from all ingress engines when ACK batching is enabled and the flush interval has elapsed.
     /// </summary>
-    private void AckBatchFlushSweep(long nowTicks, CancellationToken cancellationToken)
+    private void SendPendingAcks(long nowTicks, CancellationToken cancellationToken)
     {
         if (!Config.Reliable.AckBatchingEnabled)
             return;
 
-        long intervalTicks = Config.Reliable.AckBatchIntervalMilliseconds * TimeSpan.TicksPerMillisecond;
-
-        if (nowTicks - _lastAckFlushTicks < intervalTicks)
+        if (nowTicks - _lastAckFlushTicks < _ackBatchingIntervalTicks)
             return;
 
         _lastAckFlushTicks = nowTicks;
 
         foreach (IngressEngine engine in _ingressEngines)
-            engine.FlushPendingAcks(cancellationToken);
+            engine.SendPendingAcks(cancellationToken);
     }
 
     /// <summary>
     /// Reliable retransmission sweep: any pending reliable packet whose resend timer has expired is re-sent.
     /// Packets exceeding the retry cap are treated as a <see cref="ViolationReason.ReliableExhausted"/> violation.
     /// </summary>
-    private void ReliableRetransmitSweep(long nowTicks, SynapseConnection synapseConnection, CancellationToken cancellationToken)
+    private void RetransmitReliable(long nowTicks, SynapseConnection synapseConnection, CancellationToken cancellationToken)
     {
-        if (_sender is null)
+        if (_transmissionEngine is null)
             return;
-        
+
         if (synapseConnection.State != ConnectionState.Connected)
             return;
 
@@ -196,11 +198,11 @@ public sealed partial class SynapseManager
             if (pendingReliable.Segments is not null)
             {
                 for (int i = 0; i < pendingReliable.SegmentCount; i++)
-                    _ = _sender.SendRawAsync(pendingReliable.Segments[i], synapseConnection.RemoteEndPoint, cancellationToken);
+                    _ = _transmissionEngine.SendRawAsync(pendingReliable.Segments[i], synapseConnection.RemoteEndPoint, cancellationToken);
             }
             else if (pendingReliable.Payload is not null)
             {
-                _ = _sender.SendRawAsync(new(pendingReliable.Payload, 0, pendingReliable.PacketLength), synapseConnection.RemoteEndPoint, cancellationToken);
+                _ = _transmissionEngine.SendRawAsync(new(pendingReliable.Payload, 0, pendingReliable.PacketLength), synapseConnection.RemoteEndPoint, cancellationToken);
             }
         }
     }
@@ -208,14 +210,11 @@ public sealed partial class SynapseManager
     /// <summary>
     /// Evicts incomplete segment assemblies (reliable or unreliable) that have exceeded <see cref="SynapseSocket.Core.Configuration.SynapseConfig.SegmentAssemblyTimeoutMilliseconds"/> on each connection that has an active segmenter.
     /// </summary>
-    private void SegmentAssemblyTimeoutSweep(long nowTicks)
+    private void SegmentAssemblyTimeoutSweep(long nowTicks, SynapseConnection synapseConnection)
     {
-        if (!_isSegmentingEnabled || Config.SegmentAssemblyTimeoutMilliseconds == 0)
+        if (_segmentAssemblyTimeoutTicks == UnsetSegmentAssemblyTimeoutTicks)
             return;
 
-        long timeoutTicks = TimeSpan.FromMilliseconds(Config.SegmentAssemblyTimeoutMilliseconds).Ticks;
-
-        foreach (SynapseConnection synapseConnection in Connections.Snapshot())
-            synapseConnection.Reassembler?.RemoveExpiredSegments(nowTicks, timeoutTicks);
+        synapseConnection.Reassembler?.RemoveExpiredSegments(nowTicks, _segmentAssemblyTimeoutTicks);
     }
 }

@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
 using CodeBoost.Performance;
+using SynapseSocket.Core;
 using SynapseSocket.Core.Events;
 
 namespace SynapseSocket.Connections;
@@ -16,44 +17,28 @@ public sealed class ConnectionManager
     /// <summary>
     /// Current live connection count.
     /// </summary>
-    public int Count => _byEndPoint.Count;
+    public int Count => _connectionsByEndPoint.Count;
     /// <summary>
     /// Raised when two connections produce the same 64-bit signature (birthday-bound collision).
     /// The newer connection wins the reverse-lookup slot. Subscribe for telemetry; no corrective action is taken automatically.
     /// </summary>
     public event SignatureCollisionDelegate? SignatureCollisionDetected;
     /// <summary>
-    /// Maps a connection's EndPointKey to its <see cref="SynapseConnection"/>.
+    /// Maps a connection's IPEndPoint to its <see cref="SynapseConnection"/>.
     /// </summary>
-    private readonly ConcurrentDictionary<EndPointKey, SynapseConnection> _byEndPoint = [];
+    public IReadOnlyDictionary<IPEndPoint, SynapseConnection> ConnectionsByEndPoint => _connectionsByEndPoint;
+    private readonly ConcurrentDictionary<IPEndPoint, SynapseConnection> _connectionsByEndPoint = new(IPEndPointComparer.Default);
     /// <summary>
     /// Maps a connection's 64-bit signature to its <see cref="SynapseConnection"/>.
     /// </summary>
-    private readonly ConcurrentDictionary<ulong, SynapseConnection> _bySignature = [];
+    public IReadOnlyDictionary<ulong, SynapseConnection> ConnectionsBySignature => _connectionsBySignature;
+    private readonly ConcurrentDictionary<ulong, SynapseConnection> _connectionsBySignature = [];
     /// <summary>
     /// Connections as an index-based collection.
     /// </summary>
     public IReadOnlyList<SynapseConnection> Connections => _connections;
     private readonly List<SynapseConnection> _connections = [];
 
-    /// <summary>
-    /// Tries to find an existing connection by its remote endpoint.
-    /// </summary>
-    /// <param name="endPoint">The remote endpoint to look up.</param>
-    /// <param name="connection">When this method returns, contains the matching connection, or null if not found.</param>
-    /// <returns>True if a connection was found for the given endpoint; otherwise false.</returns>
-    public bool TryGet(IPEndPoint endPoint, out SynapseConnection? connection)
-    {
-        return _byEndPoint.TryGetValue(new(endPoint), out connection);
-    }
-
-    /// <summary>
-    /// Tries to find a connection by signature.
-    /// </summary>
-    /// <param name="signature">The 64-bit signature to look up.</param>
-    /// <param name="connection">When this method returns, contains the matching connection, or null if not found.</param>
-    /// <returns>True if a connection was found for the given signature; otherwise false.</returns>
-    public bool TryGetBySignature(ulong signature, out SynapseConnection? connection) => _bySignature.TryGetValue(signature, out connection);
 
     /// <summary>
     /// Registers a new connection.
@@ -61,32 +46,32 @@ public sealed class ConnectionManager
     /// </summary>
     /// <param name="endPoint">The remote endpoint identifying the peer.</param>
     /// <param name="signature">The 64-bit signature associated with the peer.</param>
-    /// <param name="factory">Factory invoked to create a new connection if one does not already exist for the given endpoint.</param>
+    /// <param name="isFound"></param>
     /// <returns>The existing connection for the endpoint, or the newly created one.</returns>
-    public SynapseConnection GetOrAdd(IPEndPoint endPoint, ulong signature)
+    public SynapseConnection GetOrAdd(IPEndPoint endPoint, ulong signature, out bool isFound)
     {
-        EndPointKey endPointKey = new(endPoint);
-
-        if (!_byEndPoint.TryGetValue(endPointKey, out SynapseConnection synapseConnection))
+        isFound = _connectionsByEndPoint.TryGetValue(endPoint, out SynapseConnection? synapseConnection);
+        
+        if (!isFound)
         {
             synapseConnection = ResettableObjectPool<SynapseConnection>.Rent();
 
             int connectionsIndex = _connections.Count;
             synapseConnection.Initialize(endPoint, signature, connectionsIndex);
 
-            _byEndPoint[endPointKey] = synapseConnection;
+            _connectionsByEndPoint[endPoint] = synapseConnection;
             _connections.Add(synapseConnection);
         }
 
-        if (!_bySignature.TryAdd(signature, synapseConnection))
+        if (!_connectionsBySignature.TryAdd(signature, synapseConnection))
         {
             // Two distinct endpoints produced the same 64-bit signature.
             // Overwrite so reverse lookup stays current, but surface the collision.
-            _bySignature[signature] = synapseConnection;
+            _connectionsBySignature[signature] = synapseConnection;
             SignatureCollisionDetected?.Invoke(signature);
         }
 
-        return synapseConnection;
+        return synapseConnection!;
     }
 
     /// <summary>
@@ -97,11 +82,11 @@ public sealed class ConnectionManager
     /// <returns>True if the connection was found and removed; otherwise false.</returns>
     public bool Remove(IPEndPoint endPoint, out SynapseConnection? removedSynapseConnection)
     {
-        bool isRemoved = _byEndPoint.TryRemove(new(endPoint), out removedSynapseConnection);
+        bool isRemoved = _connectionsByEndPoint.TryRemove(endPoint, out removedSynapseConnection);
 
         if (isRemoved && removedSynapseConnection is not null)
         {
-            _bySignature.TryRemove(removedSynapseConnection.Signature, out _);
+            _connectionsBySignature.TryRemove(removedSynapseConnection.Signature, out _);
 
             int connectionsIndex = removedSynapseConnection.ConnectionsIndex;
             if (connectionsIndex is not SynapseConnection.UnsetConnectionsIndex)
@@ -126,18 +111,6 @@ public sealed class ConnectionManager
         }
 
         return isRemoved;
-    }
-
-    /// <summary>
-    /// Enumerates all currently tracked connections.
-    /// Snapshot is taken at call time.
-    /// </summary>
-    /// <returns>A sequence containing all active <see cref="SynapseConnection"/> instances at the moment of enumeration.</returns>
-    //todo replace this with iteratable version. see if other timed checks can be done here, such as keep alive.
-    public IEnumerable<SynapseConnection> Snapshot()
-    {
-        foreach (KeyValuePair<EndPointKey, SynapseConnection> keyValuePair in _byEndPoint)
-            yield return keyValuePair.Value;
     }
 
     /// <summary>
