@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using CodeBoost.CodeAnalysis;
 using CodeBoost.Performance;
 using SynapseSocket.Connections;
@@ -10,7 +11,7 @@ namespace SynapseSocket.Core.Events;
 /// Obtain instances via <see cref="ResettableObjectPool{T}"/>; do not retain after the handler returns.
 /// The <see cref="Payload"/> is backed by a pooled buffer and is only valid for the duration of the handler — copy the data if you need to retain it beyond the callback.
 /// </summary>
-public struct PacketReceivedEventArgs// : EventArgs, IPoolResettable
+public struct PacketReceivedEventArgs
 {
     /// <summary>
     /// The connection that sent the payload.
@@ -27,6 +28,8 @@ public struct PacketReceivedEventArgs// : EventArgs, IPoolResettable
     /// True if the packet was delivered via the reliable channel.
     /// </summary>
     public bool IsReliable { get; private set; }
+
+    public PacketReceivedEventArgs() { }
 
     /// <summary>
     /// Initialises a new instance of <see cref="PacketReceivedEventArgs"/>.
