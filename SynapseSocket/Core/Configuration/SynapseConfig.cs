@@ -1,5 +1,6 @@
 ﻿using System.Collections.Generic;
 using System.Net;
+using SynapseSocket.Diagnostics;
 using SynapseSocket.Security;
 
 namespace SynapseSocket.Core.Configuration;

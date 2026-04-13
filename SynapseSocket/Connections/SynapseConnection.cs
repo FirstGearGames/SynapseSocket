@@ -6,6 +6,7 @@ using System.Net;
 using CodeBoost.CodeAnalysis;
 using CodeBoost.Extensions;
 using CodeBoost.Performance;
+using SynapseSocket.Core;
 using SynapseSocket.Packets;
 using SynapseSocket.Security;
 
@@ -14,49 +15,66 @@ namespace SynapseSocket.Connections;
 /// <summary>
 /// Represents the state of a single remote peer session, including reliable send/receive windows, keep-alive timestamps, and signature binding.
 /// </summary>
-public sealed class SynapseConnection
+/// <remarks>This reference is not automatically pooled but is never used again once <see cref="SynapseManager.ConnectionClosed"/>is invoked. Consider using <see cref="ResettableObjectPool{T0}.Return"/> on this connection once closed.</remarks>
+//todo add connectionremoved event and clean up automatically at that point. remove comments above. make it known whn event dispatches connection is pooled and should not have its reference retained.
+public sealed class SynapseConnection : IPoolResettable
 {
     /// <summary>
     /// Remote endpoint of this connection.
     /// </summary>
-    public IPEndPoint RemoteEndPoint { get; }
+    [PoolResettableMember]
+    public IPEndPoint RemoteEndPoint { get; private set; }
     /// <summary>
     /// The computed signature binding this connection to a physical identity.
     /// </summary>
-    public ulong Signature { get; }
+    [PoolResettableMember]
+    public ulong Signature { get; private set; }
+    /// <summary>
+    /// Index of this connection within <see cref="ConnectionManager._connections"/>.
+    /// </summary>
+    [PoolResettableMember]
+    public int ConnectionsIndex { get; internal set; } = UnsetConnectionsIndex;
     /// <summary>
     /// Current lifecycle state.
     /// </summary>
+    [PoolResettableMember]
     public ConnectionState State { get; internal set; }
     /// <summary>
     /// UTC ticks of the last received packet from this peer.
     /// </summary>
+    [PoolResettableMember]
     public long LastReceivedTicks { get; internal set; }
     /// <summary>
     /// UTC ticks of the last sent keep-alive to this peer.
     /// </summary>
+    [PoolResettableMember]
     public long LastKeepAliveSentTicks { get; internal set; }
     /// <summary>
     /// Number of consecutive keep-alives sent since the last received packet.
     /// Used to compute exponential backoff on the keep-alive send interval.
     /// Reset to zero whenever any inbound packet is received from this peer.
     /// </summary>
+    [PoolResettableMember]
     internal int UnansweredKeepAlives;
     /// <summary>
     /// Next outbound reliable sequence number.
     /// </summary>
+    [PoolResettableMember]
     internal ushort NextOutgoingSequence;
     /// <summary>
     /// Next expected inbound reliable sequence number (for ordered delivery).
     /// </summary>
+    [PoolResettableMember]
     internal ushort NextExpectedSequence;
     /// <summary>
     /// Pending unacked reliable packets keyed by sequence.
     /// </summary>
+    [PoolResettableMember]
     internal readonly ConcurrentDictionary<ushort, PendingReliable> PendingReliableQueue = [];
     /// <summary>
     /// Out-of-order reliable packets awaiting delivery.
     /// </summary>
+    [PoolResettableMember]
     internal readonly Dictionary<ushort, ArraySegment<byte>> ReorderBuffer = [];
     /// <summary>
     /// Gate for reorder buffer and sequence manipulation.
@@ -66,29 +84,39 @@ public sealed class SynapseConnection
     /// Rate bucket for this connection. Assigned on establishment when rate limiting is enabled; null otherwise.
     /// Lifetime is tied to the connection — no separate eviction needed.
     /// </summary>
+    [PoolResettableMember]
     internal SecurityProvider.RateBucket? RateBucket;
     /// <summary>
     /// Send-side splitter, rented from <see cref="CodeBoost.Performance.ResettableObjectPool{T}"/>
     /// on the first segmented send and returned to the pool on disconnect.
     /// Null until the first segmented send is issued on this connection.
     /// </summary>
+    [PoolResettableMember]
     internal PacketSplitter? Splitter;
     /// <summary>
     /// Receive-side reassembler, rented from <see cref="CodeBoost.Performance.ResettableObjectPool{T}"/>
     /// on the first segmented receive and returned to the pool on disconnect.
     /// Null until the first segmented packet is received on this connection.
     /// </summary>
+    [PoolResettableMember]
     internal PacketReassembler? Reassembler;
+    /// <summary>
+    /// Value used when ConnectionsIndex is not set.
+    /// </summary>
+    public const int UnsetConnectionsIndex = -1;
+    
+    public SynapseConnection() { }
 
     /// <summary>
     /// Creates a new connection record.
     /// </summary>
     /// <param name="remoteEndPoint">The peer's remote endpoint.</param>
     /// <param name="signature">The 64-bit signature that uniquely identifies this peer.</param>
-    public SynapseConnection(IPEndPoint remoteEndPoint, ulong signature)
+    public void Initialize(IPEndPoint remoteEndPoint, ulong signature, int connectionsIndex)
     {
         RemoteEndPoint = remoteEndPoint ?? throw new ArgumentNullException(nameof(remoteEndPoint));
         Signature = signature;
+        ConnectionsIndex = connectionsIndex;
         State = ConnectionState.Pending;
         LastReceivedTicks = DateTime.UtcNow.Ticks;
     }
@@ -213,5 +241,12 @@ public sealed class SynapseConnection
             ReleasePendingReliable(entry.Value);
 
         synapseConnection.PendingReliableQueue.Clear();
+    }
+
+    public void OnReturn()
+    {
+    }
+    public void OnRent()
+    {
     }
 }

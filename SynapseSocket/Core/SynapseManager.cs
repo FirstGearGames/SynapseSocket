@@ -80,12 +80,12 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     public bool IsRunning => _isStarted && !_isDisposed;
     private bool _isStarted;
-#if PERFTEST
+    #if PERFTEST
     /// <summary>
     /// Internal performance counters for hot-path timing. DEBUG builds only.
     /// </summary>
     internal PerfCounters Perf { get; } = new();
-#endif
+    #endif
     private bool _isDisposed;
     private readonly LatencySimulator _latencySimulator;
     private readonly bool _isSegmentingEnabled;
@@ -174,9 +174,9 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         foreach (Socket socket in _sockets)
         {
             IngressEngine ingressEngine = new(socket, Config, Security, Connections, _sender, Telemetry
-#if PERFTEST
+                #if PERFTEST
                 , Perf
-#endif
+                #endif
             );
             ingressEngine.PayloadDelivered += OnPayloadDelivered;
             ingressEngine.ConnectionEstablished += OnConnectionEstablishedInternal;
@@ -230,7 +230,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             throw new InvalidOperationException("Remote endpoint is blacklisted.");
         }
 
-        SynapseConnection synapseConnection = Connections.GetOrAdd(endPoint, signature, (remoteEndPoint, remoteSignature) => new(remoteEndPoint, remoteSignature));
+        SynapseConnection synapseConnection = Connections.GetOrAdd(endPoint, signature);
         synapseConnection.RateBucket ??= Security.CreateRateBucket();
 
         await _sender.SendHandshakeAsync(endPoint, cancellationToken).ConfigureAwait(false);
@@ -257,10 +257,10 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         if (payload.Count <= _maximumUnsegmentedPayload)
         {
             if (isReliable)
-                await _sender!.SendReliableUnsegmentedAsync(synapseConnection, payload, cancellationToken).ConfigureAwait(false); 
+                await _sender!.SendReliableUnsegmentedAsync(synapseConnection, payload, cancellationToken).ConfigureAwait(false);
             else
                 await _sender!.SendUnreliableUnsegmentedAsync(synapseConnection, payload, cancellationToken).ConfigureAwait(false);
-            
+
             RaisePacketSent(synapseConnection.RemoteEndPoint, payload, isReliable);
 
             return;
@@ -280,10 +280,10 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             if (unreliableSegmentMode is UnreliableSegmentMode.Disabled)
                 throw new InvalidOperationException($"Unreliable payload ({payload.Count} bytes) exceeds the MTU-based limit ({_maximumUnsegmentedPayload} bytes). Set UnreliableSegmentMode or reduce payload size.");
 
-            //Make reliable if the unreliableSegmentMode permits.
+            // Make reliable if the unreliableSegmentMode permits.
             isReliable = unreliableSegmentMode is UnreliableSegmentMode.SegmentReliable;
         }
-        
+
         await _sender!.SendSegmentedAsync(synapseConnection, payload, isReliable, GetOrRentSplitter(synapseConnection), cancellationToken).ConfigureAwait(false);
         RaisePacketSent(synapseConnection.RemoteEndPoint, payload, isReliable);
     }

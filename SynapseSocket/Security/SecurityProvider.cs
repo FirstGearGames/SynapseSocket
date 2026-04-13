@@ -1,6 +1,9 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Net;
+using System.Threading;
+using SynapseSocket.Core.Configuration;
+using SynapseSocket.Diagnostics;
 
 namespace SynapseSocket.Security;
 
@@ -23,10 +26,6 @@ public sealed class SecurityProvider
     /// </summary>
     private readonly uint _maximumPacketsPerSecond;
     /// <summary>
-    /// Maximum number of bytes a single peer may send per second. Zero disables byte rate limiting.
-    /// </summary>
-    private readonly uint _maximumBytesPerSecond;
-    /// <summary>
     /// Maximum permitted size of a single incoming packet in bytes. Packets exceeding this are rejected.
     /// </summary>
     private readonly uint _maximumPacketSize;
@@ -47,7 +46,6 @@ public sealed class SecurityProvider
     {
         SignatureProvider = signatureProvider ?? throw new ArgumentNullException(nameof(signatureProvider));
         _maximumPacketsPerSecond = maximumPacketsPerSecond;
-        _maximumBytesPerSecond = maximumBytesPerSecond;
         _maximumPacketSize = maximumPacketSize;
     }
 
@@ -62,7 +60,7 @@ public sealed class SecurityProvider
     {
         if (!SignatureProvider.TryCompute(endPoint, handshakePayload, out ulong signature))
             return UnsetSignature;
-        
+
         return signature;
     }
 
@@ -101,29 +99,34 @@ public sealed class SecurityProvider
     /// Assign the result to <see cref="SynapseSocket.Connections.SynapseConnection.RateBucket"/> when a connection is established.
     /// </summary>
     /// <returns>A new <see cref="RateBucket"/>, or null if rate limiting is disabled.</returns>
-    internal RateBucket? CreateRateBucket() =>
-        _maximumPacketsPerSecond == 0 && _maximumBytesPerSecond == 0 ? null : new RateBucket();
+    internal RateBucket? CreateRateBucket() => _maximumPacketsPerSecond == 0 ? null : new RateBucket();
 
-    internal FilterResult InspectEstablished(int packetLength, RateBucket? rateBucket)
+    internal FilterResult InspectEstablished(long nowTicks, int packetLength, RateBucket? rateBucket)
     {
-        if (packetLength <= 0 || (uint)packetLength > _maximumPacketSize)
+        if (packetLength <= 0 || packetLength > _maximumPacketSize)
             return FilterResult.Oversized;
 
-        if (rateBucket is null)
+        /* Bytes per second are intentionally not checked. Maximum packet size with maximum
+         * packets per second is sufficient. */
+        if (_maximumPacketsPerSecond == SynapseConfig.UnsetMaximumPacketsPerSecond)
+            return FilterResult.Allowed;
+        
+        if (rateBucket is null || rateBucket.Allow(nowTicks, packetLength, _maximumPacketsPerSecond))
             return FilterResult.Allowed;
 
-        return rateBucket.Allow(packetLength, _maximumPacketsPerSecond, _maximumBytesPerSecond) ? FilterResult.Allowed : FilterResult.RateLimited;
+        return FilterResult.RateLimited;
     }
 
     /// <summary>
     /// Lowest-level filter for packets from an unknown or not-yet-established sender.
     /// Computes the signature (so violation reports carry the correct peer identity even for rejected packets), checks the blacklist, then delegates to <see cref="InspectEstablished"/> for size and rate-limit enforcement.
     /// </summary>
+    /// <param name="nowTicks">Current timestamp in <see cref="System.DateTime.Ticks"/>.</param>
     /// <param name="endPoint">The remote endpoint the packet arrived from.</param>
     /// <param name="packetLength">Length of the received packet in bytes.</param>
     /// <param name="signature">The computed peer signature, or <see cref="UnsetSignature"/> on failure.</param>
     /// <returns>A <see cref="FilterResult"/> indicating whether the packet should be processed or dropped.</returns>
-    public FilterResult InspectNew(IPEndPoint endPoint, int packetLength, out ulong signature)
+    public FilterResult InspectNew(long nowTicks, IPEndPoint endPoint, int packetLength, out ulong signature)
     {
         // Reject immediately if the signature cannot be computed or resolves to the unset sentinel.
         // Without a valid identity we cannot rate-limit, blacklist, or attribute a violation correctly, so there is nothing useful we can do with the packet.
@@ -136,7 +139,7 @@ public sealed class SecurityProvider
         if (_blacklist.ContainsKey(signature))
             return FilterResult.Blacklisted;
 
-        return InspectEstablished(packetLength, null);
+        return InspectEstablished(nowTicks, packetLength, rateBucket: null);
     }
 
     /// <summary>
@@ -147,57 +150,67 @@ public sealed class SecurityProvider
     internal sealed class RateBucket
     {
         /// <summary>
-        /// Tick timestamp of the most recent access, used for stale-entry eviction.
-        /// </summary>
-        public long LastAccessTicks;
-        /// <summary>
         /// Tick timestamp marking the start of the current one-second rate window.
         /// </summary>
-        private long _windowStartTicks;
+        private long _passedTicks;
         /// <summary>
         /// Number of packets admitted in the current rate window.
         /// </summary>
         private uint _packetCount;
-        /// <summary>
-        /// Number of bytes admitted in the current rate window.
-        /// </summary>
-        private uint _byteCount;
-        /// <summary>
-        /// Synchronisation guard for the sliding-window state.
-        /// </summary>
-        private readonly object _lock = new();
+
+        public void RollRates(long updateInterval)
+        {
+            
+            if (nowTicks - _passedTicks >= TimeSpan.TicksPerSecond)
+            {
+                _passedTicks = nowTicks;
+                _packetCount = 0;
+                _byteCount = 0;
+            }
+
+        }
 
         /// <summary>
         /// Returns true if the endpoint may send this packet within the current window, incrementing both counters; returns false when either limit has been reached.
         /// </summary>
+        /// <param name="nowTicks">Current timestamp in <see cref="System.DateTime.Ticks"/>.</param>
         /// <param name="packetLength">Size of the incoming packet in bytes.</param>
         /// <param name="maximumPacketsPerSecond">Maximum packets per second; zero disables packet rate limiting.</param>
         /// <param name="maximumBytesPerSecond">Maximum bytes per second; zero disables byte rate limiting.</param>
         /// <returns>True if the packet is within both rate limits; false if either limit has been exceeded.</returns>
-        public bool Allow(int packetLength, uint maximumPacketsPerSecond, uint maximumBytesPerSecond)
+        public bool Allow(long nowTicks, int packetLength, uint maximumPacketsPerSecond, uint maximumBytesPerSecond)
         {
-            lock (_lock)
-            {
-                long nowTicks = DateTime.UtcNow.Ticks;
                 LastAccessTicks = nowTicks;
-
-                if (nowTicks - _windowStartTicks >= TimeSpan.TicksPerSecond)
-                {
-                    _windowStartTicks = nowTicks;
-                    _packetCount = 0;
-                    _byteCount = 0;
-                }
 
                 if (maximumPacketsPerSecond > 0 && _packetCount >= maximumPacketsPerSecond)
                     return false;
 
-                if (maximumBytesPerSecond > 0 && _byteCount + (uint)packetLength > maximumBytesPerSecond)
+                if (maximumBytesPerSecond > 0 && _byteCount + packetLength > maximumBytesPerSecond)
                     return false;
+
+                return true;
 
                 _packetCount++;
                 _byteCount += (uint)packetLength;
                 return true;
             }
+
+            LastAccessTicks = nowTicks;
+
+            if (nowTicks - _windowStartTicks >= TimeSpan.TicksPerSecond)
+            {
+                _passedTicks = nowTicks;
+                _packetCount = 0;
+                _byteCount = 0;
+            }
+
+            if (maximumPacketsPerSecond > 0 && _packetCount >= maximumPacketsPerSecond)
+                return false;
+
+            if (maximumBytesPerSecond > 0 && _byteCount + packetLength > maximumBytesPerSecond)
+                return false;
+
+            return true;
         }
     }
 }

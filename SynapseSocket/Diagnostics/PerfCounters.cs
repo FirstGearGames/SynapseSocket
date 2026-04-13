@@ -13,7 +13,6 @@ namespace SynapseSocket.Diagnostics;
 internal sealed class PerfCounters
 {
     // ── Full maintenance tick ────────────────────────────────────────────────
-
     /// <summary>
     /// Stopwatch ticks elapsed during the most recent full maintenance loop iteration.
     /// </summary>
@@ -28,7 +27,6 @@ internal sealed class PerfCounters
     public long MaintenanceTickCallCount;
 
     // ── ProgressiveKeepAliveSweep ────────────────────────────────────────────
-
     /// <summary>
     /// Stopwatch ticks elapsed during the most recent keep-alive sweep.
     /// </summary>
@@ -43,7 +41,6 @@ internal sealed class PerfCounters
     public long KeepAliveSweepCallCount;
 
     // ── ReliableRetransmitSweep ──────────────────────────────────────────────
-
     /// <summary>
     /// Stopwatch ticks elapsed during the most recent reliable-retransmit sweep.
     /// </summary>
@@ -58,7 +55,6 @@ internal sealed class PerfCounters
     public long ReliableRetransmitSweepCallCount;
 
     // ── SegmentAssemblyTimeoutSweep ──────────────────────────────────────────
-
     /// <summary>
     /// Stopwatch ticks elapsed during the most recent segment-assembly timeout sweep.
     /// </summary>
@@ -73,7 +69,6 @@ internal sealed class PerfCounters
     public long SegmentAssemblyTimeoutSweepCallCount;
 
     // ── AckBatchFlushSweep ───────────────────────────────────────────────────
-
     /// <summary>
     /// Stopwatch ticks elapsed during the most recent ACK batch flush sweep.
     /// </summary>
@@ -88,7 +83,6 @@ internal sealed class PerfCounters
     public long AckBatchFlushSweepCallCount;
 
     // ── RemoveExpiredRateBuckets ─────────────────────────────────────────────
-
     /// <summary>
     /// Stopwatch ticks elapsed during the most recent rate-bucket cleanup sweep.
     /// </summary>
@@ -103,7 +97,6 @@ internal sealed class PerfCounters
     public long RateBucketCleanupCallCount;
 
     // ── ProcessPacket (per datagram) ─────────────────────────────────────────
-
     /// <summary>
     /// Stopwatch ticks elapsed during the most recent packet processing call.
     /// </summary>
@@ -118,7 +111,6 @@ internal sealed class PerfCounters
     public long ProcessPacketCallCount;
 
     // ── DeliverOrdered lock section (per reliable packet) ────────────────────
-
     /// <summary>
     /// Stopwatch ticks elapsed inside the ordered-delivery lock during the most recent call.
     /// </summary>
@@ -133,7 +125,6 @@ internal sealed class PerfCounters
     public long DeliverOrderedCallCount;
 
     // ── DeliverOrdered callbacks (outside lock, per reliable packet) ──────────
-
     /// <summary>
     /// Stopwatch ticks elapsed in the PayloadDelivered callback loop in DeliverOrdered during the most recent call.
     /// </summary>
@@ -148,7 +139,6 @@ internal sealed class PerfCounters
     public long DeliverOrderedCallbacksCallCount;
 
     // ── DateTimeUtcNow (per datagram) ────────────────────────────────────────
-
     /// <summary>
     /// Stopwatch ticks elapsed during the most recent DateTime.UtcNow.Ticks call in the receive loop.
     /// </summary>
@@ -163,7 +153,6 @@ internal sealed class PerfCounters
     public long DateTimeUtcNowCallCount;
 
     // ── SecurityFilter (per datagram) ────────────────────────────────────────
-
     /// <summary>
     /// Stopwatch ticks elapsed during the most recent security filter (connection lookup + rate/size check) in the receive loop.
     /// </summary>
@@ -176,24 +165,8 @@ internal sealed class PerfCounters
     /// Number of security filter calls recorded.
     /// </summary>
     public long SecurityFilterCallCount;
-
-    // ── SecurityFilter TryGet (per datagram) ─────────────────────────────────
-
-    /// <summary>
-    /// Stopwatch ticks elapsed during the most recent connection table lookup inside the security filter.
-    /// </summary>
-    public long SecurityFilterTryGetLastElapsedTicks;
-    /// <summary>
-    /// Cumulative Stopwatch ticks spent in the connection table lookup inside the security filter across all datagrams.
-    /// </summary>
-    public long SecurityFilterTryGetTotalElapsedTicks;
-    /// <summary>
-    /// Number of security filter connection table lookups recorded.
-    /// </summary>
-    public long SecurityFilterTryGetCallCount;
-
+    
     // ── SecurityFilter Inspect (per datagram) ────────────────────────────────
-
     /// <summary>
     /// Stopwatch ticks elapsed during the most recent InspectEstablished/InspectNew call inside the security filter.
     /// </summary>
@@ -208,7 +181,6 @@ internal sealed class PerfCounters
     public long SecurityFilterInspectCallCount;
 
     // ── HeaderParse ──────────────────────────────────────────────────────────
-
     /// <summary>
     /// Stopwatch ticks elapsed during the most recent PacketHeader.Read call.
     /// </summary>
@@ -223,7 +195,6 @@ internal sealed class PerfCounters
     public long HeaderParseCallCount;
 
     // ── ConnectionLookup ─────────────────────────────────────────────────────
-
     /// <summary>
     /// Stopwatch ticks elapsed during the most recent connection table lookup in ProcessPacket.
     /// </summary>
@@ -238,7 +209,6 @@ internal sealed class PerfCounters
     public long ConnectionLookupCallCount;
 
     // ── PayloadCopy ──────────────────────────────────────────────────────────
-
     /// <summary>
     /// Stopwatch ticks elapsed during the most recent Buffer.BlockCopy of a received payload.
     /// </summary>
@@ -253,7 +223,6 @@ internal sealed class PerfCounters
     public long PayloadCopyCallCount;
 
     // ── EnqueueOrSendAck ─────────────────────────────────────────────────────
-
     /// <summary>
     /// Stopwatch ticks elapsed during the most recent EnqueueOrSendAck call.
     /// </summary>
@@ -268,7 +237,6 @@ internal sealed class PerfCounters
     public long EnqueueOrSendAckCallCount;
 
     // ── PayloadDeliveredCallback (unreliable / None path) ────────────────────
-
     /// <summary>
     /// Stopwatch ticks elapsed in the PayloadDelivered callback for the most recent unreliable packet.
     /// </summary>
@@ -281,7 +249,10 @@ internal sealed class PerfCounters
     /// Number of completed PayloadDelivered callbacks on the unreliable path.
     /// </summary>
     public long PayloadDeliveredCallbackCallCount;
-
+    /// <summary>
+    /// Number of times to run perf encapsulated task in a loop.
+    /// </summary>
+    public const int IterationMultiplier = 200; //Fails frequently over 200; not sure why. Tried generously increasing MaximumPacketsPerSecond, issue seems to be in SecurityProvider.Allow().
     // ── Methods ──────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -289,8 +260,7 @@ internal sealed class PerfCounters
     /// </summary>
     /// <param name="ticks">Elapsed ticks from <see cref="Stopwatch.GetTimestamp"/>.</param>
     /// <returns>Elapsed time in milliseconds.</returns>
-    public static double TicksToMilliseconds(long ticks) =>
-        (double)ticks / Stopwatch.Frequency * 1000.0;
+    public static double TicksToMilliseconds(long ticks) => (double)ticks / Stopwatch.Frequency * 1000.0;
 
     /// <summary>
     /// Records a completed full maintenance loop iteration.
@@ -380,16 +350,6 @@ internal sealed class PerfCounters
         Interlocked.Exchange(ref DeliverOrderedCallbacksLastElapsedTicks, elapsedTicks);
         Interlocked.Add(ref DeliverOrderedCallbacksTotalElapsedTicks, elapsedTicks);
         Interlocked.Increment(ref DeliverOrderedCallbacksCallCount);
-    }
-
-    /// <summary>
-    /// Records the connection table lookup inside the security filter.
-    /// </summary>
-    internal void RecordSecurityFilterTryGet(long elapsedTicks)
-    {
-        Interlocked.Exchange(ref SecurityFilterTryGetLastElapsedTicks, elapsedTicks);
-        Interlocked.Add(ref SecurityFilterTryGetTotalElapsedTicks, elapsedTicks);
-        Interlocked.Increment(ref SecurityFilterTryGetCallCount);
     }
 
     /// <summary>

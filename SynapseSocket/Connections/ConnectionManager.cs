@@ -2,6 +2,7 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
+using CodeBoost.Performance;
 using SynapseSocket.Core.Events;
 
 namespace SynapseSocket.Connections;
@@ -16,19 +17,23 @@ public sealed class ConnectionManager
     /// Current live connection count.
     /// </summary>
     public int Count => _byEndPoint.Count;
-
     /// <summary>
     /// Raised when two connections produce the same 64-bit signature (birthday-bound collision).
     /// The newer connection wins the reverse-lookup slot. Subscribe for telemetry; no corrective action is taken automatically.
     /// </summary>
     public event SignatureCollisionDelegate? SignatureCollisionDetected;
-
-    private readonly ConcurrentDictionary<EndPointKey, SynapseConnection> _byEndPoint = [];
-
     /// <summary>
-    /// Reverse lookup: maps a connection's 64-bit signature to its <see cref="SynapseConnection"/>.
+    /// Maps a connection's EndPointKey to its <see cref="SynapseConnection"/>.
+    /// </summary>
+    private readonly ConcurrentDictionary<EndPointKey, SynapseConnection> _byEndPoint = [];
+    /// <summary>
+    /// Maps a connection's 64-bit signature to its <see cref="SynapseConnection"/>.
     /// </summary>
     private readonly ConcurrentDictionary<ulong, SynapseConnection> _bySignature = [];
+    /// <summary>
+    /// Connections as an index-based collection.
+    /// </summary>
+    private readonly List<SynapseConnection> _connections = [];
 
     /// <summary>
     /// Tries to find an existing connection by its remote endpoint.
@@ -47,8 +52,7 @@ public sealed class ConnectionManager
     /// <param name="signature">The 64-bit signature to look up.</param>
     /// <param name="connection">When this method returns, contains the matching connection, or null if not found.</param>
     /// <returns>True if a connection was found for the given signature; otherwise false.</returns>
-    public bool TryGetBySignature(ulong signature, out SynapseConnection? connection)
-        => _bySignature.TryGetValue(signature, out connection);
+    public bool TryGetBySignature(ulong signature, out SynapseConnection? connection) => _bySignature.TryGetValue(signature, out connection);
 
     /// <summary>
     /// Registers a new connection.
@@ -58,10 +62,20 @@ public sealed class ConnectionManager
     /// <param name="signature">The 64-bit signature associated with the peer.</param>
     /// <param name="factory">Factory invoked to create a new connection if one does not already exist for the given endpoint.</param>
     /// <returns>The existing connection for the endpoint, or the newly created one.</returns>
-    public SynapseConnection GetOrAdd(IPEndPoint endPoint, ulong signature, Func<IPEndPoint, ulong, SynapseConnection> factory)
+    public SynapseConnection GetOrAdd(IPEndPoint endPoint, ulong signature)
     {
         EndPointKey endPointKey = new(endPoint);
-        SynapseConnection synapseConnection = _byEndPoint.GetOrAdd(endPointKey, _ => factory(endPoint, signature));
+
+        if (!_byEndPoint.TryGetValue(endPointKey, out SynapseConnection synapseConnection))
+        {
+            synapseConnection = ResettableObjectPool<SynapseConnection>.Rent();
+
+            int connectionsIndex = _connections.Count;
+            synapseConnection.Initialize(endPoint, signature, connectionsIndex);
+
+            _byEndPoint[endPointKey] = synapseConnection;
+            _connections.Add(synapseConnection);
+        }
 
         if (!_bySignature.TryAdd(signature, synapseConnection))
         {
@@ -70,6 +84,7 @@ public sealed class ConnectionManager
             _bySignature[signature] = synapseConnection;
             SignatureCollisionDetected?.Invoke(signature);
         }
+
         return synapseConnection;
     }
 
@@ -83,7 +98,32 @@ public sealed class ConnectionManager
     {
         bool isRemoved = _byEndPoint.TryRemove(new(endPoint), out removedSynapseConnection);
 
-        if (isRemoved && removedSynapseConnection is not null) _bySignature.TryRemove(removedSynapseConnection.Signature, out _);
+        if (isRemoved && removedSynapseConnection is not null)
+        {
+            _bySignature.TryRemove(removedSynapseConnection.Signature, out _);
+
+            int connectionsIndex = removedSynapseConnection.ConnectionsIndex;
+            if (connectionsIndex is not SynapseConnection.UnsetConnectionsIndex)
+            {
+                int lastConnectionsIndex = _connections.Count - 1;
+
+                /* If connectionsIndex is the not last entry then
+                 * move the last connections entry to connectionsIndex
+                 * and update the ConnectionsIndex member for the moved
+                 * connection. */
+                if (connectionsIndex < lastConnectionsIndex)
+                {
+                    SynapseConnection otherConnection = _connections[lastConnectionsIndex];
+                    otherConnection.ConnectionsIndex = connectionsIndex;
+
+                    _connections[connectionsIndex] = otherConnection;
+                    removedSynapseConnection.ConnectionsIndex = SynapseConnection.UnsetConnectionsIndex;
+                }
+
+                _connections.RemoveAt(connectionsIndex);
+            }
+        }
+
         return isRemoved;
     }
 
@@ -92,6 +132,7 @@ public sealed class ConnectionManager
     /// Snapshot is taken at call time.
     /// </summary>
     /// <returns>A sequence containing all active <see cref="SynapseConnection"/> instances at the moment of enumeration.</returns>
+    //todo replace this with iteratable version. see if other timed checks can be done here, such as keep alive.
     public IEnumerable<SynapseConnection> Snapshot()
     {
         foreach (KeyValuePair<EndPointKey, SynapseConnection> keyValuePair in _byEndPoint)
@@ -112,7 +153,10 @@ public sealed class ConnectionManager
         /// Initializes a new <see cref="EndPointKey"/> wrapping the given endpoint.
         /// </summary>
         /// <param name="endPoint">The remote endpoint to wrap.</param>
-        public EndPointKey(IPEndPoint endPoint) { _endPoint = endPoint; }
+        public EndPointKey(IPEndPoint endPoint)
+        {
+            _endPoint = endPoint;
+        }
 
         /// <summary>
         /// Compares this key to another by address and port.
@@ -121,7 +165,8 @@ public sealed class ConnectionManager
         /// <returns>True if both keys represent the same address and port; otherwise false.</returns>
         public bool Equals(EndPointKey other)
         {
-            if (_endPoint is null || other._endPoint is null) return ReferenceEquals(_endPoint, other._endPoint);
+            if (_endPoint is null || other._endPoint is null)
+                return ReferenceEquals(_endPoint, other._endPoint);
 
             return _endPoint.Port == other._endPoint.Port && _endPoint.Address.Equals(other._endPoint.Address);
         }

@@ -55,12 +55,12 @@ public sealed partial class IngressEngine
     /// Telemetry counters for this engine.
     /// </summary>
     private readonly Telemetry _telemetry;
-#if PERFTEST
+    #if PERFTEST
     /// <summary>
     /// Performance counters for hot-path timing. DEBUG builds only.
     /// </summary>
     private readonly PerfCounters _perfCounters;
-#endif
+    #endif
     /// <summary>
     /// Tracks the last probe-response tick per source IP to enforce the per-address rate limit.
     /// </summary>
@@ -111,7 +111,6 @@ public sealed partial class IngressEngine
     /// Raised when an unexpected exception escapes the receive loop.
     /// </summary>
     public event UnhandledExceptionDelegate? UnhandledException;
-
     private const string ViolationSegmentAssemblyOversized = "Declared segment assembly size exceeds MaximumReassembledPacketSize.";
     private const string ViolationSegmentMismatch = "Segment resent with mismatched segment count or reliability flag.";
     private const string ViolationReorderBufferExceeded = "Reorder buffer capacity exceeded.";
@@ -126,9 +125,9 @@ public sealed partial class IngressEngine
     /// <param name="sender">Transmission engine used to emit acknowledgements and handshake responses.</param>
     /// <param name="telemetry">Telemetry counters for this engine instance.</param>
     internal IngressEngine(Socket socket, SynapseConfig config, SecurityProvider security, ConnectionManager connections, TransmissionEngine sender, Telemetry telemetry
-#if PERFTEST
+        #if PERFTEST
         , PerfCounters perfCounters
-#endif
+        #endif
     )
     {
         _socket = socket;
@@ -138,9 +137,9 @@ public sealed partial class IngressEngine
         _sender = sender;
         _telemetry = telemetry;
         System.Security.Cryptography.RandomNumberGenerator.Fill(_natChallengeSecret);
-#if PERFTEST
+        #if PERFTEST
         _perfCounters = perfCounters;
-#endif
+        #endif
     }
 
     /// <summary>
@@ -196,44 +195,48 @@ public sealed partial class IngressEngine
 
                 IPEndPoint fromEndPoint = (IPEndPoint)socketReceiveResult.RemoteEndPoint;
                 int receivedLength = socketReceiveResult.ReceivedBytes;
-#if PERFTEST
+                #if PERFTEST
                 long utcNowStart = Stopwatch.GetTimestamp();
-#endif
+                #endif
                 long nowTicks = DateTime.UtcNow.Ticks;
-#if PERFTEST
+                #if PERFTEST
                 _perfCounters.RecordDateTimeUtcNow(Stopwatch.GetTimestamp() - utcNowStart);
-#endif
+                #endif
 
                 // Lowest-level mitigation first, before any copy.
                 // Established connections skip signature recomputation and blacklist lookup — those only apply at handshake time. Size and rate-limit checks still run for all senders.
                 FilterResult filterResult;
                 ulong signature;
-#if PERFTEST
+                #if PERFTEST
                 long securityFilterStart = Stopwatch.GetTimestamp();
                 long securityTryGetStart = Stopwatch.GetTimestamp();
-#endif
+                #endif
                 bool isEstablished = _connections.TryGet(fromEndPoint, out SynapseConnection? synapseConnection) && synapseConnection is not null;
-#if PERFTEST
-                _perfCounters.RecordSecurityFilterTryGet(Stopwatch.GetTimestamp() - securityTryGetStart);
+                #if PERFTEST
                 long securityInspectStart = Stopwatch.GetTimestamp();
-#endif
+                #endif
                 if (isEstablished)
                 {
-                    signature = synapseConnection!.Signature;
-                    filterResult = _security.InspectEstablished(receivedLength, synapseConnection.RateBucket);
+                    signature = 0;
+                    filterResult = FilterResult.Allowed;
+                    for (int i = 0; i < PerfCounters.IterationMultiplier; i++)
+                    {
+                        signature = synapseConnection!.Signature;
+                        filterResult = _security.InspectEstablished(nowTicks, receivedLength, synapseConnection.RateBucket);
+                    }
                 }
                 else
-                    filterResult = _security.InspectNew(fromEndPoint, receivedLength, out signature);
-#if PERFTEST
+                    filterResult = _security.InspectNew(nowTicks, fromEndPoint, receivedLength, out signature);
+                #if PERFTEST
                 _perfCounters.RecordSecurityFilterInspect(Stopwatch.GetTimestamp() - securityInspectStart);
                 _perfCounters.RecordSecurityFilter(Stopwatch.GetTimestamp() - securityFilterStart);
-#endif
+                #endif
 
-                if (filterResult != FilterResult.Allowed)
+                if (filterResult is not FilterResult.Allowed) 
                 {
                     _telemetry.OnDroppedIn();
 
-                    if (filterResult == FilterResult.Blacklisted)
+                    if (filterResult is FilterResult.Blacklisted)
                     {
                         // Blacklisted = REJECTION, not a per-packet violation.
                         // The peer is already known-bad; surface a connection-rejected event.
@@ -252,13 +255,13 @@ public sealed partial class IngressEngine
                 }
 
                 _telemetry.OnReceived(receivedLength);
-#if PERFTEST
+                #if PERFTEST
                 long processPacketStart = Stopwatch.GetTimestamp();
-#endif
+                #endif
                 ProcessPacket(rentedBuffer, receivedLength, fromEndPoint, synapseConnection, nowTicks, cancellationToken, ref isPayloadCopied);
-#if PERFTEST
+                #if PERFTEST
                 _perfCounters.RecordProcessPacket(Stopwatch.GetTimestamp() - processPacketStart);
-#endif
+                #endif
             }
             catch (OperationCanceledException)
             {
@@ -277,6 +280,7 @@ public sealed partial class IngressEngine
                     ArrayPool<byte>.Shared.Return(rentedBuffer, clearArray: false);
             }
         }
+
         IsRunning = false;
     }
 
@@ -301,13 +305,13 @@ public sealed partial class IngressEngine
 
         try
         {
-#if PERFTEST
+            #if PERFTEST
             long headerParseStart = Stopwatch.GetTimestamp();
-#endif
+            #endif
             headerSize = PacketHeader.Read(buffer.AsSpan(0, length), out type, out sequence, out segmentId, out segmentIndex, out segmentCount);
-#if PERFTEST
+            #if PERFTEST
             _perfCounters.RecordHeaderParse(Stopwatch.GetTimestamp() - headerParseStart);
-#endif
+            #endif
         }
         catch
         {
@@ -381,10 +385,7 @@ public sealed partial class IngressEngine
             if (segmentCount * _config.MaximumTransmissionUnit > _config.MaximumReassembledPacketSize)
             {
                 _telemetry.OnDroppedIn();
-                ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature,
-                    ViolationReason.Oversized, length,
-                    ViolationSegmentAssemblyOversized,
-                    ViolationAction.KickAndBlacklist);
+                ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Oversized, length, ViolationSegmentAssemblyOversized, ViolationAction.KickAndBlacklist);
                 return;
             }
         }
@@ -394,21 +395,21 @@ public sealed partial class IngressEngine
             case PacketType.Reliable:
             {
                 byte[] payloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
-#if PERFTEST
+                #if PERFTEST
                 long payloadCopyStart = Stopwatch.GetTimestamp();
-#endif
+                #endif
                 Buffer.BlockCopy(buffer, headerSize, payloadBuffer, 0, payloadLength);
-#if PERFTEST
+                #if PERFTEST
                 _perfCounters.RecordPayloadCopy(Stopwatch.GetTimestamp() - payloadCopyStart);
-#endif
+                #endif
                 ArraySegment<byte> payload = new(payloadBuffer, 0, payloadLength);
-#if PERFTEST
+                #if PERFTEST
                 long ackStart = Stopwatch.GetTimestamp();
-#endif
+                #endif
                 EnqueueOrSendAck(synapseConnection, sequence, cancellationToken);
-#if PERFTEST
+                #if PERFTEST
                 _perfCounters.RecordEnqueueOrSendAck(Stopwatch.GetTimestamp() - ackStart);
-#endif
+                #endif
                 DeliverOrdered(synapseConnection, sequence, payload, isReliable: true);
                 return;
             }
@@ -430,10 +431,7 @@ public sealed partial class IngressEngine
                     else if (isProtocolViolation)
                     {
                         _telemetry.OnDroppedIn();
-                        ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature,
-                            ViolationReason.Malformed, length,
-                            ViolationSegmentMismatch,
-                            ViolationAction.KickAndBlacklist);
+                        ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Malformed, length, ViolationSegmentMismatch, ViolationAction.KickAndBlacklist);
                         ArrayPool<byte>.Shared.Return(payloadBuffer);
                         return;
                     }
@@ -459,10 +457,7 @@ public sealed partial class IngressEngine
                     else if (isProtocolViolation)
                     {
                         _telemetry.OnDroppedIn();
-                        ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature,
-                            ViolationReason.Malformed, length,
-                            ViolationSegmentMismatch,
-                            ViolationAction.KickAndBlacklist);
+                        ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Malformed, length, ViolationSegmentMismatch, ViolationAction.KickAndBlacklist);
                         ArrayPool<byte>.Shared.Return(segmentPayloadBuffer);
                         return;
                     }
@@ -478,29 +473,35 @@ public sealed partial class IngressEngine
                 if (!_config.CopyReceivedPayloads)
                 {
                     isPayloadCopied = false;
-#if PERFTEST
+                    #if PERFTEST
                     long callbackStart = Stopwatch.GetTimestamp();
-#endif
-                    PayloadDelivered?.Invoke(synapseConnection, new(buffer, headerSize, payloadLength), false);
-#if PERFTEST
+                    #endif
+                    for (int i = 0; i < PerfCounters.IterationMultiplier; i++)
+                        PayloadDelivered?.Invoke(synapseConnection, new(buffer, headerSize, payloadLength), false);
+                    #if PERFTEST
                     _perfCounters.RecordPayloadDeliveredCallback(Stopwatch.GetTimestamp() - callbackStart);
-#endif
+                    #endif
                 }
                 else
                 {
                     byte[] payloadCopyBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
-#if PERFTEST
+                    #if PERFTEST
                     long payloadCopyStart = Stopwatch.GetTimestamp();
-#endif
+                    #endif
                     Buffer.BlockCopy(buffer, headerSize, payloadCopyBuffer, 0, payloadLength);
-#if PERFTEST
+                    #if PERFTEST
                     _perfCounters.RecordPayloadCopy(Stopwatch.GetTimestamp() - payloadCopyStart);
                     long callbackStart = Stopwatch.GetTimestamp();
-#endif
+                    #endif
+                    #if PERFTEST
+                    for (int i = 0; i < PerfCounters.IterationMultiplier; i++)
+                        PayloadDelivered?.Invoke(synapseConnection, new(payloadCopyBuffer, 0, payloadLength), false);
+                    #else
                     PayloadDelivered?.Invoke(synapseConnection, new(payloadCopyBuffer, 0, payloadLength), false);
-#if PERFTEST
+                    #endif
+                    #if PERFTEST
                     _perfCounters.RecordPayloadDeliveredCallback(Stopwatch.GetTimestamp() - callbackStart);
-#endif
+                    #endif
                 }
 
                 return;
@@ -543,9 +544,9 @@ public sealed partial class IngressEngine
     private void DeliverOrdered(SynapseConnection synapseConnection, ushort sequence, ArraySegment<byte> payload, bool isReliable)
     {
         List<ArraySegment<byte>>? toDeliver = null;
-#if PERFTEST
+        #if PERFTEST
         long lockStart = Stopwatch.GetTimestamp();
-#endif
+        #endif
 
         lock (synapseConnection.ReliableLock)
         {
@@ -564,19 +565,12 @@ public sealed partial class IngressEngine
             else
             {
                 // Out of order - buffer (only if not already received).
-                if (_config.MaximumOutOfOrderReliablePackets > 0
-                    && synapseConnection.ReorderBuffer.Count >= _config.MaximumOutOfOrderReliablePackets)
+                if (_config.MaximumOutOfOrderReliablePackets > 0 && synapseConnection.ReorderBuffer.Count >= _config.MaximumOutOfOrderReliablePackets)
                 {
                     if (payload.Array is not null)
                         ArrayPool<byte>.Shared.Return(payload.Array);
 
-                    ViolationOccurred?.Invoke(
-                        synapseConnection.RemoteEndPoint,
-                        synapseConnection.Signature,
-                        ViolationReason.Oversized,
-                        0,
-                        ViolationReorderBufferExceeded,
-                        ViolationAction.KickAndBlacklist);
+                    ViolationOccurred?.Invoke(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.Oversized, 0, ViolationReorderBufferExceeded, ViolationAction.KickAndBlacklist);
                     return;
                 }
 
@@ -584,21 +578,21 @@ public sealed partial class IngressEngine
             }
         }
 
-#if PERFTEST
+        #if PERFTEST
         _perfCounters.RecordDeliverOrdered(Stopwatch.GetTimestamp() - lockStart);
-#endif
+        #endif
 
         // Callbacks happen OUTSIDE the lock so user handlers are free to call back into the engine (e.g., SendReliableAsync) safely.
         if (toDeliver is not null)
         {
-#if PERFTEST
+            #if PERFTEST
             long callbacksStart = Stopwatch.GetTimestamp();
-#endif
+            #endif
             foreach (ArraySegment<byte> deliverPayload in toDeliver)
                 PayloadDelivered?.Invoke(synapseConnection, deliverPayload, isReliable);
-#if PERFTEST
+            #if PERFTEST
             _perfCounters.RecordDeliverOrderedCallbacks(Stopwatch.GetTimestamp() - callbacksStart);
-#endif
+            #endif
         }
     }
 
@@ -624,9 +618,7 @@ public sealed partial class IngressEngine
         }
 
         // Connection cap: reject new peers when the engine is full.
-        if (_config.MaximumConcurrentConnections > 0
-            && _connections.Count >= _config.MaximumConcurrentConnections
-            && !_connections.TryGet(fromEndPoint, out _))
+        if (_config.MaximumConcurrentConnections > 0 && _connections.Count >= _config.MaximumConcurrentConnections && !_connections.TryGet(fromEndPoint, out _))
         {
             ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.ServerFull, "Connection limit reached");
             return;
@@ -678,10 +670,9 @@ public sealed partial class IngressEngine
     /// <summary>
     /// Evicts stale entries from the handshake replay cache.
     /// </summary>
-    /// <param name="nowTicks">The current UTC tick count.</param>
+    /// <param name="nowTicks">Current timestamp in <see cref="System.DateTime.Ticks"/>.</param>
     /// <param name="staleTicks">Age in ticks beyond which a cached handshake signature is considered expired.</param>
-    private void RemoveExpiredHandshakeEntries(long nowTicks, long staleTicks) =>
-        RemoveExpiredEntries(_seenHandshakes, nowTicks, staleTicks);
+    private void RemoveExpiredHandshakeEntries(long nowTicks, long staleTicks) => RemoveExpiredEntries(_seenHandshakes, nowTicks, staleTicks);
 
     /// <summary>
     /// Mixes <paramref name="payload"/> into <paramref name="signature"/> using FNV-1a to produce a per-handshake replay cache key.
@@ -708,7 +699,7 @@ public sealed partial class IngressEngine
     /// whose tick-valued values are older than <paramref name="staleTicks"/> relative to <paramref name="nowTicks"/>.
     /// </summary>
     /// <param name="dictionary">The dictionary to prune.</param>
-    /// <param name="nowTicks">The current UTC tick count.</param>
+    /// <param name="nowTicks">Current timestamp in <see cref="System.DateTime.Ticks"/>.</param>
     /// <param name="staleTicks">Age in ticks beyond which an entry is removed.</param>
     /// <typeparam name="TKey">The dictionary key type.</typeparam>
     /// <summary>
@@ -732,8 +723,7 @@ public sealed partial class IngressEngine
             _ = _sender.SendAckAsync(item.Connection, item.Sequence, cancellationToken);
     }
 
-    private static void RemoveExpiredEntries<TKey>(ConcurrentDictionary<TKey, long> dictionary, long nowTicks, long staleTicks)
-        where TKey : notnull
+    private static void RemoveExpiredEntries<TKey>(ConcurrentDictionary<TKey, long> dictionary, long nowTicks, long staleTicks) where TKey : notnull
     {
         foreach (KeyValuePair<TKey, long> entry in dictionary)
         {
@@ -789,8 +779,10 @@ public sealed partial class IngressEngine
 
         /// <inheritdoc/>
         public bool Equals(IpKey other) => _upper64 == other._upper64 && _lower64 == other._lower64;
+
         /// <inheritdoc/>
         public override bool Equals(object? obj) => obj is IpKey other && Equals(other);
+
         /// <inheritdoc/>
         public override int GetHashCode() => HashCode.Combine(_upper64, _lower64);
     }
