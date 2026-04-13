@@ -18,49 +18,57 @@ namespace SynapseSocket.Core;
 public sealed partial class SynapseManager
 {
     private const string ViolationReliableExhausted = "Connection exceeded the maximum reliable packet retry limit.";
-
     /// <summary>
     /// UTC ticks of the last ACK batch flush. Used by <see cref="AckBatchFlushSweep"/> to enforce the configured interval.
     /// </summary>
     private long _lastAckFlushTicks;
+    private long _connectionKeepAliveTicks;
+    private long _connectionTimeoutTicks;
+    private long _reliableResendTicks;
+    private uint _maximumReliableRetries;
+
+    private int _nextMaintenanceConnectionIndex;
 
     /// <summary>
     /// Background loop that periodically runs keep-alive, retransmit, and segment-timeout sweeps.
     /// </summary>
     private async Task MaintenanceLoopAsync(CancellationToken cancellationToken)
     {
-        return;
-        int maintenanceLoopDelayMilliseconds = 50;
+        // How long between performing maintenance on each connection.
+        int maintenanceLoopDelayMilliseconds = 1;
 
         while (!cancellationToken.IsCancellationRequested)
         {
             try
             {
+                int connectionsCount = Connections.Connections.Count;
+
+                if (connectionsCount == 0)
+                    continue;
+
+                if (_nextMaintenanceConnectionIndex >= connectionsCount)
+                    _nextMaintenanceConnectionIndex = 0;
+
+                SynapseConnection connection = Connections.Connections[_nextMaintenanceConnectionIndex];
+
                 long nowTicks = DateTime.UtcNow.Ticks;
-#if PERFTEST
-                long tickStart = Stopwatch.GetTimestamp();
-                long sweepStart = tickStart;
-#endif
-                ProgressiveKeepAliveSweep(nowTicks, cancellationToken);
-#if PERFTEST
-                Perf.RecordKeepAliveSweep(Stopwatch.GetTimestamp() - sweepStart);
-                sweepStart = Stopwatch.GetTimestamp();
-#endif
-                ReliableRetransmitSweep(nowTicks, cancellationToken);
-#if PERFTEST
+
+                PerformKeepAlive(nowTicks, connection, cancellationToken);
+                ReliableRetransmitSweep(nowTicks, connection, cancellationToken);
+                #if PERFTEST
                 Perf.RecordReliableRetransmitSweep(Stopwatch.GetTimestamp() - sweepStart);
                 sweepStart = Stopwatch.GetTimestamp();
-#endif
+                #endif
                 SegmentAssemblyTimeoutSweep(nowTicks);
-#if PERFTEST
+                #if PERFTEST
                 Perf.RecordSegmentAssemblyTimeoutSweep(Stopwatch.GetTimestamp() - sweepStart);
                 sweepStart = Stopwatch.GetTimestamp();
-#endif
+                #endif
                 AckBatchFlushSweep(nowTicks, cancellationToken);
-#if PERFTEST
+                #if PERFTEST
                 Perf.RecordAckBatchFlushSweep(Stopwatch.GetTimestamp() - sweepStart);
                 Perf.RecordMaintenanceTick(Stopwatch.GetTimestamp() - tickStart);
-#endif
+                #endif
             }
             catch (OperationCanceledException)
             {
@@ -86,59 +94,50 @@ public sealed partial class SynapseManager
     /// Progressive keep-alive: iterates a slice of connections per tick so heartbeat traffic is spread across the configured sweep window.
     /// Also detects timeouts and disconnects non-responsive peers.
     /// </summary>
-    private void ProgressiveKeepAliveSweep(long nowTicks, CancellationToken cancellationToken)
+    private void PerformKeepAlive(long nowTicks, SynapseConnection synapseConnection, CancellationToken cancellationToken)
     {
         if (_sender is null)
             return;
 
-        long keepAliveTicks = TimeSpan.FromMilliseconds(Config.Connection.KeepAliveIntervalMilliseconds).Ticks;
-        long timeoutTicks = TimeSpan.FromMilliseconds(Config.Connection.TimeoutMilliseconds).Ticks;
+        if (synapseConnection.State == ConnectionState.Disconnected)
+            return;
 
-        List<SynapseConnection> snapshot = [];
-
-        foreach (SynapseConnection synapseConnection in Connections.Snapshot())
-            snapshot.Add(synapseConnection);
-
-        foreach (SynapseConnection synapseConnection in snapshot)
+        // Timeout check - treated as a (benign) violation.
+        // Default initial action is Kick (disconnect without blacklisting); a listener can escalate or downgrade.
+        if (nowTicks - synapseConnection.LastReceivedTicks > _connectionTimeoutTicks)
         {
-            if (synapseConnection.State == ConnectionState.Disconnected)
-                continue;
+            synapseConnection.State = ConnectionState.Disconnected;
+            Connections.Remove(synapseConnection.RemoteEndPoint, out _);
+            ReturnReorderBufferToPool(synapseConnection);
+            SynapseConnection.DrainPendingReliableQueue(synapseConnection);
+            RaiseConnectionClosed(synapseConnection);
+            HandleViolation(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.Timeout, 0, null, ViolationAction.Kick);
 
-            // Timeout check - treated as a (benign) violation.
-            // Default initial action is Kick (disconnect without blacklisting); a listener can escalate or downgrade.
-            if (nowTicks - synapseConnection.LastReceivedTicks > timeoutTicks)
-            {
-                synapseConnection.State = ConnectionState.Disconnected;
-                Connections.Remove(synapseConnection.RemoteEndPoint, out _);
-                ReturnReorderBufferToPool(synapseConnection);
-                SynapseConnection.DrainPendingReliableQueue(synapseConnection);
-                RaiseConnectionClosed(synapseConnection);
-                HandleViolation(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.Timeout, 0, null, ViolationAction.Kick);
-                continue;
-            }
-
-            // Keep-alive: skip when traffic is already flowing; reset backoff when active.
-            if (nowTicks - synapseConnection.LastReceivedTicks < keepAliveTicks)
-            {
-                synapseConnection.UnansweredKeepAlives = 0;
-                continue;
-            }
-
-            // Exponential backoff: double the interval for each consecutive unanswered keep-alive, capped at 8×.
-            long effectiveIntervalTicks = keepAliveTicks << Math.Min(synapseConnection.UnansweredKeepAlives, 3);
-
-            if (nowTicks - synapseConnection.LastKeepAliveSentTicks < effectiveIntervalTicks)
-                continue;
-
-            // Track whether the previous keep-alive was answered.
-            if (synapseConnection.LastKeepAliveSentTicks > 0 && synapseConnection.LastReceivedTicks < synapseConnection.LastKeepAliveSentTicks)
-                synapseConnection.UnansweredKeepAlives++;
-            else
-                synapseConnection.UnansweredKeepAlives = 0;
-
-            synapseConnection.LastKeepAliveSentTicks = nowTicks;
-            _ = _sender.SendKeepAliveAsync(synapseConnection, cancellationToken);
+            return;
         }
+
+        // Keep-alive: skip when traffic is already flowing; reset backoff when active.
+        if (nowTicks - synapseConnection.LastReceivedTicks < _connectionKeepAliveTicks)
+        {
+            synapseConnection.UnansweredKeepAlives = 0;
+            return;
+        }
+
+        // Exponential backoff: double the interval for each consecutive unanswered keep-alive, capped at 8×.
+        long effectiveIntervalTicks = _connectionKeepAliveTicks << Math.Min(synapseConnection.UnansweredKeepAlives, 3);
+
+        if (nowTicks - synapseConnection.LastKeepAliveSentTicks < effectiveIntervalTicks)
+            return;
+
+        // Track whether the previous keep-alive was answered.
+        if (synapseConnection.LastKeepAliveSentTicks > 0 && synapseConnection.LastReceivedTicks < synapseConnection.LastKeepAliveSentTicks)
+            synapseConnection.UnansweredKeepAlives++;
+        else
+            synapseConnection.UnansweredKeepAlives = 0;
+
+        synapseConnection.LastKeepAliveSentTicks = nowTicks;
+
+        _ = _sender.SendKeepAliveAsync(synapseConnection, cancellationToken);
     }
 
     /// <summary>
@@ -164,48 +163,44 @@ public sealed partial class SynapseManager
     /// Reliable retransmission sweep: any pending reliable packet whose resend timer has expired is re-sent.
     /// Packets exceeding the retry cap are treated as a <see cref="ViolationReason.ReliableExhausted"/> violation.
     /// </summary>
-    private void ReliableRetransmitSweep(long nowTicks, CancellationToken cancellationToken)
+    private void ReliableRetransmitSweep(long nowTicks, SynapseConnection synapseConnection, CancellationToken cancellationToken)
     {
         if (_sender is null)
             return;
+        
+        if (synapseConnection.State != ConnectionState.Connected)
+            return;
 
-        long resendTicks = TimeSpan.FromMilliseconds(Config.Reliable.ResendMilliseconds).Ticks;
-
-        foreach (SynapseConnection synapseConnection in Connections.Snapshot())
+        foreach (KeyValuePair<ushort, SynapseConnection.PendingReliable> keyValuePair in synapseConnection.PendingReliableQueue)
         {
-            if (synapseConnection.State != ConnectionState.Connected)
+            SynapseConnection.PendingReliable pendingReliable = keyValuePair.Value;
+
+            if (nowTicks - pendingReliable.SentTicks < _reliableResendTicks)
                 continue;
 
-            foreach (KeyValuePair<ushort, SynapseConnection.PendingReliable> keyValuePair in synapseConnection.PendingReliableQueue)
+            if (pendingReliable.Retries >= _maximumReliableRetries)
             {
-                SynapseConnection.PendingReliable pendingReliable = keyValuePair.Value;
+                synapseConnection.PendingReliableQueue.TryRemove(keyValuePair.Key, out _);
+                SynapseConnection.ReleasePendingReliable(pendingReliable);
+                Telemetry.OnLost();
+                HandleViolation(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.ReliableExhausted, 0, ViolationReliableExhausted, ViolationAction.Kick);
 
-                if (nowTicks - pendingReliable.SentTicks < resendTicks)
-                    continue;
+                return;
+            }
 
-                if (pendingReliable.Retries >= Config.Reliable.MaximumRetries)
-                {
-                    synapseConnection.PendingReliableQueue.TryRemove(keyValuePair.Key, out _);
-                    SynapseConnection.ReleasePendingReliable(pendingReliable);
-                    Telemetry.OnLost();
-                    HandleViolation(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.ReliableExhausted, 0, ViolationReliableExhausted, ViolationAction.Kick);
-                    continue;
-                }
+            pendingReliable.Retries++;
+            pendingReliable.SentTicks = nowTicks;
 
-                pendingReliable.Retries++;
-                pendingReliable.SentTicks = nowTicks;
-                
-                Telemetry.OnReliableResend();
+            Telemetry.OnReliableResend();
 
-                if (pendingReliable.Segments is not null)
-                {
-                    for (int i = 0; i < pendingReliable.SegmentCount; i++)
-                        _ = _sender.SendRawAsync(pendingReliable.Segments[i], synapseConnection.RemoteEndPoint, cancellationToken);
-                }
-                else
-                {
-                    _ = _sender.SendRawAsync(new(pendingReliable.Payload, 0, pendingReliable.PacketLength), synapseConnection.RemoteEndPoint, cancellationToken);
-                }
+            if (pendingReliable.Segments is not null)
+            {
+                for (int i = 0; i < pendingReliable.SegmentCount; i++)
+                    _ = _sender.SendRawAsync(pendingReliable.Segments[i], synapseConnection.RemoteEndPoint, cancellationToken);
+            }
+            else if (pendingReliable.Payload is not null)
+            {
+                _ = _sender.SendRawAsync(new(pendingReliable.Payload, 0, pendingReliable.PacketLength), synapseConnection.RemoteEndPoint, cancellationToken);
             }
         }
     }

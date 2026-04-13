@@ -122,6 +122,12 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
          * and unreliable segmented. Rather than add additional complexity and branching
          * the rare byte cost is consumed. */
         _maximumUnsegmentedPayload = (int)Config.MaximumTransmissionUnit - PacketHeader.TypeSize - PacketHeader.SequenceSize;
+        
+        /* Maintenance. */
+        _connectionKeepAliveTicks = TimeSpan.FromMilliseconds(Config.Connection.KeepAliveIntervalMilliseconds).Ticks;
+        _connectionTimeoutTicks = TimeSpan.FromMilliseconds(Config.Connection.TimeoutMilliseconds).Ticks;
+        _reliableResendTicks = TimeSpan.FromMilliseconds(Config.Reliable.ResendMilliseconds).Ticks;
+        _maximumReliableRetries = Config.Reliable.MaximumRetries;
     }
 
     /// <summary>

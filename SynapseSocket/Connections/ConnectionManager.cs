@@ -33,6 +33,7 @@ public sealed class ConnectionManager
     /// <summary>
     /// Connections as an index-based collection.
     /// </summary>
+    public IReadOnlyList<SynapseConnection> Connections => _connections;
     private readonly List<SynapseConnection> _connections = [];
 
     /// <summary>

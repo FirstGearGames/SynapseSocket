@@ -150,7 +150,7 @@ public sealed class SecurityProvider
     internal sealed class RateBucket
     {
         /// <summary>
-        /// Tick timestamp marking the start of the current one-second rate window.
+        /// Ticks which have
         /// </summary>
         private long _passedTicks;
         /// <summary>
