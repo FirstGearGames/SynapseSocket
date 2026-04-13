@@ -1,6 +1,4 @@
 using System;
-using System.Buffers;
-using System.Collections.Concurrent;
 using System.Net;
 using System.Security.Cryptography;
 using System.Threading;
@@ -22,27 +20,26 @@ public sealed partial class IngressEngine
     /// Raised when a NAT rendezvous server reports the peer's external endpoint.
     /// </summary>
     public event NatPeerReadyDelegate? NatPeerReady;
-
     /// <summary>
     /// Raised when a NAT rendezvous server rejects the session because it is full or was not found.
     /// </summary>
     public event NatSessionFullDelegate? NatSessionFull;
-
     /// <summary>
     /// Raised when a NAT rendezvous server responds with the server-assigned session ID.
     /// </summary>
     public event NatSessionCreatedDelegate? NatSessionCreated;
-
     /// <summary>
     /// Raised when a NAT rendezvous server rejects a session-creation request because its concurrent session limit has been reached.
     /// </summary>
     public event NatSessionUnavailableDelegate? NatSessionUnavailable;
-
+    /// <summary>
+    /// True if NAT is enabled for any configuration.
+    /// </summary>
+    private bool _isNatEnabled;
     /// <summary>
     /// Size of the HMAC-SHA256 token truncated to this many bytes for NAT challenge packets.
     /// </summary>
     private const int NatTokenSize = 8;
-
     /// <summary>
     /// Duration of a single time bucket in ticks. Tokens are valid for the current bucket and the previous one (~60 seconds total).
     /// </summary>
@@ -54,7 +51,7 @@ public sealed partial class IngressEngine
     /// </summary>
     private void ProcessNatProbe(IPEndPoint fromEndPoint, CancellationToken cancellationToken)
     {
-        if (_config.NatTraversal.Mode == NatTraversalMode.Disabled)
+        if (!_isNatEnabled)
             return;
 
         // Never respond to blacklisted addresses.
@@ -64,7 +61,7 @@ public sealed partial class IngressEngine
             return;
 
         // Only respond to unrecognised endpoints; established peers do not need probes.
-        if (_connections.TryGet(fromEndPoint, out SynapseConnection? _))
+        if (_connections.ConnectionsByEndPoint.TryGetValue(fromEndPoint, out SynapseConnection? _))
             return;
 
         // Rate-limit outbound challenge responses per source IP.
@@ -99,10 +96,10 @@ public sealed partial class IngressEngine
     /// </summary>
     private void ProcessNatChallengeExchange(IPEndPoint fromEndPoint, ReadOnlySpan<byte> payload, CancellationToken cancellationToken)
     {
-        if (payload.Length != NatTokenSize)
+        if (!_isNatEnabled)
             return;
 
-        if (_config.NatTraversal.Mode == NatTraversalMode.Disabled)
+        if (payload.Length != NatTokenSize)
             return;
 
         ulong signature = _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
@@ -110,7 +107,7 @@ public sealed partial class IngressEngine
         if (_security.IsBlacklisted(signature))
             return;
 
-        if (_connections.TryGet(fromEndPoint, out SynapseConnection? _))
+        if (_connections.ConnectionsByEndPoint.TryGetValue(fromEndPoint, out SynapseConnection? _))
             return;
 
         long nowTicks = DateTime.UtcNow.Ticks;
@@ -135,7 +132,7 @@ public sealed partial class IngressEngine
     /// </summary>
     private void ProcessNatServerPacket(IPEndPoint fromEndPoint, PacketType packetType, ReadOnlySpan<byte> payload)
     {
-        if (_config.NatTraversal.Mode != NatTraversalMode.Server)
+        if (!_isNatEnabled || _config.NatTraversal.Mode != NatTraversalMode.Server)
             return;
 
         if (_config.NatTraversal.Server.ServerEndPoint is null)
@@ -215,8 +212,7 @@ public sealed partial class IngressEngine
     /// <summary>
     /// Evicts stale entries from the NAT probe response-time dictionary.
     /// </summary>
-    private void RemoveExpiredProbeLimitEntries(long nowTicks, long staleTicks) =>
-        RemoveExpiredEntries(_natProbeLastResponseTicks, nowTicks, staleTicks);
+    private void RemoveExpiredProbeLimitEntries(long nowTicks, long staleTicks) => RemoveExpiredEntries(_natProbeLastResponseTicks, nowTicks, staleTicks);
 
     /// <summary>
     /// Parses the uint session ID from a <see cref="PacketType.NatSessionCreated"/> payload.

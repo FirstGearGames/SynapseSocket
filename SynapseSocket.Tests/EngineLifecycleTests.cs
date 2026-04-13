@@ -2,6 +2,7 @@ using System;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading.Tasks;
+using SynapseSocket.Connections;
 using SynapseSocket.Core;
 using Xunit;
 using SynapseSocket.Core.Configuration;
@@ -68,9 +69,12 @@ public class EngineLifecycleTests
     {
         SynapseManager engine = new(TestHarness.ServerConfig(TestHarness.GetFreePort()));
         // Not calling StartAsync.
-        Connections.SynapseConnection fakeConnection = new(new(IPAddress.Loopback, 1), 0UL);
+        SynapseConnection fakeConnection = new();
+        fakeConnection.Initialize(new(IPAddress.Loopback, port: 1), signature:1, connectionsIndex: SynapseConnection.UnsetConnectionsIndex);
+
         await Assert.ThrowsAsync<InvalidOperationException>(async () =>
             await engine.SendAsync(fakeConnection, new byte[] { 1, 2, 3 }, isReliable: true));
+        
         engine.Dispose();
     }
 

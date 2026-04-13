@@ -187,11 +187,8 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
 
         foreach (Socket socket in _sockets)
         {
-            IngressEngine ingressEngine = new(socket, Config, Security, Connections, _transmissionEngine, Telemetry
-                #if PERFTEST
-                , Perf
-                #endif
-            );
+            IngressEngine ingressEngine = new(socket, Config, Security, Connections, _transmissionEngine, Telemetry);
+
             ingressEngine.PayloadDelivered += OnPayloadDelivered;
             ingressEngine.ConnectionEstablished += OnConnectionEstablishedInternal;
             ingressEngine.ConnectionClosed += OnConnectionClosedInternal;
@@ -202,6 +199,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             ingressEngine.NatSessionFull += OnNatSessionFull;
             ingressEngine.NatSessionCreated += OnNatSessionCreated;
             ingressEngine.NatSessionUnavailable += OnNatSessionUnavailable;
+            
             _ingressEngines.Add(ingressEngine);
             _ingressTasks.Add(ingressEngine.StartAsync(_cancellationTokenSource.Token));
         }

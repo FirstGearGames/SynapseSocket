@@ -124,11 +124,7 @@ public sealed partial class IngressEngine
     /// <param name="connections">Active connection table shared with the rest of the engine.</param>
     /// <param name="sender">Transmission engine used to emit acknowledgements and handshake responses.</param>
     /// <param name="telemetry">Telemetry counters for this engine instance.</param>
-    internal IngressEngine(Socket socket, SynapseConfig config, SecurityProvider security, ConnectionManager connections, TransmissionEngine sender, Telemetry telemetry
-        #if PERFTEST
-        , PerfCounters perfCounters
-        #endif
-    )
+    internal IngressEngine(Socket socket, SynapseConfig config, SecurityProvider security, ConnectionManager connections, TransmissionEngine sender, Telemetry telemetry)
     {
         _socket = socket;
         _config = config;
@@ -136,10 +132,10 @@ public sealed partial class IngressEngine
         _connections = connections;
         _sender = sender;
         _telemetry = telemetry;
+
+        _isNatEnabled = _config.NatTraversal.Mode != NatTraversalMode.Disabled;
+        
         System.Security.Cryptography.RandomNumberGenerator.Fill(_natChallengeSecret);
-        #if PERFTEST
-        _perfCounters = perfCounters;
-        #endif
     }
 
     /// <summary>
@@ -194,27 +190,17 @@ public sealed partial class IngressEngine
                 }
 
                 IPEndPoint fromEndPoint = (IPEndPoint)socketReceiveResult.RemoteEndPoint;
+
                 int receivedLength = socketReceiveResult.ReceivedBytes;
-                #if PERFTEST
-                long utcNowStart = Stopwatch.GetTimestamp();
-                #endif
                 long nowTicks = DateTime.UtcNow.Ticks;
-                #if PERFTEST
-                _perfCounters.RecordDateTimeUtcNow(Stopwatch.GetTimestamp() - utcNowStart);
-                #endif
 
                 // Lowest-level mitigation first, before any copy.
                 // Established connections skip signature recomputation and blacklist lookup — those only apply at handshake time. Size and rate-limit checks still run for all senders.
                 FilterResult filterResult;
                 ulong signature;
-                #if PERFTEST
-                long securityFilterStart = Stopwatch.GetTimestamp();
-                long securityTryGetStart = Stopwatch.GetTimestamp();
-                #endif
-                bool isEstablished = _connections.TryGet(fromEndPoint, out SynapseConnection? synapseConnection) && synapseConnection is not null;
-                #if PERFTEST
-                long securityInspectStart = Stopwatch.GetTimestamp();
-                #endif
+
+                bool isEstablished = _connections.ConnectionsByEndPoint.TryGetValue(fromEndPoint, out SynapseConnection synapseConnection);
+
                 if (isEstablished)
                 {
                     signature = 0;
@@ -222,16 +208,12 @@ public sealed partial class IngressEngine
                     for (int i = 0; i < PerfCounters.IterationMultiplier; i++)
                     {
                         signature = synapseConnection!.Signature;
-                        filterResult = _security.InspectEstablished(nowTicks, receivedLength, synapseConnection.RateBucket);
+                        filterResult = _security.InspectEstablished(nowTicks, receivedLength);
                     }
                 }
                 else
                     filterResult = _security.InspectNew(nowTicks, fromEndPoint, receivedLength, out signature);
-                #if PERFTEST
-                _perfCounters.RecordSecurityFilterInspect(Stopwatch.GetTimestamp() - securityInspectStart);
-                _perfCounters.RecordSecurityFilter(Stopwatch.GetTimestamp() - securityFilterStart);
-                #endif
-
+                
                 if (filterResult is not FilterResult.Allowed)
                 {
                     _telemetry.OnDroppedIn();
@@ -650,8 +632,10 @@ public sealed partial class IngressEngine
         {
             synapseConnection.State = ConnectionState.Connected;
             synapseConnection.LastReceivedTicks = DateTime.UtcNow.Ticks;
-            synapseConnection.RateBucket = _security.CreateRateBucket();
-            _ = _sender.SendHandshakeAsync(fromEndPoint, cancellationToken); // handshake-ack = another handshake packet
+            
+            // handshake-ack = another handshake packet
+            _ = _sender.SendHandshakeAsync(fromEndPoint, cancellationToken);
+            
             ConnectionEstablished?.Invoke(synapseConnection);
         }
     }

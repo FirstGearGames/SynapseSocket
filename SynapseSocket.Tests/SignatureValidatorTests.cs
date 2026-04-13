@@ -106,7 +106,7 @@ public class SignatureValidatorTests
         await TestHarness.WaitFor(() => eventRecorder.ConnectionsEstablished >= 1);
 
         // Server should have created the connection with the FIXED signature.
-        Assert.True(server.Connections.TryGetBySignature(0xCAFEBABEDEADBEEF, out Connections.SynapseConnection? foundSynapseConnection));
+        Assert.True(server.Connections.ConnectionsBySignature.TryGetValue(0xCAFEBABEDEADBEEF, out Connections.SynapseConnection? foundSynapseConnection));
         Assert.NotNull(foundSynapseConnection);
         Assert.True(provider.Calls > 0);
     }

@@ -16,7 +16,7 @@ namespace SynapseSocket.Connections;
 /// Represents the state of a single remote peer session, including reliable send/receive windows, keep-alive timestamps, and signature binding.
 /// </summary>
 /// <remarks>This reference is not automatically pooled but is never used again once <see cref="SynapseManager.ConnectionClosed"/>is invoked. Consider using <see cref="ResettableObjectPool{T0}.Return"/> on this connection once closed.</remarks>
-//todo add connectionremoved event and clean up automatically at that point. remove comments above. make it known whn event dispatches connection is pooled and should not have its reference retained.
+// todo add connectionremoved event and clean up automatically at that point. remove comments above. make it known whn event dispatches connection is pooled and should not have its reference retained.
 public sealed class SynapseConnection : IPoolResettable
 {
     /// <summary>
@@ -98,7 +98,6 @@ public sealed class SynapseConnection : IPoolResettable
     /// Value used when ConnectionsIndex is not set.
     /// </summary>
     public const int UnsetConnectionsIndex = -1;
-    
     public SynapseConnection() { }
 
     /// <summary>
@@ -196,7 +195,7 @@ public sealed class SynapseConnection : IPoolResettable
             PacketLength = 0;
             SegmentCount = 0;
             SentTicks = 0;
-            
+
             /* Only Segments or Payload will have value, never both. */
             if (Segments is not null)
             {
@@ -240,8 +239,27 @@ public sealed class SynapseConnection : IPoolResettable
 
     public void OnReturn()
     {
+        RemoteEndPoint = null;
+        Signature = SecurityProvider.UnsetSignature;
+        ConnectionsIndex = UnsetConnectionsIndex;
+        State = ConnectionState.Disconnected;
+
+        LastReceivedTicks = 0;
+        LastKeepAliveSentTicks = 0;
+        UnansweredKeepAlives = 0;
+
+        NextOutgoingSequence = 0;
+        NextExpectedSequence = 0;
+
+        foreach (PendingReliable? value in PendingReliableQueue.Values)
+            ResettableObjectPool<PendingReliable>.Return(value);
+        
+        foreach (ArraySegment<byte> reorderSegment in ReorderBuffer.Values)
+            reorderSegment.PoolArrayIntoShared();
+
+        ResettableObjectPool<PacketSplitter>.ReturnAndNullifyReference(ref Splitter);
+        ResettableObjectPool<PacketReassembler>.ReturnAndNullifyReference(ref Reassembler);
     }
-    public void OnRent()
-    {
-    }
+
+    public void OnRent() { }
 }
