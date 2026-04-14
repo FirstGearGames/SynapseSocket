@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using System.Net;
+using System.Threading;
 using System.Threading.Tasks;
 using SynapseSocket.Core;
 using SynapseSocket.Security;
@@ -54,10 +55,10 @@ public class SignatureValidatorTests
         TestHarness.EventRecorder eventRecorder = new();
         eventRecorder.Attach(server);
 
-        await server.StartAsync();
-        await client.StartAsync();
+        await server.StartAsync(CancellationToken.None);
+        await client.StartAsync(CancellationToken.None);
 
-        await client.ConnectAsync(new(IPAddress.Loopback, port));
+        await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
         Assert.True(await TestHarness.WaitFor(() => eventRecorder.ConnectionsEstablished >= 1));
         Assert.True(validator.Calls >= 1, "custom validator should be called at least once");
     }
@@ -76,9 +77,9 @@ public class SignatureValidatorTests
         TestHarness.EventRecorder eventRecorder = new();
         eventRecorder.Attach(server);
 
-        await server.StartAsync();
-        await client.StartAsync();
-        await client.ConnectAsync(new(IPAddress.Loopback, port));
+        await server.StartAsync(CancellationToken.None);
+        await client.StartAsync(CancellationToken.None);
+        await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
 
         Assert.True(await TestHarness.WaitFor(
             () => eventRecorder.FailureReasons.Contains(ConnectionRejectedReason.SignatureRejected)));
@@ -100,9 +101,9 @@ public class SignatureValidatorTests
         TestHarness.EventRecorder eventRecorder = new();
         eventRecorder.Attach(server);
 
-        await server.StartAsync();
-        await client.StartAsync();
-        Connections.SynapseConnection _ = await client.ConnectAsync(new(IPAddress.Loopback, port));
+        await server.StartAsync(CancellationToken.None);
+        await client.StartAsync(CancellationToken.None);
+        Connections.SynapseConnection _ = await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
         await TestHarness.WaitFor(() => eventRecorder.ConnectionsEstablished >= 1);
 
         // Server should have created the connection with the FIXED signature.

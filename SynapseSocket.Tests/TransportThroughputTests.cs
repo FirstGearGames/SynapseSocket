@@ -63,7 +63,7 @@ public sealed class TransportThroughputTests
 
         try
         {
-            await server.StartAsync();
+            await server.StartAsync(CancellationToken.None);
 
             int connectedClientCount = 0;
             server.ConnectionEstablished += _ => Interlocked.Increment(ref connectedClientCount);
@@ -84,8 +84,8 @@ public sealed class TransportThroughputTests
                     }
                 };
 
-                await clients[i].StartAsync();
-                clientToServerConnections[i] = await clients[i].ConnectAsync(new(IPAddress.Loopback, port));
+                await clients[i].StartAsync(CancellationToken.None);
+                clientToServerConnections[i] = await clients[i].ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
             }
 
             Assert.True(await TestHarness.WaitFor(() => connectedClientCount >= ClientCount, 5000),
@@ -110,7 +110,7 @@ public sealed class TransportThroughputTests
                     ArraySegment<byte> segment = new(SendBuffer, 0, byteCount);
 
                     for (int i = 0; i < ClientCount; i++)
-                        _ = clients[i].SendAsync(clientToServerConnections[i], segment, isReliable);
+                        _ = clients[i].SendAsync(clientToServerConnections[i], segment, isReliable, CancellationToken.None);
                 }
             }
 

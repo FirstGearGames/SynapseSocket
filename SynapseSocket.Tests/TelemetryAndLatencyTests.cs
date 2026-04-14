@@ -1,6 +1,7 @@
 using System;
 using System.Net;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
@@ -17,14 +18,14 @@ public class TelemetryAndLatencyTests
         await using SynapseManager server = new(TestHarness.ServerConfig(port));
         await using SynapseManager client = new(TestHarness.ClientConfig());
 
-        await server.StartAsync();
-        await client.StartAsync();
+        await server.StartAsync(CancellationToken.None);
+        await client.StartAsync(CancellationToken.None);
 
-        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
         await TestHarness.WaitFor(() => synapseConnection.State == ConnectionState.Connected);
 
-        await client.SendAsync(synapseConnection, Encoding.UTF8.GetBytes("abc"), isReliable: false);
-        await client.SendAsync(synapseConnection, Encoding.UTF8.GetBytes("def"), isReliable: true);
+        await client.SendAsync(synapseConnection, Encoding.UTF8.GetBytes("abc"), isReliable: false, CancellationToken.None);
+        await client.SendAsync(synapseConnection, Encoding.UTF8.GetBytes("def"), isReliable: true, CancellationToken.None);
 
         await TestHarness.WaitFor(() => server.Telemetry.PacketsIn >= 3);
 
@@ -48,14 +49,14 @@ public class TelemetryAndLatencyTests
         TestHarness.EventRecorder eventRecorder = new();
         eventRecorder.Attach(server);
 
-        await server.StartAsync();
-        await client.StartAsync();
+        await server.StartAsync(CancellationToken.None);
+        await client.StartAsync(CancellationToken.None);
 
         // ConnectAsync sends a handshake, but it gets dropped by the latency sim.
-        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
 
         // Also send data, all of which should disappear.
-        await client.SendAsync(synapseConnection, new byte[] { 1, 2, 3 }, isReliable: false);
+        await client.SendAsync(synapseConnection, new byte[] { 1, 2, 3 }, isReliable: false, CancellationToken.None);
         await Task.Delay(300);
 
         Assert.Equal(0, eventRecorder.PacketsReceived);
@@ -76,11 +77,11 @@ public class TelemetryAndLatencyTests
         TestHarness.EventRecorder eventRecorder = new();
         eventRecorder.Attach(server);
 
-        await server.StartAsync();
-        await client.StartAsync();
+        await server.StartAsync(CancellationToken.None);
+        await client.StartAsync(CancellationToken.None);
 
         DateTime startTime = DateTime.UtcNow;
-        SynapseConnection _ = await client.ConnectAsync(new(IPAddress.Loopback, port));
+        SynapseConnection _ = await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
         await TestHarness.WaitFor(() => eventRecorder.ConnectionsEstablished >= 1, 3000);
         TimeSpan elapsedTime = DateTime.UtcNow - startTime;
 

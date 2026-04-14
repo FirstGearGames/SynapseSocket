@@ -1,6 +1,7 @@
 using System;
 using System.Net;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
@@ -32,7 +33,7 @@ internal static class Program
 
         await using SynapseManager server = new(serverConfig);
         WireServerEvents(server);
-        await server.StartAsync().ConfigureAwait(false);
+        await server.StartAsync(CancellationToken.None).ConfigureAwait(false);
         Console.WriteLine($"[server] bound on port {Port}");
 
         // --- Build client config ---
@@ -62,31 +63,31 @@ internal static class Program
         client.ConnectionClosed += (connectionEventArgs) => Console.WriteLine($"[client] connection closed: {connectionEventArgs.Connection.RemoteEndPoint}");
         client.ConnectionFailed += (connectionFailedEventArgs) => Console.WriteLine($"[client] failure: {connectionFailedEventArgs.Reason} {connectionFailedEventArgs.Message}");
 
-        await client.StartAsync().ConfigureAwait(false);
+        await client.StartAsync(CancellationToken.None).ConfigureAwait(false);
         Console.WriteLine("[client] started");
 
         IPEndPoint serverEndPoint = new(IPAddress.Loopback, Port);
-        SynapseConnection synapseConnection = await client.ConnectAsync(serverEndPoint).ConfigureAwait(false);
+        SynapseConnection synapseConnection = await client.ConnectAsync(serverEndPoint, CancellationToken.None).ConfigureAwait(false);
 
         // Wait for handshake to complete (server handshake-ack arrives back).
         await Task.WhenAny(clientConnected.Task, Task.Delay(2000)).ConfigureAwait(false);
 
         // Send a reliable hello.
         byte[] helloPayload = Encoding.UTF8.GetBytes("Hello from client (reliable)");
-        await client.SendAsync(synapseConnection, helloPayload, isReliable: true).ConfigureAwait(false);
+        await client.SendAsync(synapseConnection, helloPayload, isReliable: true, CancellationToken.None).ConfigureAwait(false);
 
         byte[] fragmentedPayload = new byte[2500];
-        await client.SendAsync(synapseConnection, fragmentedPayload, isReliable: false).ConfigureAwait(false);
+        await client.SendAsync(synapseConnection, fragmentedPayload, isReliable: false, CancellationToken.None).ConfigureAwait(false);
 
         // Send an unreliable ping.
         byte[] pingPayload = Encoding.UTF8.GetBytes("Ping from client (unreliable)");
-        await client.SendAsync(synapseConnection, pingPayload, isReliable: false).ConfigureAwait(false);
+        await client.SendAsync(synapseConnection, pingPayload, isReliable: false, CancellationToken.None).ConfigureAwait(false);
 
         // Wait for an echo.
         await Task.WhenAny(clientReply.Task, Task.Delay(2000)).ConfigureAwait(false);
 
         await Task.Delay(300).ConfigureAwait(false);
-        await client.DisconnectAsync(synapseConnection).ConfigureAwait(false);
+        await client.DisconnectAsync(synapseConnection, CancellationToken.None).ConfigureAwait(false);
         await Task.Delay(200).ConfigureAwait(false);
 
         Console.WriteLine();
@@ -113,7 +114,7 @@ internal static class Program
             byte[] replyPayload = Encoding.UTF8.GetBytes($"echo: {decodedText}");
             try
             {
-                await server.SendAsync(packetReceivedEventArgs.Connection, replyPayload, packetReceivedEventArgs.IsReliable).ConfigureAwait(false);
+                await server.SendAsync(packetReceivedEventArgs.Connection, replyPayload, packetReceivedEventArgs.IsReliable, CancellationToken.None).ConfigureAwait(false);
             }
             catch (Exception ex)
             {

@@ -166,7 +166,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// <summary>
     /// Binds all configured endpoints, starts ingress loops, and launches background maintenance (keep-alive and reliable retransmission).
     /// </summary>
-    public Task StartAsync(CancellationToken cancellationToken = default)
+    public Task StartAsync(CancellationToken cancellationToken)
     {
         if (_isStarted)
             throw new InvalidOperationException("Engine is already running.");
@@ -256,7 +256,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// Initiates an outgoing connection to the specified remote endpoint.
     /// Sends a handshake packet; the connection is considered established when the remote handshake response arrives.
     /// </summary>
-    public async Task<SynapseConnection> ConnectAsync(IPEndPoint endPoint, CancellationToken cancellationToken = default)
+    public async Task<SynapseConnection> ConnectAsync(IPEndPoint endPoint, CancellationToken cancellationToken)
     {
         if (!_isStarted || _transmissionEngine is null)
             throw new InvalidOperationException("Engine not started.");
@@ -288,7 +288,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// <item><see cref="UnreliableSegmentMode.SegmentReliable"/> — splits into reliable segments.</item>
     /// </list>
     /// </summary>
-    public async Task SendAsync(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable, CancellationToken cancellationToken = default)
+    public async Task SendAsync(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable, CancellationToken cancellationToken)
     {
         EnsureRunning();
 
@@ -329,7 +329,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// <summary>
     /// Gracefully disconnects a connection, notifying the peer.
     /// </summary>
-    public async Task DisconnectAsync(SynapseConnection synapseConnection, CancellationToken cancellationToken = default)
+    public async Task DisconnectAsync(SynapseConnection synapseConnection, CancellationToken cancellationToken)
     {
         if (_transmissionEngine is not null)
             await _transmissionEngine.SendDisconnectAsync(synapseConnection, cancellationToken).ConfigureAwait(false);

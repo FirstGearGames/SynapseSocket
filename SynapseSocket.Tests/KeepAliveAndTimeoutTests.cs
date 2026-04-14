@@ -1,6 +1,7 @@
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
@@ -23,7 +24,7 @@ public class KeepAliveAndTimeoutTests
 
         TestHarness.EventRecorder eventRecorder = new();
         eventRecorder.Attach(server);
-        await server.StartAsync();
+        await server.StartAsync(CancellationToken.None);
 
         // Stand up a raw socket that pretends to handshake once and then
         // goes silent so the server times it out.
@@ -55,10 +56,10 @@ public class KeepAliveAndTimeoutTests
         TestHarness.EventRecorder eventRecorder = new();
         eventRecorder.Attach(server);
 
-        await server.StartAsync();
-        await client.StartAsync();
+        await server.StartAsync(CancellationToken.None);
+        await client.StartAsync(CancellationToken.None);
 
-        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
         await TestHarness.WaitFor(() => synapseConnection.State == ConnectionState.Connected);
 
         // Wait longer than ConnectionTimeoutMilliseconds; keep-alive should keep both sides alive.

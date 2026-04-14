@@ -2,6 +2,7 @@ using System.Linq;
 using System;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
@@ -32,16 +33,16 @@ public class SegmentationTests
         byte[]? receivedPayload = null;
         server.PacketReceived += (packetReceivedEventArgs) => receivedPayload = packetReceivedEventArgs.Payload.ToArray();
 
-        await server.StartAsync();
-        await client.StartAsync();
+        await server.StartAsync(CancellationToken.None);
+        await client.StartAsync(CancellationToken.None);
 
-        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
         await TestHarness.WaitFor(() => synapseConnection.State == ConnectionState.Connected);
 
         byte[] payload = new byte[4096];
         new Random(42).NextBytes(payload);
 
-        await client.SendAsync(synapseConnection, payload, isReliable: false);
+        await client.SendAsync(synapseConnection, payload, isReliable: false, CancellationToken.None);
         Assert.True(await TestHarness.WaitFor(() => receivedPayload != null, 5000),
             "server never reassembled the segmented payload");
         Assert.Equal(payload, receivedPayload);
@@ -58,15 +59,15 @@ public class SegmentationTests
             c.MaximumPacketSize = 512;
         }));
 
-        await server.StartAsync();
-        await client.StartAsync();
+        await server.StartAsync(CancellationToken.None);
+        await client.StartAsync(CancellationToken.None);
 
-        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
         await TestHarness.WaitFor(() => synapseConnection.State == ConnectionState.Connected);
 
         byte[] oversizedPayload = new byte[1024];
         await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await client.SendAsync(synapseConnection, oversizedPayload, isReliable: true));
+            await client.SendAsync(synapseConnection, oversizedPayload, isReliable: true, CancellationToken.None));
     }
 
     [Fact]
@@ -83,7 +84,7 @@ public class SegmentationTests
 
         TestHarness.EventRecorder eventRecorder = new();
         eventRecorder.Attach(server);
-        await server.StartAsync();
+        await server.StartAsync(CancellationToken.None);
 
         // Establish a connection first so the server has a known peer.
         using Socket socket = TestHarness.CreateRawSocket();

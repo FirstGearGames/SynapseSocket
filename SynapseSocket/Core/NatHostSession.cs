@@ -37,7 +37,7 @@ public sealed class NatHostSession : IAsyncDisposable
     /// Peers that are already connected are not affected.
     /// Safe to call multiple times.
     /// </summary>
-    public Task CloseAsync(CancellationToken cancellationToken = default)
+    public Task CloseAsync(CancellationToken cancellationToken)
     {
         if (Interlocked.Exchange(ref _closed, 1) != 0)
             return Task.CompletedTask;
@@ -49,7 +49,7 @@ public sealed class NatHostSession : IAsyncDisposable
     /// <inheritdoc/>
     public async ValueTask DisposeAsync()
     {
-        await CloseAsync().ConfigureAwait(false);
+        await CloseAsync(CancellationToken.None).ConfigureAwait(false);
         _heartbeatCts.Dispose();
     }
 }

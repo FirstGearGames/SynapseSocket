@@ -40,15 +40,15 @@ public sealed class GarbageCollectionTests
 
         try
         {
-            await server.StartAsync();
+            await server.StartAsync(CancellationToken.None);
 
             int connectedClientCount = 0;
             server.ConnectionEstablished += _ => Interlocked.Increment(ref connectedClientCount);
 
             for (int i = 0; i < ClientCount; i++)
             {
-                await clients[i].StartAsync();
-                clientToServerConnections[i] = await clients[i].ConnectAsync(new(IPAddress.Loopback, port));
+                await clients[i].StartAsync(CancellationToken.None);
+                clientToServerConnections[i] = await clients[i].ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
             }
 
             Assert.True(await TestHarness.WaitFor(() => connectedClientCount >= ClientCount, 5000),
@@ -68,7 +68,7 @@ public sealed class GarbageCollectionTests
                 ArraySegment<byte> segment = new(SendBuffer, 0, byteCount);
 
                 for (int i = 0; i < ClientCount; i++)
-                    _ = clients[i].SendAsync(clientToServerConnections[i], segment, isReliable: true);
+                    _ = clients[i].SendAsync(clientToServerConnections[i], segment, isReliable: true, CancellationToken.None);
 
                 Thread.Sleep(WarmupDelayMilliseconds);
             }
@@ -93,7 +93,7 @@ public sealed class GarbageCollectionTests
                     ArraySegment<byte> segment = new(SendBuffer, 0, byteCount);
 
                     for (int i = 0; i < ClientCount; i++)
-                        _ = clients[i].SendAsync(clientToServerConnections[i], segment, isReliable: true);
+                        _ = clients[i].SendAsync(clientToServerConnections[i], segment, isReliable: true, CancellationToken.None);
 
                     Thread.Sleep(SendDelayMilliseconds);
                 }

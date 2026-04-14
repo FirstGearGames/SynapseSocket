@@ -1,6 +1,7 @@
 using System;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
@@ -19,7 +20,7 @@ public class EngineLifecycleTests
         SynapseConfig synapseConfig = TestHarness.ServerConfig(port);
         await using SynapseManager engine = new(synapseConfig);
 
-        await engine.StartAsync();
+        await engine.StartAsync(CancellationToken.None);
 
         Assert.True(engine.IsRunning);
     }
@@ -30,9 +31,9 @@ public class EngineLifecycleTests
         int port = TestHarness.GetFreePort();
         await using SynapseManager engine = new(TestHarness.ServerConfig(port));
 
-        await engine.StartAsync();
+        await engine.StartAsync(CancellationToken.None);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(async () => await engine.StartAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await engine.StartAsync(CancellationToken.None));
     }
 
     [Fact]
@@ -53,7 +54,7 @@ public class EngineLifecycleTests
     {
         int port = TestHarness.GetFreePort();
         SynapseManager engine = new(TestHarness.ServerConfig(port));
-        await engine.StartAsync();
+        await engine.StartAsync(CancellationToken.None);
         Assert.True(engine.IsRunning);
 
         engine.Dispose();
@@ -73,8 +74,8 @@ public class EngineLifecycleTests
         fakeConnection.Initialize(new(IPAddress.Loopback, port: 1), signature:1, connectionsIndex: SynapseConnection.UnsetConnectionsIndex);
 
         await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await engine.SendAsync(fakeConnection, new byte[] { 1, 2, 3 }, isReliable: true));
-        
+            await engine.SendAsync(fakeConnection, new byte[] { 1, 2, 3 }, isReliable: true, CancellationToken.None));
+
         engine.Dispose();
     }
 
@@ -91,7 +92,7 @@ public class EngineLifecycleTests
         ConnectionRejectedReason? connectionRejectedReason = null;
         engine.ConnectionFailed += (connectionFailedEventArgs) => connectionRejectedReason = connectionFailedEventArgs.Reason;
 
-        await Assert.ThrowsAsync<InvalidOperationException>(async () => await engine.StartAsync());
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await engine.StartAsync(CancellationToken.None));
         Assert.Equal(ConnectionRejectedReason.BindFailed, connectionRejectedReason);
     }
 }

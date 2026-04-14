@@ -1,6 +1,7 @@
 using System;
 using System.Net;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
@@ -23,10 +24,10 @@ public class HandshakeAndChannelTests
         serverEventRecorder.Attach(server);
         clientEventRecorder.Attach(client);
 
-        await server.StartAsync();
-        await client.StartAsync();
+        await server.StartAsync(CancellationToken.None);
+        await client.StartAsync(CancellationToken.None);
 
-        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
         await TestHarness.WaitFor(() => serverEventRecorder.ConnectionsEstablished >= 1 && clientEventRecorder.ConnectionsEstablished >= 1);
 
         return (server, client, synapseConnection, serverEventRecorder, clientEventRecorder);
@@ -51,7 +52,7 @@ public class HandshakeAndChannelTests
         await using (server)
         await using (client)
         {
-            await client.SendAsync(synapseConnection, Encoding.UTF8.GetBytes("hello"), isReliable: false);
+            await client.SendAsync(synapseConnection, Encoding.UTF8.GetBytes("hello"), isReliable: false, CancellationToken.None);
             Assert.True(await TestHarness.WaitFor(() => serverEventRecorder.PacketsReceived >= 1),
                 "server never received an unreliable packet");
 
@@ -68,7 +69,7 @@ public class HandshakeAndChannelTests
         await using (server)
         await using (client)
         {
-            await client.SendAsync(synapseConnection, Encoding.UTF8.GetBytes("rel"), isReliable: true);
+            await client.SendAsync(synapseConnection, Encoding.UTF8.GetBytes("rel"), isReliable: true, CancellationToken.None);
             Assert.True(await TestHarness.WaitFor(() => serverEventRecorder.PacketsReceived >= 1));
         }
     }
@@ -83,7 +84,7 @@ public class HandshakeAndChannelTests
             const int Count = 20;
             for (int i = 0; i < Count; i++)
             {
-                await client.SendAsync(synapseConnection, BitConverter.GetBytes(i), isReliable: true);
+                await client.SendAsync(synapseConnection, BitConverter.GetBytes(i), isReliable: true, CancellationToken.None);
             }
 
             Assert.True(await TestHarness.WaitFor(() => serverEventRecorder.PacketsReceived >= Count, 4000));
@@ -108,18 +109,18 @@ public class HandshakeAndChannelTests
         SynapseManager serverRef = server;
         server.PacketReceived += async (packetReceivedEventArgs) =>
         {
-            await serverRef.SendAsync(packetReceivedEventArgs.Connection, Encoding.UTF8.GetBytes("pong"), isReliable: true);
+            await serverRef.SendAsync(packetReceivedEventArgs.Connection, Encoding.UTF8.GetBytes("pong"), isReliable: true, CancellationToken.None);
         };
 
         byte[]? clientReceivedPayload = null;
         client.PacketReceived += (packetReceivedEventArgs) => clientReceivedPayload = packetReceivedEventArgs.Payload.ToArray();
 
-        await server.StartAsync();
-        await client.StartAsync();
+        await server.StartAsync(CancellationToken.None);
+        await client.StartAsync(CancellationToken.None);
 
-        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
         await TestHarness.WaitFor(() => synapseConnection.State == ConnectionState.Connected);
-        await client.SendAsync(synapseConnection, Encoding.UTF8.GetBytes("ping"), isReliable: true);
+        await client.SendAsync(synapseConnection, Encoding.UTF8.GetBytes("ping"), isReliable: true, CancellationToken.None);
 
         Assert.True(await TestHarness.WaitFor(() => clientReceivedPayload != null, 3000));
         Assert.Equal("pong", Encoding.UTF8.GetString(clientReceivedPayload!));
@@ -132,7 +133,7 @@ public class HandshakeAndChannelTests
         await using (server)
         await using (client)
         {
-            await client.DisconnectAsync(synapseConnection);
+            await client.DisconnectAsync(synapseConnection, CancellationToken.None);
             Assert.True(await TestHarness.WaitFor(() => serverEventRecorder.ConnectionsClosed >= 1
                 && clientEventRecorder.ConnectionsClosed >= 1, 3000),
                 "disconnect did not fire on both sides");

@@ -66,7 +66,7 @@ public sealed partial class SynapseManager
     /// Requires <see cref="NatTraversalConfig.Mode"/> == <see cref="NatTraversalMode.Server"/> and
     /// <see cref="ServerNatConfig.ServerEndPoint"/> set.
     /// </summary>
-    public async Task<NatHostSession> HostViaNatServerAsync(CancellationToken cancellationToken = default)
+    public async Task<NatHostSession> HostViaNatServerAsync(CancellationToken cancellationToken)
     {
         if (!_isStarted || _transmissionEngine is null)
             throw new InvalidOperationException("Engine not started.");
@@ -138,7 +138,7 @@ public sealed partial class SynapseManager
     /// Requires <see cref="NatTraversalConfig.Mode"/> == <see cref="NatTraversalMode.Server"/> and
     /// <see cref="ServerNatConfig.ServerEndPoint"/> set.
     /// </summary>
-    public async Task<SynapseConnection> JoinViaNatServerAsync(uint sessionId, CancellationToken cancellationToken = default)
+    public async Task<SynapseConnection> JoinViaNatServerAsync(uint sessionId, CancellationToken cancellationToken)
     {
         if (!_isStarted || _transmissionEngine is null)
             throw new InvalidOperationException("Engine not started.");
