@@ -201,10 +201,10 @@ public sealed partial class IngressEngine
                 if (isEstablished)
                 {
                     signature = synapseConnection!.Signature;
-                    filterResult = _security.InspectEstablished(nowTicks, receivedLength);
+                    filterResult = _security.InspectEstablished(synapseConnection, receivedLength);
                 }
                 else
-                    filterResult = _security.InspectNew(nowTicks, fromEndPoint, receivedLength, out signature);
+                    filterResult = _security.InspectNew(fromEndPoint, receivedLength, out signature);
 
                 if (filterResult is not FilterResult.Allowed)
                 {
@@ -266,6 +266,35 @@ public sealed partial class IngressEngine
     /// <param name = "synapseConnection"></param>
     private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, SynapseConnection? synapseConnection, long nowTicks, CancellationToken cancellationToken, ref bool isPayloadCopied)
     {
+        // Fast path: unreliable unsegmented payload — the dominant case.
+        // PacketType.None = 0, header is exactly one byte. Filter guarantees length > 0.
+        // Skip PacketHeader.Read entirely; no other fields are needed.
+        if (buffer[0] == (byte)PacketType.None)
+        {
+            if (synapseConnection is null)
+            {
+                _telemetry.OnDroppedIn();
+                return;
+            }
+
+            synapseConnection.LastReceivedTicks = nowTicks;
+            int fastPayloadLength = length - PacketHeader.TypeSize;
+
+            if (!_config.CopyReceivedPayloads)
+            {
+                isPayloadCopied = false;
+                PayloadDelivered?.Invoke(synapseConnection, new(buffer, PacketHeader.TypeSize, fastPayloadLength), false);
+            }
+            else
+            {
+                byte[] payloadCopyBuffer = ArrayPool<byte>.Shared.Rent(fastPayloadLength);
+                Buffer.BlockCopy(buffer, PacketHeader.TypeSize, payloadCopyBuffer, 0, fastPayloadLength);
+                PayloadDelivered?.Invoke(synapseConnection, new(payloadCopyBuffer, 0, fastPayloadLength), false);
+            }
+
+            return;
+        }
+
         PacketType type;
         ushort sequence;
         ushort segmentId;
@@ -423,22 +452,6 @@ public sealed partial class IngressEngine
                 return;
             }
 
-            case PacketType.None:
-            {
-                if (!_config.CopyReceivedPayloads)
-                {
-                    isPayloadCopied = false;
-                    PayloadDelivered?.Invoke(synapseConnection, new(buffer, headerSize, payloadLength), false);
-                }
-                else
-                {
-                    byte[] payloadCopyBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
-                    Buffer.BlockCopy(buffer, headerSize, payloadCopyBuffer, 0, payloadLength);
-                    PayloadDelivered?.Invoke(synapseConnection, new(payloadCopyBuffer, 0, payloadLength), false);
-                }
-
-                return;
-            }
         }
     }
 

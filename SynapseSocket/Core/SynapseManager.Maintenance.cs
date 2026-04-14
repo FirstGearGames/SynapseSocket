@@ -36,6 +36,12 @@ public sealed partial class SynapseManager
     /// </summary>
     private readonly long _segmentAssemblyTimeoutTicks;
     /// <summary>
+    /// Maximum number of packets a single connection may receive per second before further packets are dropped.
+    /// Derived from <see cref="SynapseSocket.Core.Configuration.SynapseConfig.MaximumPacketsPerSecond"/>.
+    /// Set to <see cref="SynapseSocket.Core.Configuration.SynapseConfig.DisabledMaximumPacketsPerSecond"/> when the limit is disabled.
+    /// </summary>
+    private readonly uint _maximumPacketsPerSecond;
+    /// <summary>
     /// Cached value of <see cref="SynapseSocket.Core.Configuration.ReliableConfig.AckBatchingEnabled"/> to avoid repeated config lookups on the hot maintenance path.
     /// </summary>
     private readonly bool _isAckBatchingEnabled;
@@ -85,7 +91,8 @@ public sealed partial class SynapseManager
                     if (PerformKeepAlive(nowTicks, connection, cancellationToken))
                     {
                         RetransmitReliable(nowTicks, connection, cancellationToken);
-                        SegmentAssemblyTimeoutSweep(nowTicks, connection);
+                        TimeoutAssembledSegments(nowTicks, connection);
+                        ResetReceivedByPacketCount(nowTicks, connection);
                     }
                 }
             }
@@ -247,6 +254,18 @@ public sealed partial class SynapseManager
     }
 
     /// <summary>
+    /// Resets the per-connection inbound packet counter for <paramref name="synapseConnection"/> if the one-second window has elapsed.
+    /// No-op when <see cref="SynapseSocket.Core.Configuration.SynapseConfig.MaximumPacketsPerSecond"/> is disabled.
+    /// </summary>
+    private void ResetReceivedByPacketCount(long nowTicks, SynapseConnection synapseConnection)
+    {
+        if (_maximumPacketsPerSecond == SynapseConfig.DisabledMaximumPacketsPerSecond)
+            return;
+
+        synapseConnection.ResetReceivedByPacketCount(nowTicks);
+    }
+    
+    /// <summary>
     /// Reliable retransmission sweep: any pending reliable packet whose resend timer has expired is re-sent.
     /// Packets exceeding the retry cap are treated as a <see cref="ViolationReason.ReliableExhausted"/> violation.
     /// </summary>
@@ -288,7 +307,7 @@ public sealed partial class SynapseManager
     /// <summary>
     /// Evicts incomplete segment assemblies (reliable or unreliable) that have exceeded <see cref="SynapseSocket.Core.Configuration.SynapseConfig.SegmentAssemblyTimeoutMilliseconds"/> on each connection that has an active segmenter.
     /// </summary>
-    private void SegmentAssemblyTimeoutSweep(long nowTicks, SynapseConnection synapseConnection)
+    private void TimeoutAssembledSegments(long nowTicks, SynapseConnection synapseConnection)
     {
         if (_segmentAssemblyTimeoutTicks == UnsetSegmentAssemblyTimeoutTicks)
             return;

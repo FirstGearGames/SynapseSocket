@@ -25,10 +25,6 @@ public sealed class LatencySimulator
     /// Pseudo-random number generator used for loss rolls, jitter, and reorder decisions.
     /// </summary>
     private readonly Random _random = new();
-    /// <summary>
-    /// Guards shared access to <see cref="_random"/>.
-    /// </summary>
-    private readonly object _lock = new();
 
     /// <summary>
     /// Creates a simulator from the provided configuration.
@@ -50,21 +46,12 @@ public sealed class LatencySimulator
     /// <returns>A task that completes when the packet has been passed to <paramref name="sender"/> or dropped.</returns>
     public Task ProcessAsync(ArraySegment<byte> segment, IPEndPoint target, Func<ArraySegment<byte>, IPEndPoint, Task> sender, CancellationToken cancellationToken)
     {
-        if (!_config.IsEnabled)
-            return sender(segment, target);
+        double lossRoll = _random.NextDouble();
+        int jitter = _config.JitterMilliseconds > 0 ? _random.Next(0, (int)_config.JitterMilliseconds) : 0;
+        int delayMilliseconds = (int)_config.BaseLatencyMilliseconds + jitter;
 
-        double lossRoll;
-        int delayMilliseconds;
-
-        lock (_lock)
-        {
-            lossRoll = _random.NextDouble();
-            int jitter = _config.JitterMilliseconds > 0 ? _random.Next(0, (int)_config.JitterMilliseconds) : 0;
-            delayMilliseconds = (int)_config.BaseLatencyMilliseconds + jitter;
-
-            if (_random.NextDouble() < _config.ReorderChance)
-                delayMilliseconds += _random.Next(0, 50);
-        }
+        if (_random.NextDouble() < _config.ReorderChance)
+            delayMilliseconds += _random.Next(0, 50);
 
         if (lossRoll < _config.PacketLossChance)
             return Task.CompletedTask;

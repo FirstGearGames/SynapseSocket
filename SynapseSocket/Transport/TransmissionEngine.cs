@@ -41,6 +41,10 @@ public sealed partial class TransmissionEngine
     /// Latency simulator that may artificially delay or drop outbound packets for testing purposes.
     /// </summary>
     private readonly LatencySimulator _latencySimulator;
+    /// <summary>
+    /// True if the LatencySimulator is enabled.
+    /// </summary>
+    private readonly bool _isLatencySimulatorEnabled;
 
     /// <summary>
     /// Creates a new transmission engine bound to the given sockets.
@@ -56,7 +60,9 @@ public sealed partial class TransmissionEngine
         _ipv6Socket = ipv6Socket;
         _config = config;
         _telemetry = telemetry;
+
         _latencySimulator = latency;
+        _isLatencySimulatorEnabled = _latencySimulator.IsEnabled;
     }
 
     /// <summary>
@@ -67,6 +73,9 @@ public sealed partial class TransmissionEngine
     /// <param name="cancellationToken">Token to cancel the operation.</param>
     public Task SendRawAsync(ArraySegment<byte> segment, IPEndPoint target, CancellationToken cancellationToken)
     {
+        if (!_isLatencySimulatorEnabled)
+            return SendDirectAsync(segment, target);
+
         return _latencySimulator.ProcessAsync(segment, target, SendDirectAsync, cancellationToken);
     }
 
@@ -253,12 +262,12 @@ public sealed partial class TransmissionEngine
     private async Task SendDirectAsync(ArraySegment<byte> segment, IPEndPoint target)
     {
         Socket socket = target.AddressFamily == AddressFamily.InterNetworkV6 && _ipv6Socket is not null ? _ipv6Socket : _ipv4Socket;
-#if NET8_0_OR_GREATER 
-        //ReadOnlyMemory<byte> + ValueTask overload; CancellationToken.None because SendDirectAsync has no token.
+        #if NET8_0_OR_GREATER
+        // ReadOnlyMemory<byte> + ValueTask overload; CancellationToken.None because SendDirectAsync has no token.
         int bytesSent = await socket.SendToAsync(segment.AsMemory(), SocketFlags.None, target, CancellationToken.None).ConfigureAwait(false);
-#else
+        #else
         int bytesSent = await socket.SendToAsync(segment, SocketFlags.None, target).ConfigureAwait(false);
-#endif
+        #endif
         _telemetry.OnSent(bytesSent);
     }
 

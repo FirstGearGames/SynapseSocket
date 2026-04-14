@@ -8,6 +8,7 @@ using CodeBoost.CodeAnalysis;
 using CodeBoost.Extensions;
 using CodeBoost.Performance;
 using SynapseSocket.Core;
+using SynapseSocket.Core.Configuration;
 using SynapseSocket.Packets;
 using SynapseSocket.Security;
 using SynapseSocket.Transport;
@@ -17,7 +18,7 @@ namespace SynapseSocket.Connections;
 /// <summary>
 /// Represents the state of a single remote peer session, including reliable send/receive windows, keep-alive timestamps, and signature binding.
 /// </summary>
-public sealed class SynapseConnection : IPoolResettable
+public sealed partial class SynapseConnection : IPoolResettable
 {
     /// <summary>
     /// Remote endpoint of this connection.
@@ -282,7 +283,7 @@ public sealed class SynapseConnection : IPoolResettable
         NextOutgoingSequence = 0;
         NextExpectedSequence = 0;
         PendingAcks.Clear();
-
+        
         foreach (PendingReliable? value in PendingReliableQueue.Values)
             ResettableObjectPool<PendingReliable>.Return(value);
 
@@ -295,6 +296,10 @@ public sealed class SynapseConnection : IPoolResettable
 
         ResettableObjectPool<PacketSplitter>.ReturnAndNullifyReference(ref Splitter);
         ResettableObjectPool<PacketReassembler>.ReturnAndNullifyReference(ref Reassembler);
+        
+        /* Security. */
+        _receivedPacketCountResetTick = 0;
+        _receivedByPacketCount = 0;
     }
 
     /// <inheritdoc/>

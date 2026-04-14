@@ -12,7 +12,7 @@
         <NoWarn>$(NoWarn);CS8618;CS8625;CS0067</NoWarn>
         <Description>Synapse - High-Performance Multi-Stack UDP Transport Engine</Description>
         <Version>1.0.0</Version>
-        <TargetFrameworks>net8.0;netstandard2.1</TargetFrameworks>
+        <TargetFramework>net8.0</TargetFramework>
     </PropertyGroup>
 
     <ItemGroup>

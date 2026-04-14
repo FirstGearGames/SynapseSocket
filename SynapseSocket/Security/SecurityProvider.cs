@@ -1,6 +1,8 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Net;
+using SynapseSocket.Connections;
+using SynapseSocket.Core.Configuration;
 
 namespace SynapseSocket.Security;
 
@@ -81,16 +83,16 @@ public sealed class SecurityProvider
     /// <returns>True if the signature was present and has been removed; false if it was not found.</returns>
     public bool RemoveFromBlacklist(ulong signature) => _blacklist.TryRemove(signature, out _);
 
-    internal FilterResult InspectEstablished(long nowTicks, int packetLength)
+    internal FilterResult InspectEstablished(SynapseConnection synapseConnection, int packetLength)
     {
         if (packetLength <= 0 || packetLength > _maximumPacketSize)
             return FilterResult.Oversized;
 
         /* Bytes per second are intentionally not checked. Maximum packet size with maximum
          * packets per second is sufficient. */
-
-        // todo Per-connection rate limiting using connection-owned fields is not yet implemented.
-        // When implemented, check per-connection packet count against _maximumPacketsPerSecond here.
+        if (_maximumPacketsPerSecond != SynapseConfig.DisabledMaximumPacketsPerSecond && !synapseConnection.AllowReceivePacket(_maximumPacketsPerSecond))
+            return FilterResult.RateLimited;
+        
         return FilterResult.Allowed;
     }
 
@@ -103,7 +105,7 @@ public sealed class SecurityProvider
     /// <param name="packetLength">Length of the received packet in bytes.</param>
     /// <param name="signature">The computed peer signature, or <see cref="UnsetSignature"/> on failure.</param>
     /// <returns>A <see cref="FilterResult"/> indicating whether the packet should be processed or dropped.</returns>
-    public FilterResult InspectNew(long nowTicks, IPEndPoint endPoint, int packetLength, out ulong signature)
+    public FilterResult InspectNew(IPEndPoint endPoint, int packetLength, out ulong signature)
     {
         // Reject immediately if the signature cannot be computed or resolves to the unset sentinel.
         // Without a valid identity we cannot rate-limit, blacklist, or attribute a violation correctly, so there is nothing useful we can do with the packet.
@@ -116,7 +118,10 @@ public sealed class SecurityProvider
         if (_blacklist.ContainsKey(signature))
             return FilterResult.Blacklisted;
 
-        return InspectEstablished(nowTicks, packetLength);
+        if (packetLength <= 0 || packetLength > _maximumPacketSize)
+            return FilterResult.Oversized;
+
+        return FilterResult.Allowed;
     }
     
 }

@@ -161,6 +161,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
          * a timeout is unset. */
         uint segmentAssemblyTimeoutMilliseconds = config.SegmentAssemblyTimeoutMilliseconds;
         _segmentAssemblyTimeoutTicks = _isSegmentingEnabled && segmentAssemblyTimeoutMilliseconds != SynapseConfig.DisabledSegmentAssemblyTimeout ? TimeSpan.FromMilliseconds(segmentAssemblyTimeoutMilliseconds).Ticks : UnsetSegmentAssemblyTimeoutTicks;
+        _maximumPacketsPerSecond = Config.MaximumPacketsPerSecond;
     }
 
     /// <summary>
