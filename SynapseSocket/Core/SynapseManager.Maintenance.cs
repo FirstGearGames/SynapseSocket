@@ -20,17 +20,50 @@ public sealed partial class SynapseManager
     /// UTC ticks of the last ACK batch flush. Used by <see cref="SendPendingAcks"/> to enforce the configured interval.
     /// </summary>
     private long _lastAckFlushTicks;
+    /// <summary>
+    /// Ticks between keep-alive heartbeats, derived from <see cref="SynapseSocket.Core.Configuration.ConnectionConfig.KeepAliveIntervalMilliseconds"/>.
+    /// </summary>
     private long _connectionKeepAliveTicks;
+    /// <summary>
+    /// Ticks of idle time after which a connection is considered timed out, derived from <see cref="SynapseSocket.Core.Configuration.ConnectionConfig.TimeoutMilliseconds"/>.
+    /// </summary>
     private long _connectionTimeoutTicks;
+    /// <summary>
+    /// Ticks between reliable packet retransmission attempts, derived from <see cref="SynapseSocket.Core.Configuration.ReliableConfig.ResendMilliseconds"/>.
+    /// </summary>
     private long _reliableResendTicks;
+    /// <summary>
+    /// Maximum number of retransmission attempts before a reliable packet is considered lost, derived from <see cref="SynapseSocket.Core.Configuration.ReliableConfig.MaximumRetries"/>.
+    /// </summary>
     private uint _maximumReliableRetries;
+    /// <summary>
+    /// Ticks after which an incomplete segment assembly is evicted. Set to <see cref="UnsetSegmentAssemblyTimeoutTicks"/> when the timeout is disabled or segmentation is off.
+    /// </summary>
     private long _segmentAssemblyTimeoutTicks;
+    /// <summary>
+    /// Cached value of <see cref="SynapseSocket.Core.Configuration.ReliableConfig.AckBatchingEnabled"/> to avoid repeated config lookups on the hot maintenance path.
+    /// </summary>
     private bool _isAckBatchingEnabled;
+    /// <summary>
+    /// Ticks between ACK batch flushes, derived from <see cref="SynapseSocket.Core.Configuration.ReliableConfig.AckBatchIntervalMilliseconds"/>. Unset when ACK batching is disabled.
+    /// </summary>
     private long _ackBatchingIntervalTicks;
+    /// <summary>
+    /// Index of the connection to process on the next maintenance tick. Wraps around when it reaches the connection count.
+    /// </summary>
     private int _nextMaintenanceConnectionIndex;
+    /// <summary>
+    /// Index of the connection to process on the next ACK flush tick. Reserved for future per-connection ACK batching.
+    /// </summary>
     private int _nextAckConnectionIndex;
-    private long UnsetSegmentAssemblyTimeoutTicks = 0;
-    private long UnsetAckBatchingIntervalTicks = 0;
+    /// <summary>
+    /// Sentinel value indicating that segment assembly timeout is disabled.
+    /// </summary>
+    private const long UnsetSegmentAssemblyTimeoutTicks = 0;
+    /// <summary>
+    /// Sentinel value indicating that ACK batching interval is unset (batching disabled).
+    /// </summary>
+    private const long UnsetAckBatchingIntervalTicks = 0;
 
     /// <summary>
     /// Background loop that periodically runs keep-alive, retransmit, and segment-timeout sweeps.
