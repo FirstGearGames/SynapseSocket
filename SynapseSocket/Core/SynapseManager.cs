@@ -80,12 +80,6 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     public bool IsRunning => _isStarted && !_isDisposed;
     private bool _isStarted;
-    #if PERFTEST
-    /// <summary>
-    /// Internal performance counters for hot-path timing. DEBUG builds only.
-    /// </summary>
-    internal PerfCounters Perf { get; } = new();
-    #endif
     private bool _isDisposed;
     private readonly LatencySimulator _latencySimulator;
     private readonly bool _isSegmentingEnabled;

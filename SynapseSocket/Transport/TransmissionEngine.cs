@@ -67,7 +67,7 @@ public sealed partial class TransmissionEngine
     /// <param name="cancellationToken">Token to cancel the operation.</param>
     public Task SendRawAsync(ArraySegment<byte> segment, IPEndPoint target, CancellationToken cancellationToken)
     {
-        return _latencySimulator.ProcessAsync(segment.Array!, segment.Count, target, SendDirectAsync, cancellationToken);
+        return _latencySimulator.ProcessAsync(segment, target, SendDirectAsync, cancellationToken);
     }
 
     /// <summary>
@@ -245,13 +245,12 @@ public sealed partial class TransmissionEngine
     /// Sends bytes directly over the appropriate socket (IPv6 when available, otherwise IPv4)
     /// and records the sent byte count in telemetry.
     /// </summary>
-    /// <param name="buffer">The buffer containing the bytes to send.</param>
-    /// <param name="length">Number of bytes to send from the start of <paramref name="buffer"/>.</param>
+    /// <param name="segment">The packet data to send, including offset and length.</param>
     /// <param name="target">The remote endpoint to send to.</param>
-    private async Task SendDirectAsync(byte[] buffer, int length, IPEndPoint target)
+    private async Task SendDirectAsync(ArraySegment<byte> segment, IPEndPoint target)
     {
         Socket socket = target.AddressFamily == AddressFamily.InterNetworkV6 && _ipv6Socket is not null ? _ipv6Socket : _ipv4Socket;
-        int bytesSent = await socket.SendToAsync(new(buffer, 0, length), SocketFlags.None, target).ConfigureAwait(false);
+        int bytesSent = await socket.SendToAsync(segment, SocketFlags.None, target).ConfigureAwait(false);
         _telemetry.OnSent(bytesSent);
     }
 

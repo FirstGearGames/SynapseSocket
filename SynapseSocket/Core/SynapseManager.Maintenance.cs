@@ -3,9 +3,6 @@ using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
-#if PERFTEST
-using System.Diagnostics;
-#endif
 using SynapseSocket.Connections;
 using SynapseSocket.Core.Events;
 using SynapseSocket.Transport;
@@ -62,11 +59,14 @@ public sealed partial class SynapseManager
 
                 long nowTicks = DateTime.UtcNow.Ticks;
 
-                if (!PerformKeepAlive(nowTicks, connection, cancellationToken))
-                    return;
+                if (PerformKeepAlive(nowTicks, connection, cancellationToken))
+                {
+                    RetransmitReliable(nowTicks, connection, cancellationToken);
+                    SegmentAssemblyTimeoutSweep(nowTicks, connection);
+                    SendPendingAcks(nowTicks, cancellationToken);
+                }
 
-                RetransmitReliable(nowTicks, connection, cancellationToken);
-                SegmentAssemblyTimeoutSweep(nowTicks, connection);
+                _nextMaintenanceConnectionIndex++;
             }
             catch (OperationCanceledException)
             {

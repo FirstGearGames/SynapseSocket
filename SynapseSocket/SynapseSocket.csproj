@@ -11,7 +11,6 @@
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
         <!-- Suppress warnings that originate in CodeBoost source files. -->
         <NoWarn>$(NoWarn);CS8618;CS8625;CS0067</NoWarn>
-        <DefineConstants>$(DefineConstants);PERFTEST</DefineConstants>
         <Description>Synapse - High-Performance Multi-Stack UDP Transport Engine</Description>
         <Version>1.0.0</Version>
     </PropertyGroup>

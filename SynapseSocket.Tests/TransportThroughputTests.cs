@@ -6,9 +6,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
-#if PERFTEST
-using PerfCounters = SynapseSocket.Diagnostics.PerfCounters;
-#endif
 using Xunit;
 using Xunit.Abstractions;
 
@@ -139,10 +136,6 @@ public sealed class TransportThroughputTests
             _output.WriteLine($"Elapsed           : {elapsedMilliseconds:F2} ms");
             _output.WriteLine($"Throughput        : {megabytesPerSecond:F3} MB/s");
             _output.WriteLine($"Message rate      : {messagesPerSecond:F0} msg/s");
-#if PERFTEST
-
-#endif
-
             Assert.Equal(expectedMessageCount, receivedMessageCount);
             Assert.Equal(expectedByteCount, Volatile.Read(ref receivedByteCount));
         }

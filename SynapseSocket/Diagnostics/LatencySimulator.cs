@@ -43,16 +43,15 @@ public sealed class LatencySimulator
     /// Processes an outbound packet through the simulator.
     /// The sender function is invoked after the computed delay unless the packet is dropped.
     /// </summary>
-    /// <param name="buffer">The raw packet data to send.</param>
-    /// <param name="length">The number of valid bytes in <paramref name="buffer"/>.</param>
+    /// <param name="segment">The packet data to send, including offset and length.</param>
     /// <param name="target">The remote endpoint the packet is addressed to.</param>
     /// <param name="sender">The underlying send function to invoke after any simulated delay.</param>
     /// <param name="cancellationToken">Token used to cancel the delayed send.</param>
     /// <returns>A task that completes when the packet has been passed to <paramref name="sender"/> or dropped.</returns>
-    public Task ProcessAsync(byte[] buffer, int length, IPEndPoint target, Func<byte[], int, IPEndPoint, Task> sender, CancellationToken cancellationToken)
+    public Task ProcessAsync(ArraySegment<byte> segment, IPEndPoint target, Func<ArraySegment<byte>, IPEndPoint, Task> sender, CancellationToken cancellationToken)
     {
         if (!_config.IsEnabled)
-            return sender(buffer, length, target);
+            return sender(segment, target);
 
         double lossRoll;
         int delayMilliseconds;
@@ -70,24 +69,23 @@ public sealed class LatencySimulator
         if (lossRoll < _config.PacketLossChance)
             return Task.CompletedTask;
 
-        return DelayedSendAsync(buffer, length, target, sender, delayMilliseconds, cancellationToken);
+        return DelayedSendAsync(segment, target, sender, delayMilliseconds, cancellationToken);
     }
 
     /// <summary>
     /// Waits for the specified delay then invokes the sender function.
     /// </summary>
-    /// <param name="buffer">The raw packet data to send.</param>
-    /// <param name="length">The number of valid bytes in <paramref name="buffer"/>.</param>
+    /// <param name="segment">The packet data to send, including offset and length.</param>
     /// <param name="target">The remote endpoint the packet is addressed to.</param>
     /// <param name="sender">The underlying send function to invoke after the delay.</param>
     /// <param name="delayMilliseconds">Milliseconds to wait before sending.</param>
     /// <param name="cancellationToken">Token used to cancel the delay.</param>
     /// <returns>A task that completes when the delayed send has finished.</returns>
-    private static async Task DelayedSendAsync(byte[] buffer, int length, IPEndPoint target, Func<byte[], int, IPEndPoint, Task> sender, int delayMilliseconds, CancellationToken cancellationToken)
+    private static async Task DelayedSendAsync(ArraySegment<byte> segment, IPEndPoint target, Func<ArraySegment<byte>, IPEndPoint, Task> sender, int delayMilliseconds, CancellationToken cancellationToken)
     {
         if (delayMilliseconds > 0)
             await Task.Delay(delayMilliseconds, cancellationToken).ConfigureAwait(false);
 
-        await sender(buffer, length, target).ConfigureAwait(false);
+        await sender(segment, target).ConfigureAwait(false);
     }
 }

@@ -11,10 +11,6 @@ using SynapseSocket.Connections;
 using SynapseSocket.Core;
 using Xunit;
 using Xunit.Abstractions;
-#if PERFTEST
-using PerfCounters = SynapseSocket.Diagnostics.PerfCounters;
-#endif
-
 namespace SynapseSocket.Tests;
 
 public sealed class TransportThroughputPerfTests

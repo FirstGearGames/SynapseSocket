@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Net;
-using System.Threading;
 using SynapseSocket.Core.Configuration;
 using SynapseSocket.Diagnostics;
 
@@ -92,16 +91,10 @@ public sealed class SecurityProvider
 
         /* Bytes per second are intentionally not checked. Maximum packet size with maximum
          * packets per second is sufficient. */
-        if (_maximumPacketsPerSecond == SynapseConfig.UnsetMaximumPacketsPerSecond)
-            return FilterResult.Allowed;
 
-        //todo //hotpath
-        /* make rate limiting variables on the connection to track packets sent.
-         * Use root members to prevent memory jumps.
-         *
-         * Return pass if not rate limited -- otherwise return rate limited of course.
-         * */
-        return FilterResult.RateLimited;
+        // todo Per-connection rate limiting using connection-owned fields is not yet implemented.
+        // When implemented, check per-connection packet count against _maximumPacketsPerSecond here.
+        return FilterResult.Allowed;
     }
 
     /// <summary>

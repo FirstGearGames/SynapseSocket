@@ -1,0 +1,7 @@
+Fix segmented send offset bug; remove rate bucket code
+
+- fix: SendRawAsync passed segment.Array!/Count to ProcessAsync, ignoring segment.Offset — all segments after the first sent wrong bytes (always segment 0's data from offset 0 of the shared backing buffer)
+- fix: LatencySimulator.ProcessAsync and DelayedSendAsync now take ArraySegment<byte> instead of (byte[], int) so offset is preserved through the send path
+- fix: SendDirectAsync now takes ArraySegment<byte> and passes it directly to SendToAsync
+- fix: removed PreConnectionRateBucket class, _rateBuckets dictionary, and rate-limiting block from SecurityProvider.InspectNew (intentionally removed per user)
+- fix: removed unused System.Threading import from SecurityProvider.cs

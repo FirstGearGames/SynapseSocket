@@ -88,15 +88,15 @@ public class SegmentationTests
         // Establish a connection first so the server has a known peer.
         using Socket socket = TestHarness.CreateRawSocket();
         IPEndPoint serverEndPoint = new(IPAddress.Loopback, port);
-        socket.SendTo(new byte[] { 0x04 }, serverEndPoint); // Handshake
+        socket.SendTo(new byte[] { 0x03 }, serverEndPoint); // PacketType.Handshake
         Assert.True(await TestHarness.WaitFor(() => eventRecorder.ConnectionsEstablished >= 1),
             "connection should have been established");
 
         // Craft a raw segmented packet:
-        // PacketFlags.Segmented = 1 << 5 = 0x20
-        // Header: [flags=0x20, segmentId_lo=0x01, segmentId_hi=0x00, segmentIndex=0x00, segmentCount=0x05]
+        // PacketType.Segmented = 6 = 0x06
+        // Header: [type=0x06, segmentId_lo=0x01, segmentId_hi=0x00, segmentIndex=0x00, segmentCount=0x05]
         // segmentCount=5, MTU=200 => 5*200=1000 > MaximumReassembledPacketSize=500 => blacklist
-        byte[] segmentedPacket = [0x20, 0x01, 0x00, 0x00, 0x05, 0xAA, 0xBB, 0xCC];
+        byte[] segmentedPacket = [0x06, 0x01, 0x00, 0x00, 0x05, 0xAA, 0xBB, 0xCC];
         socket.SendTo(segmentedPacket, serverEndPoint);
 
         Assert.True(await TestHarness.WaitFor(

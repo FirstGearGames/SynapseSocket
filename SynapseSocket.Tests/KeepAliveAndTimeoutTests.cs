@@ -28,7 +28,7 @@ public class KeepAliveAndTimeoutTests
         // Stand up a raw socket that pretends to handshake once and then
         // goes silent so the server times it out.
         using Socket socket = TestHarness.CreateRawSocket();
-        byte[] handshakePacket = [0x04]; // PacketFlags.Handshake
+        byte[] handshakePacket = [0x03]; // PacketType.Handshake
         socket.SendTo(handshakePacket, new IPEndPoint(IPAddress.Loopback, port));
 
         Assert.True(await TestHarness.WaitFor(() => eventRecorder.ConnectionsEstablished >= 1));
