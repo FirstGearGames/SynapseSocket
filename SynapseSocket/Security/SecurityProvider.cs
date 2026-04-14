@@ -1,8 +1,6 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Net;
-using SynapseSocket.Core.Configuration;
-using SynapseSocket.Diagnostics;
 
 namespace SynapseSocket.Security;
 
@@ -39,9 +37,8 @@ public sealed class SecurityProvider
     /// </summary>
     /// <param name="signatureProvider">The signature provider used to identify remote peers.</param>
     /// <param name="maximumPacketsPerSecond">Per-peer packet rate limit. Zero disables packet rate limiting.</param>
-    /// <param name="maximumBytesPerSecond">Per-peer byte rate limit. Zero disables byte rate limiting.</param>
     /// <param name="maximumPacketSize">Maximum permitted packet size in bytes.</param>
-    public SecurityProvider(ISignatureProvider signatureProvider, uint maximumPacketsPerSecond, uint maximumBytesPerSecond, uint maximumPacketSize)
+    public SecurityProvider(ISignatureProvider signatureProvider, uint maximumPacketsPerSecond, uint maximumPacketSize)
     {
         SignatureProvider = signatureProvider ?? throw new ArgumentNullException(nameof(signatureProvider));
         _maximumPacketsPerSecond = maximumPacketsPerSecond;

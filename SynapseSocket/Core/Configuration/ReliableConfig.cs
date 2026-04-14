@@ -5,6 +5,8 @@ namespace SynapseSocket.Core.Configuration;
 /// </summary>
 public sealed class ReliableConfig
 {
+    // ReSharper disable FieldCanBeMadeReadOnly.Global
+
     /// <summary>
     /// Maximum number of unacknowledged reliable packets per connection before backpressure is applied.
     /// </summary>
@@ -32,4 +34,14 @@ public sealed class ReliableConfig
     /// Lower values reduce ACK latency; higher values improve batching efficiency under bursts.
     /// </summary>
     public uint AckBatchIntervalMilliseconds = 20;
+
+    /// <summary>
+    /// Minimum permitted value for <see cref="AckBatchIntervalMilliseconds"/>. Values below this are clamped up.
+    /// </summary>
+    public const uint MinimumAckBatchIntervalMilliseconds = 20;
+    /// <summary>
+    /// Maximum permitted value for <see cref="AckBatchIntervalMilliseconds"/>. Values above this are clamped down.
+    /// </summary>
+    public const uint MaximumAckBatchIntervalMilliseconds = 1000;
+
 }

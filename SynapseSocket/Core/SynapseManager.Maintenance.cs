@@ -1,11 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
-using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using SynapseSocket.Connections;
+using SynapseSocket.Core.Configuration;
 using SynapseSocket.Core.Events;
-using SynapseSocket.Transport;
 
 namespace SynapseSocket.Core;
 
@@ -17,65 +16,56 @@ public sealed partial class SynapseManager
 {
     private const string ViolationReliableExhausted = "Connection exceeded the maximum reliable packet retry limit.";
     /// <summary>
-    /// UTC ticks of the last ACK batch flush. Used by <see cref="SendPendingAcks"/> to enforce the configured interval.
-    /// </summary>
-    private long _lastAckFlushTicks;
-    /// <summary>
     /// Ticks between keep-alive heartbeats, derived from <see cref="SynapseSocket.Core.Configuration.ConnectionConfig.KeepAliveIntervalMilliseconds"/>.
     /// </summary>
-    private long _connectionKeepAliveTicks;
+    private readonly long _connectionKeepAliveTicks;
     /// <summary>
     /// Ticks of idle time after which a connection is considered timed out, derived from <see cref="SynapseSocket.Core.Configuration.ConnectionConfig.TimeoutMilliseconds"/>.
     /// </summary>
-    private long _connectionTimeoutTicks;
+    private readonly long _connectionTimeoutTicks;
     /// <summary>
     /// Ticks between reliable packet retransmission attempts, derived from <see cref="SynapseSocket.Core.Configuration.ReliableConfig.ResendMilliseconds"/>.
     /// </summary>
-    private long _reliableResendTicks;
+    private readonly long _reliableResendTicks;
     /// <summary>
     /// Maximum number of retransmission attempts before a reliable packet is considered lost, derived from <see cref="SynapseSocket.Core.Configuration.ReliableConfig.MaximumRetries"/>.
     /// </summary>
-    private uint _maximumReliableRetries;
+    private readonly uint _maximumReliableRetries;
     /// <summary>
     /// Ticks after which an incomplete segment assembly is evicted. Set to <see cref="UnsetSegmentAssemblyTimeoutTicks"/> when the timeout is disabled or segmentation is off.
     /// </summary>
-    private long _segmentAssemblyTimeoutTicks;
+    private readonly long _segmentAssemblyTimeoutTicks;
     /// <summary>
     /// Cached value of <see cref="SynapseSocket.Core.Configuration.ReliableConfig.AckBatchingEnabled"/> to avoid repeated config lookups on the hot maintenance path.
     /// </summary>
-    private bool _isAckBatchingEnabled;
-    /// <summary>
-    /// Ticks between ACK batch flushes, derived from <see cref="SynapseSocket.Core.Configuration.ReliableConfig.AckBatchIntervalMilliseconds"/>. Unset when ACK batching is disabled.
-    /// </summary>
-    private long _ackBatchingIntervalTicks;
+    private readonly bool _isAckBatchingEnabled;
     /// <summary>
     /// Index of the connection to process on the next maintenance tick. Wraps around when it reaches the connection count.
     /// </summary>
     private int _nextMaintenanceConnectionIndex;
     /// <summary>
-    /// Index of the connection to process on the next ACK flush tick. Reserved for future per-connection ACK batching.
+    /// Index of the connection to flush pending ACKs for on the next ACK loop tick. Wraps around when it reaches the connection count.
     /// </summary>
-    private int _nextAckConnectionIndex;
+    private int _nextPendingAckConnectionIndex;
+    /// <summary>
+    /// Sentinel value indicating that ACK batching interval is unset (batching disabled).
+    /// </summary>
+    public const long UnsetAckBatchingIntervalTicks = 0;
     /// <summary>
     /// Sentinel value indicating that segment assembly timeout is disabled.
     /// </summary>
     private const long UnsetSegmentAssemblyTimeoutTicks = 0;
-    /// <summary>
-    /// Sentinel value indicating that ACK batching interval is unset (batching disabled).
-    /// </summary>
-    private const long UnsetAckBatchingIntervalTicks = 0;
 
     /// <summary>
     /// Background loop that periodically runs keep-alive, retransmit, and segment-timeout sweeps.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private async Task MaintenanceLoopAsync(CancellationToken cancellationToken)
     {
         const int MaintenanceLoopTargetMilliseconds = 50;
-        
+
         while (!cancellationToken.IsCancellationRequested)
         {
-            if (Connections is null || Connections.Connections.Count == 0)
+            if (!DoConnectionsExist())
             {
                 await Task.Delay(MaintenanceLoopTargetMilliseconds, cancellationToken).ConfigureAwait(false);
                 continue;
@@ -85,10 +75,7 @@ public sealed partial class SynapseManager
 
             try
             {
-                if (_nextMaintenanceConnectionIndex >= connectionsCount)
-                    _nextMaintenanceConnectionIndex = 0;
-
-                SynapseConnection connection = Connections.Connections[_nextMaintenanceConnectionIndex];
+                SynapseConnection connection = GetConnectionAndIncreaseIndex(connectionsCount, ref _nextMaintenanceConnectionIndex);
 
                 long nowTicks = DateTime.UtcNow.Ticks;
 
@@ -96,10 +83,7 @@ public sealed partial class SynapseManager
                 {
                     RetransmitReliable(nowTicks, connection, cancellationToken);
                     SegmentAssemblyTimeoutSweep(nowTicks, connection);
-                    SendPendingAcks(nowTicks, cancellationToken);
                 }
-
-                _nextMaintenanceConnectionIndex++;
             }
             catch (OperationCanceledException)
             {
@@ -112,16 +96,93 @@ public sealed partial class SynapseManager
 
             try
             {
-                /* Wait time is calculated to have iterated all connections
-                 * at roughly the target milliseconds. */
-                int waitMilliseconds = Math.Max(1, MaintenanceLoopTargetMilliseconds / connectionsCount);
-                await Task.Delay(waitMilliseconds, cancellationToken).ConfigureAwait(false);
+                await WaitDelayForLoop(MaintenanceLoopTargetMilliseconds, connectionsCount, cancellationToken);
             }
             catch (OperationCanceledException)
             {
                 break;
             }
         }
+    }
+
+    /// <summary>
+    /// Background loop that flushes batched outbound ACKs for each connection at the configured <see cref="Configuration.ReliableConfig.AckBatchIntervalMilliseconds"/> interval.
+    /// Only started when ACK batching is enabled.
+    /// </summary>
+    private async Task PendingAckLoopAsync(CancellationToken cancellationToken)
+    {
+        /* Enabled state of batching does not need to be checked.
+         * This Task will not start if batching is disabled. */
+
+        int pendingAckLoopTargetMilliseconds = (int)Math.Clamp(Config.Reliable.AckBatchIntervalMilliseconds, ReliableConfig.MinimumAckBatchIntervalMilliseconds, ReliableConfig.MaximumAckBatchIntervalMilliseconds);
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            if (!DoConnectionsExist())
+            {
+                await Task.Delay(pendingAckLoopTargetMilliseconds, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
+            int connectionsCount = Connections.Connections.Count;
+
+            try
+            {
+                SynapseConnection connection = GetConnectionAndIncreaseIndex(connectionsCount, ref _nextPendingAckConnectionIndex);
+                connection.SendPendingAcks(cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception unexpectedException)
+            {
+                UnhandledException?.Invoke(unexpectedException);
+            }
+
+            try
+            {
+                await WaitDelayForLoop(pendingAckLoopTargetMilliseconds, connectionsCount, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns the connection at <paramref name="currentIndex"/>, wrapping the index to zero when it reaches <paramref name="connectionsCount"/>, then advances it.
+    /// </summary>
+    /// <param name="connectionsCount">Current snapshot of the connection count, used for wrap-around.</param>
+    /// <param name="currentIndex">The index to read and advance. Passed by ref so the caller's field is updated.</param>
+    private SynapseConnection GetConnectionAndIncreaseIndex(int connectionsCount, ref int currentIndex)
+    {
+        if (currentIndex >= connectionsCount)
+            currentIndex = 0;
+
+        SynapseConnection connection = Connections.Connections[currentIndex];
+        currentIndex++;
+        return connection;
+    }
+
+    /// <summary>
+    /// Returns true when the connection list is non-null and has at least one entry.
+    /// </summary>
+    private bool DoConnectionsExist() => Connections is not null && Connections.Connections.Count > 0;
+
+    /// <summary>
+    /// Delays for a per-connection slice of <paramref name="targetMilliseconds"/> so all connections are visited within approximately that window.
+    /// </summary>
+    /// <param name="targetMilliseconds">The total sweep window in milliseconds.</param>
+    /// <param name="connectionsCount">Current connection count used to calculate the per-connection wait slice.</param>
+    /// <param name="cancellationToken">Token forwarded to <see cref="Task.Delay(int, CancellationToken)"/>.</param>
+    private async Task WaitDelayForLoop(int targetMilliseconds, int connectionsCount, CancellationToken cancellationToken)
+    {
+        /* Wait time is calculated to have iterated all connections
+         * at roughly the target milliseconds. */
+        int waitMilliseconds = Math.Max(1, targetMilliseconds / connectionsCount);
+        await Task.Delay(waitMilliseconds, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -175,23 +236,6 @@ public sealed partial class SynapseManager
         _ = _transmissionEngine.SendKeepAliveAsync(synapseConnection, cancellationToken);
 
         return true;
-    }
-
-    /// <summary>
-    /// Flushes queued ACKs from all ingress engines when ACK batching is enabled and the flush interval has elapsed.
-    /// </summary>
-    private void SendPendingAcks(long nowTicks, CancellationToken cancellationToken)
-    {
-        if (!Config.Reliable.AckBatchingEnabled)
-            return;
-
-        if (nowTicks - _lastAckFlushTicks < _ackBatchingIntervalTicks)
-            return;
-
-        _lastAckFlushTicks = nowTicks;
-
-        foreach (IngressEngine engine in _ingressEngines)
-            engine.SendPendingAcks(cancellationToken);
     }
 
     /// <summary>

@@ -79,17 +79,51 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// True if <see cref="StartAsync"/> has completed successfully and the engine has not been stopped or disposed.
     /// </summary>
     public bool IsRunning => _isStarted && !_isDisposed;
+    /// <summary>
+    /// True after <see cref="StartAsync"/> completes; false after <see cref="StopAsync"/> or disposal.
+    /// </summary>
     private bool _isStarted;
+    /// <summary>
+    /// True after <see cref="Dispose"/> or <see cref="DisposeAsync"/> is called. Guards against double-dispose.
+    /// </summary>
     private bool _isDisposed;
+    /// <summary>
+    /// Optional latency simulator applied to all outbound packets. Configured from <see cref="SynapseConfig.LatencySimulator"/>.
+    /// </summary>
     private readonly LatencySimulator _latencySimulator;
+    /// <summary>
+    /// True when <see cref="SynapseConfig.MaximumSegments"/> is not <see cref="SynapseConfig.DisabledMaximumSegments"/>; enables segmented send paths.
+    /// </summary>
     private readonly bool _isSegmentingEnabled;
+    /// <summary>
+    /// Maximum payload bytes that fit in a single unsegmented packet, derived from MTU minus header overhead.
+    /// </summary>
     private readonly int _maximumUnsegmentedPayload;
+    /// <summary>
+    /// Bound UDP sockets, one per configured endpoint. Shared with the ingress engines.
+    /// </summary>
     private readonly List<Socket> _sockets = [];
+    /// <summary>
+    /// Tasks running each <see cref="IngressEngine"/> receive loop, one per socket.
+    /// </summary>
     private readonly List<Task> _ingressTasks = [];
-    private readonly List<IngressEngine> _ingressEngines = [];
+    /// <summary>
+    /// Shared outbound engine used by all send paths and the maintenance loop.
+    /// Null until <see cref="StartAsync"/> binds sockets.
+    /// </summary>
     private TransmissionEngine? _transmissionEngine;
+    /// <summary>
+    /// Linked cancellation source that drives all background loops. Created on start, disposed on stop.
+    /// </summary>
     private CancellationTokenSource? _cancellationTokenSource;
+    /// <summary>
+    /// Task running <see cref="MaintenanceLoopAsync"/>. Null until <see cref="StartAsync"/> completes.
+    /// </summary>
     private Task? _maintenanceTask;
+    /// <summary>
+    /// Task running <see cref="PendingAckLoopAsync"/>. Null when ACK batching is disabled or the engine has not started.
+    /// </summary>
+    private Task? _pendingAckTask;
 
     /// <summary>
     /// Creates a new SynapseSocket engine from the supplied configuration.
@@ -102,11 +136,11 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         if (Config.BindEndPoints.Count == 0)
             throw new ArgumentException("At least one bind endpoint is required.", nameof(config));
 
-        if (Config.SegmentAssemblyTimeoutMilliseconds > 0 && Config.SegmentAssemblyTimeoutMilliseconds > 300_000)
+        if (Config.SegmentAssemblyTimeoutMilliseconds is > 0 and > 300_000)
             throw new ArgumentOutOfRangeException(nameof(config), "SegmentAssemblyTimeoutMilliseconds must not exceed 300000 (5 minutes).");
 
         ISignatureProvider signatureProvider = Config.SignatureProvider ?? new DefaultSignatureProvider();
-        Security = new(signatureProvider, Config.MaximumPacketsPerSecond, Config.MaximumBytesPerSecond, Config.MaximumPacketSize);
+        Security = new(signatureProvider, Config.MaximumPacketsPerSecond, Config.MaximumPacketSize);
         Connections = new();
         Telemetry = new(Config.EnableTelemetry);
         _latencySimulator = new(Config.LatencySimulator);
@@ -116,20 +150,17 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
          * and unreliable segmented. Rather than add additional complexity and branching
          * the rare byte cost is consumed. */
         _maximumUnsegmentedPayload = (int)Config.MaximumTransmissionUnit - PacketHeader.TypeSize - PacketHeader.SequenceSize;
-        
+
         /* Maintenance. */
         _connectionKeepAliveTicks = TimeSpan.FromMilliseconds(Config.Connection.KeepAliveIntervalMilliseconds).Ticks;
         _connectionTimeoutTicks = TimeSpan.FromMilliseconds(Config.Connection.TimeoutMilliseconds).Ticks;
         _reliableResendTicks = TimeSpan.FromMilliseconds(Config.Reliable.ResendMilliseconds).Ticks;
         _maximumReliableRetries = Config.Reliable.MaximumRetries;
         _isAckBatchingEnabled = Config.Reliable.AckBatchingEnabled;
-        // Value is unset is ack batching is not enabled.
-        _ackBatchingIntervalTicks = _isAckBatchingEnabled ? TimeSpan.FromMilliseconds(Config.Reliable.AckBatchIntervalMilliseconds).Ticks : UnsetAckBatchingIntervalTicks;
         /* Value is unset if segmenting is not enabled or if
          * a timeout is unset. */
         uint segmentAssemblyTimeoutMilliseconds = config.SegmentAssemblyTimeoutMilliseconds;
-        _segmentAssemblyTimeoutTicks = _isSegmentingEnabled && segmentAssemblyTimeoutMilliseconds != SynapseConfig.UnsetSegmentAssemblyTimeout ? TimeSpan.FromMilliseconds(segmentAssemblyTimeoutMilliseconds).Ticks : UnsetSegmentAssemblyTimeoutTicks;
-
+        _segmentAssemblyTimeoutTicks = _isSegmentingEnabled && segmentAssemblyTimeoutMilliseconds != SynapseConfig.DisabledSegmentAssemblyTimeout ? TimeSpan.FromMilliseconds(segmentAssemblyTimeoutMilliseconds).Ticks : UnsetSegmentAssemblyTimeoutTicks;
     }
 
     /// <summary>
@@ -193,12 +224,14 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             ingressEngine.NatSessionFull += OnNatSessionFull;
             ingressEngine.NatSessionCreated += OnNatSessionCreated;
             ingressEngine.NatSessionUnavailable += OnNatSessionUnavailable;
-            
-            _ingressEngines.Add(ingressEngine);
+
             _ingressTasks.Add(ingressEngine.StartAsync(_cancellationTokenSource.Token));
         }
 
         _maintenanceTask = Task.Run(() => MaintenanceLoopAsync(_cancellationTokenSource.Token), _cancellationTokenSource.Token);
+        if (_isAckBatchingEnabled)
+            _pendingAckTask = Task.Run(() => PendingAckLoopAsync(_cancellationTokenSource.Token), _cancellationTokenSource.Token);
+
         _isStarted = true;
         return Task.CompletedTask;
     }
@@ -384,10 +417,14 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
 
         if (_maintenanceTask is not null)
             pendingTasks.Add(_maintenanceTask);
+        _maintenanceTask = null;
+
+        if (_pendingAckTask is not null)
+            pendingTasks.Add(_pendingAckTask);
+        _pendingAckTask = null;
 
         _ingressTasks.Clear();
-        _ingressEngines.Clear();
-        _maintenanceTask = null;
+
 
         if (pendingTasks.Count > 0)
         {
@@ -435,10 +472,13 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
 
         if (_maintenanceTask is not null)
             pendingTasks.Add(_maintenanceTask);
+        _maintenanceTask = null;
+
+        if (_pendingAckTask is not null)
+            pendingTasks.Add(_pendingAckTask);
+        _pendingAckTask = null;
 
         _ingressTasks.Clear();
-        _ingressEngines.Clear();
-        _maintenanceTask = null;
 
         if (pendingTasks.Count > 0)
             await Task.WhenAny(Task.WhenAll(pendingTasks), Task.Delay(5000)).ConfigureAwait(false);

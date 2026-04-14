@@ -3,12 +3,14 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
+using System.Threading;
 using CodeBoost.CodeAnalysis;
 using CodeBoost.Extensions;
 using CodeBoost.Performance;
 using SynapseSocket.Core;
 using SynapseSocket.Packets;
 using SynapseSocket.Security;
+using SynapseSocket.Transport;
 
 namespace SynapseSocket.Connections;
 
@@ -72,6 +74,11 @@ public sealed class SynapseConnection : IPoolResettable
     [PoolResettableMember]
     internal readonly ConcurrentDictionary<ushort, PendingReliable> PendingReliableQueue = [];
     /// <summary>
+    /// Outbound ACK sequence numbers queued for batch delivery when ACK batching is enabled.
+    /// </summary>
+    [PoolResettableMember]
+    internal readonly ConcurrentQueue<ushort> PendingAcks = [];
+    /// <summary>
     /// Out-of-order reliable packets awaiting delivery.
     /// </summary>
     [PoolResettableMember]
@@ -95,9 +102,17 @@ public sealed class SynapseConnection : IPoolResettable
     [PoolResettableMember]
     internal PacketReassembler? Reassembler;
     /// <summary>
+    /// Reference to the shared transmission engine used to send ACKs during batch flush.
+    /// Set on connection creation and cleared on pool return.
+    /// </summary>
+    [PoolResettableMember]
+    internal TransmissionEngine? TransmissionEngine;
+    /// <summary>
     /// Value used when ConnectionsIndex is not set.
     /// </summary>
     public const int UnsetConnectionsIndex = -1;
+    
+    // ReSharper disable once EmptyConstructor
     public SynapseConnection() { }
 
     /// <summary>
@@ -113,6 +128,17 @@ public sealed class SynapseConnection : IPoolResettable
         ConnectionsIndex = connectionsIndex;
         State = ConnectionState.Pending;
         LastReceivedTicks = DateTime.UtcNow.Ticks;
+    }
+
+    /// <summary>
+    /// Dequeues all pending ACK sequence numbers and sends each via <see cref="TransmissionEngine"/>.
+    /// Called by the maintenance loop when ACK batching is enabled.
+    /// </summary>
+    /// <param name="cancellationToken">Token forwarded to each ACK send.</param>
+    internal void SendPendingAcks(CancellationToken cancellationToken)
+    {
+        while (PendingAcks.TryDequeue(out ushort sequence))
+            _ = TransmissionEngine?.SendAckAsync(this, sequence, cancellationToken);
     }
 
     /// <summary>
@@ -240,6 +266,7 @@ public sealed class SynapseConnection : IPoolResettable
     public void OnReturn()
     {
         RemoteEndPoint = null;
+        TransmissionEngine = null;
         Signature = SecurityProvider.UnsetSignature;
         ConnectionsIndex = UnsetConnectionsIndex;
         State = ConnectionState.Disconnected;
@@ -250,6 +277,7 @@ public sealed class SynapseConnection : IPoolResettable
 
         NextOutgoingSequence = 0;
         NextExpectedSequence = 0;
+        PendingAcks.Clear();
 
         foreach (PendingReliable? value in PendingReliableQueue.Values)
             ResettableObjectPool<PendingReliable>.Return(value);
