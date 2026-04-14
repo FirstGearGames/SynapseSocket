@@ -150,11 +150,12 @@ public sealed partial class IngressEngine
     {
         EndPoint anyEndPoint = _socket.AddressFamily == AddressFamily.InterNetworkV6 ? new(IPAddress.IPv6Any, 0) : new IPEndPoint(IPAddress.Any, 0);
 
-        // Always receive into a max-UDP-sized buffer so that oversized datagrams are not silently truncated by the kernel — we want to see them so the security layer can raise an Oversized violation.
-        const int MaximumUdpDatagramSize = 65535;
 
         while (!cancellationToken.IsCancellationRequested)
         {
+            // Always receive into a max-UDP-sized buffer so that oversized datagrams are not silently truncated by the kernel — we want to see them so the security layer can raise an Oversized violation.
+            const int MaximumUdpDatagramSize = 65535;
+
             byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
             bool isPayloadCopied = true;
 
@@ -163,7 +164,12 @@ public sealed partial class IngressEngine
                 SocketReceiveFromResult socketReceiveResult;
                 try
                 {
+#if NET8_0_OR_GREATER
+                    // Memory<byte> overload returns ValueTask<SocketReceiveFromResult>; no per-call Task allocation on synchronous completions.
+                    socketReceiveResult = await _socket.ReceiveFromAsync(rentedBuffer.AsMemory(0, MaximumUdpDatagramSize), SocketFlags.None, anyEndPoint, CancellationToken.None).ConfigureAwait(false);
+#else
                     socketReceiveResult = await _socket.ReceiveFromAsync(new(rentedBuffer, 0, MaximumUdpDatagramSize), SocketFlags.None, anyEndPoint).ConfigureAwait(false);
+#endif
                 }
                 catch (ObjectDisposedException)
                 {
@@ -182,7 +188,6 @@ public sealed partial class IngressEngine
                 }
 
                 IPEndPoint fromEndPoint = (IPEndPoint)socketReceiveResult.RemoteEndPoint;
-
                 int receivedLength = socketReceiveResult.ReceivedBytes;
                 long nowTicks = DateTime.UtcNow.Ticks;
 
@@ -191,7 +196,7 @@ public sealed partial class IngressEngine
                 FilterResult filterResult;
                 ulong signature;
 
-                bool isEstablished = _connections.ConnectionsByEndPoint.TryGetValue(fromEndPoint, out SynapseConnection synapseConnection);
+                bool isEstablished = _connections.ConnectionsByEndPoint.TryGetValue(fromEndPoint, out SynapseConnection? synapseConnection);
 
                 if (isEstablished)
                 {
@@ -223,7 +228,7 @@ public sealed partial class IngressEngine
                     continue;
                 }
 
-                _telemetry.OnReceived(receivedLength);
+                //_telemetry.OnReceived(receivedLength);
                 ProcessPacket(rentedBuffer, receivedLength, fromEndPoint, synapseConnection, nowTicks, cancellationToken, ref isPayloadCopied);
             }
             catch (OperationCanceledException)
@@ -339,7 +344,7 @@ public sealed partial class IngressEngine
             return;
         }
 
-        if ((type == PacketType.Segmented || type == PacketType.ReliableSegmented) && _config.MaximumReassembledPacketSize > 0)
+        if (type is PacketType.Segmented or PacketType.ReliableSegmented && _config.MaximumReassembledPacketSize > 0)
         {
             if (segmentCount * _config.MaximumTransmissionUnit > _config.MaximumReassembledPacketSize)
             {

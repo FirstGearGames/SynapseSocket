@@ -72,17 +72,21 @@ public sealed partial class SynapseManager
             }
 
             int connectionsCount = Connections.Connections.Count;
+            int connectionsPerTick = Math.Max(1, connectionsCount / MaintenanceLoopTargetMilliseconds);
 
             try
             {
-                SynapseConnection connection = GetConnectionAndIncreaseIndex(connectionsCount, ref _nextMaintenanceConnectionIndex);
-
                 long nowTicks = DateTime.UtcNow.Ticks;
 
-                if (PerformKeepAlive(nowTicks, connection, cancellationToken))
+                for (int i = 0; i < connectionsPerTick; i++)
                 {
-                    RetransmitReliable(nowTicks, connection, cancellationToken);
-                    SegmentAssemblyTimeoutSweep(nowTicks, connection);
+                    SynapseConnection connection = GetConnectionAndIncreaseIndex(connectionsCount, ref _nextMaintenanceConnectionIndex);
+
+                    if (PerformKeepAlive(nowTicks, connection, cancellationToken))
+                    {
+                        RetransmitReliable(nowTicks, connection, cancellationToken);
+                        SegmentAssemblyTimeoutSweep(nowTicks, connection);
+                    }
                 }
             }
             catch (OperationCanceledException)
@@ -125,11 +129,15 @@ public sealed partial class SynapseManager
             }
 
             int connectionsCount = Connections.Connections.Count;
+            int connectionsPerTick = Math.Max(1, connectionsCount / pendingAckLoopTargetMilliseconds);
 
             try
             {
-                SynapseConnection connection = GetConnectionAndIncreaseIndex(connectionsCount, ref _nextPendingAckConnectionIndex);
-                connection.SendPendingAcks(cancellationToken);
+                for (int i = 0; i < connectionsPerTick; i++)
+                {
+                    SynapseConnection connection = GetConnectionAndIncreaseIndex(connectionsCount, ref _nextPendingAckConnectionIndex);
+                    connection.SendPendingAcks(cancellationToken);
+                }
             }
             catch (OperationCanceledException)
             {

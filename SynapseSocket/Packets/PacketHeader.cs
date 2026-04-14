@@ -102,7 +102,7 @@ public static class PacketHeader
         segmentIndex = 0;
         segmentCount = 0;
 
-        if (type == PacketType.Reliable || type == PacketType.Ack || type == PacketType.ReliableSegmented)
+        if (type is PacketType.Reliable or PacketType.Ack or PacketType.ReliableSegmented)
         {
             if (buffer.Length < offset + SequenceSize) throw new ArgumentException("Buffer too small for sequence.");
             sequence = (ushort)(buffer[offset] | (buffer[offset + 1] << 8));

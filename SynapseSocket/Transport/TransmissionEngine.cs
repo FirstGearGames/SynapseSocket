@@ -253,7 +253,12 @@ public sealed partial class TransmissionEngine
     private async Task SendDirectAsync(ArraySegment<byte> segment, IPEndPoint target)
     {
         Socket socket = target.AddressFamily == AddressFamily.InterNetworkV6 && _ipv6Socket is not null ? _ipv6Socket : _ipv4Socket;
+#if NET8_0_OR_GREATER 
+        //ReadOnlyMemory<byte> + ValueTask overload; CancellationToken.None because SendDirectAsync has no token.
+        int bytesSent = await socket.SendToAsync(segment.AsMemory(), SocketFlags.None, target, CancellationToken.None).ConfigureAwait(false);
+#else
         int bytesSent = await socket.SendToAsync(segment, SocketFlags.None, target).ConfigureAwait(false);
+#endif
         _telemetry.OnSent(bytesSent);
     }
 
