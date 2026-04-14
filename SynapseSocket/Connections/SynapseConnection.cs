@@ -17,8 +17,6 @@ namespace SynapseSocket.Connections;
 /// <summary>
 /// Represents the state of a single remote peer session, including reliable send/receive windows, keep-alive timestamps, and signature binding.
 /// </summary>
-/// <remarks>This reference is not automatically pooled but is never used again once <see cref="SynapseManager.ConnectionClosed"/>is invoked. Consider using <see cref="ResettableObjectPool{T0}.Return"/> on this connection once closed.</remarks>
-// todo add connectionremoved event and clean up automatically at that point. remove comments above. make it known whn event dispatches connection is pooled and should not have its reference retained.
 public sealed class SynapseConnection : IPoolResettable
 {
     /// <summary>
@@ -103,7 +101,7 @@ public sealed class SynapseConnection : IPoolResettable
     internal PacketReassembler? Reassembler;
     /// <summary>
     /// Reference to the shared transmission engine used to send ACKs during batch flush.
-    /// Set on connection creation and cleared on pool return.
+    /// Set on connection establishment and cleared on disconnect.
     /// </summary>
     [PoolResettableMember]
     internal TransmissionEngine? TransmissionEngine;
@@ -111,7 +109,7 @@ public sealed class SynapseConnection : IPoolResettable
     /// Value used when ConnectionsIndex is not set.
     /// </summary>
     public const int UnsetConnectionsIndex = -1;
-    
+
     // ReSharper disable once EmptyConstructor
     public SynapseConnection() { }
 
@@ -234,6 +232,41 @@ public sealed class SynapseConnection : IPoolResettable
         synapseConnection.PendingReliableQueue.Clear();
     }
 
+    /// <summary>
+    /// Resets all per-session state for a reconnecting peer without returning the connection to the pool.
+    /// Clears sequence numbers, the reorder buffer, pending ACKs, the pending reliable queue, and segmenters.
+    /// Sets <see cref="State"/> to <see cref="ConnectionState.Disconnected"/> so the caller
+    /// can re-initialise it through the normal handshake path.
+    /// </summary>
+    internal void ResetForReconnect()
+    {
+        PacketSplitter? splitter = Interlocked.Exchange(ref Splitter, null);
+        if (splitter is not null)
+            ResettableObjectPool<PacketSplitter>.Return(splitter);
+
+        PacketReassembler? reassembler = Interlocked.Exchange(ref Reassembler, null);
+        if (reassembler is not null)
+            ResettableObjectPool<PacketReassembler>.Return(reassembler);
+
+        DrainPendingReliableQueue(this);
+        PendingAcks.Clear();
+
+        lock (ReliableLock)
+        {
+            foreach (ArraySegment<byte> segment in ReorderBuffer.Values)
+                segment.PoolArrayIntoShared();
+
+            ReorderBuffer.Clear();
+            NextOutgoingSequence = 0;
+            NextExpectedSequence = 0;
+        }
+
+        UnansweredKeepAlives = 0;
+        LastKeepAliveSentTicks = 0;
+        State = ConnectionState.Disconnected;
+    }
+
+    /// <inheritdoc/>
     public void OnReturn()
     {
         RemoteEndPoint = null;
@@ -252,13 +285,18 @@ public sealed class SynapseConnection : IPoolResettable
 
         foreach (PendingReliable? value in PendingReliableQueue.Values)
             ResettableObjectPool<PendingReliable>.Return(value);
-        
+
+        PendingReliableQueue.Clear();
+
         foreach (ArraySegment<byte> reorderSegment in ReorderBuffer.Values)
             reorderSegment.PoolArrayIntoShared();
+
+        ReorderBuffer.Clear();
 
         ResettableObjectPool<PacketSplitter>.ReturnAndNullifyReference(ref Splitter);
         ResettableObjectPool<PacketReassembler>.ReturnAndNullifyReference(ref Reassembler);
     }
 
+    /// <inheritdoc/>
     public void OnRent() { }
 }

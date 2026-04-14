@@ -551,7 +551,7 @@ public sealed partial class IngressEngine
         long nowTicks = DateTime.UtcNow.Ticks;
         ulong replayKey = MixHandshakeNonce(signature, handshakePayload);
 
-        if (!_seenHandshakes.TryAdd(replayKey, nowTicks))
+        if (!_config.DisableHandshakeReplayProtection && !_seenHandshakes.TryAdd(replayKey, nowTicks))
         {
             // Exact same bytes received again - replay.
             ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.SignatureRejected, "Handshake replay detected");
@@ -575,14 +575,32 @@ public sealed partial class IngressEngine
 
         SynapseConnection synapseConnection = _connections.GetOrAdd(fromEndPoint, signature, out bool isExistingConnection);
 
+        // True when the peer reconnected without a clean disconnect. We need to respond with a
+        // handshake-ack in this case just as we would for a brand-new connection.
+        bool wasConnected = isExistingConnection && synapseConnection.State == ConnectionState.Connected;
+
+        if (wasConnected)
+        {
+            // Peer reconnected without a clean disconnect (e.g. dropped disconnect packet).
+            // Reset per-session state so the new session starts with fresh sequence numbers
+            // and a clean reorder buffer, then fall through to normal connection initialisation.
+            synapseConnection.ResetForReconnect();
+            ConnectionClosed?.Invoke(synapseConnection);
+        }
+
         if (!isExistingConnection || synapseConnection.State != ConnectionState.Connected)
         {
             synapseConnection.State = ConnectionState.Connected;
             synapseConnection.LastReceivedTicks = DateTime.UtcNow.Ticks;
             synapseConnection.TransmissionEngine = _sender;
 
-            // handshake-ack = another handshake packet
-            _ = _sender.SendHandshakeAsync(fromEndPoint, cancellationToken);
+            // Send a handshake-ack only when this side did not initiate the connection.
+            // If the connection was already in our table as Pending, we are the client waiting
+            // for the server's reply — echoing back would create an infinite ping-pong.
+            // We do respond for brand-new connections (!isExistingConnection) and for forced
+            // reconnects where the peer was previously fully Connected (wasConnected).
+            if (!isExistingConnection || wasConnected)
+                _ = _sender.SendHandshakeAsync(fromEndPoint, cancellationToken);
 
             ConnectionEstablished?.Invoke(synapseConnection);
         }

@@ -269,7 +269,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             throw new InvalidOperationException("Remote endpoint is blacklisted.");
         }
 
-        SynapseConnection synapseConnection = Connections.GetOrAdd(endPoint, signature, out _);
+        SynapseConnection synapseConnection = Connections.CreateNew(endPoint, signature);
 
         await _transmissionEngine.SendHandshakeAsync(endPoint, cancellationToken).ConfigureAwait(false);
 

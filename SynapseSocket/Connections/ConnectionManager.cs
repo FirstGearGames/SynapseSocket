@@ -51,7 +51,7 @@ public sealed class ConnectionManager
     public SynapseConnection GetOrAdd(IPEndPoint endPoint, ulong signature, out bool isFound)
     {
         isFound = _connectionsByEndPoint.TryGetValue(endPoint, out SynapseConnection? synapseConnection);
-        
+
         if (!isFound)
         {
             synapseConnection = ResettableObjectPool<SynapseConnection>.Rent();
@@ -72,6 +72,49 @@ public sealed class ConnectionManager
         }
 
         return synapseConnection!;
+    }
+
+    /// <summary>
+    /// Always creates a fresh <see cref="SynapseConnection"/> for <paramref name="endPoint"/>,
+    /// removing any existing entry first. Used by the outbound connect path to guarantee a clean
+    /// connection object on every call regardless of prior session state.
+    /// </summary>
+    /// <param name="endPoint">The remote endpoint to connect to.</param>
+    /// <param name="signature">The 64-bit signature associated with the peer.</param>
+    /// <returns>The newly created <see cref="SynapseConnection"/>.</returns>
+    public SynapseConnection CreateNew(IPEndPoint endPoint, ulong signature)
+    {
+        if (_connectionsByEndPoint.TryRemove(endPoint, out SynapseConnection? old))
+        {
+            if (old.ConnectionsIndex is not SynapseConnection.UnsetConnectionsIndex)
+            {
+                int lastIndex = _connections.Count - 1;
+
+                if (old.ConnectionsIndex < lastIndex)
+                {
+                    SynapseConnection swapped = _connections[lastIndex];
+                    swapped.ConnectionsIndex = old.ConnectionsIndex;
+                    _connections[old.ConnectionsIndex] = swapped;
+                }
+
+                _connections.RemoveAt(old.ConnectionsIndex < lastIndex ? old.ConnectionsIndex : lastIndex);
+                old.ConnectionsIndex = SynapseConnection.UnsetConnectionsIndex;
+            }
+
+            _connectionsBySignature.TryRemove(old.Signature, out _);
+        }
+
+        SynapseConnection synapseConnection = ResettableObjectPool<SynapseConnection>.Rent();
+        int connectionsIndex = _connections.Count;
+        synapseConnection.Initialize(endPoint, signature, connectionsIndex);
+
+        _connectionsByEndPoint[endPoint] = synapseConnection;
+        _connections.Add(synapseConnection);
+
+        if (!_connectionsBySignature.TryAdd(signature, synapseConnection))
+            _connectionsBySignature[signature] = synapseConnection;
+
+        return synapseConnection;
     }
 
     /// <summary>

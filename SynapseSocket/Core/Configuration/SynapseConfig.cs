@@ -109,6 +109,12 @@ public sealed class SynapseConfig
     public ISignatureValidator? SignatureValidator;
 
     /// <summary>
+    /// When true, the handshake replay cache is bypassed and duplicate handshake packets are accepted.
+    /// Intended for testing reconnect scenarios only — never set this in production.
+    /// </summary>
+    public bool DisableHandshakeReplayProtection = false;
+
+    /// <summary>
     /// Connection lifecycle settings: keep-alive interval, timeout, and sweep window.
     /// </summary>
     public ConnectionConfig Connection = new();
