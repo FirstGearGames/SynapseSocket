@@ -145,33 +145,24 @@ public sealed class SynapseConnection : IPoolResettable
     /// A reliable packet that has been sent but not yet acknowledged.
     /// Instances are managed by <see cref="ResettableObjectPool{T}"/>; rent via
     /// <see cref="ResettableObjectPool{T}.Rent"/> and return via <see cref="ReleasePendingReliable"/>
-    /// so both the payload buffers and the <see cref="PendingReliable"/> object itself are recycled.
-    /// For segmented sends, <see cref="Segments"/> holds rented <see cref="ArraySegment{T}"/>s whose backing arrays must be returned to <see cref="ArrayPool{T}.Shared"/> on ACK or eviction.
-    /// <see cref="SegmentCount"/> is the logical count — <see cref="Segments"/> may be a larger rented array.
+    /// so all pooled buffers and the <see cref="PendingReliable"/> object itself are recycled.
+    /// <see cref="Segments"/> holds the wire-ready slices; <see cref="BackingArray"/> is the single
+    /// rented buffer that backs all of them and is the only array returned to <see cref="ArrayPool{T}.Shared"/>.
     /// </summary>
     internal sealed class PendingReliable : IPoolResettable
     {
         /// <summary>
-        /// Rented packet buffer (header + payload) for unsegmented reliable sends. Null for segmented sends.
-        /// Returned to <see cref="ArrayPool{T}.Shared"/> by <see cref="ReleasePendingReliable"/>.
-        /// </summary>
-        [PoolResettableMember]
-        public byte[]? Payload { get; private set; }
-        /// <summary>
-        /// Total wire length of the packet, or of each segment when segmented.
-        /// </summary>
-        [PoolResettableMember]
-        public int PacketLength { get; private set; }
-        /// <summary>
-        /// Per-segment buffers for segmented sends. Null for unsegmented packets.
+        /// Wire-ready slices of <see cref="BackingArray"/>, one per logical segment.
+        /// For unsegmented sends this list contains exactly one entry.
         /// </summary>
         [PoolResettableMember]
         public List<ArraySegment<byte>> Segments { get; private set; }
         /// <summary>
-        /// Logical number of valid entries in <see cref="Segments"/>. May be less than the array length.
+        /// The single rented buffer that backs all entries in <see cref="Segments"/>.
+        /// Returned to <see cref="ArrayPool{T}.Shared"/> on ACK or eviction.
         /// </summary>
         [PoolResettableMember]
-        public int SegmentCount { get; private set; }
+        public byte[]? BackingArray { get; private set; }
         /// <summary>
         /// UTC ticks when this packet was last sent or retransmitted.
         /// </summary>
@@ -184,30 +175,16 @@ public sealed class SynapseConnection : IPoolResettable
         public int Retries;
 
         /// <summary>
-        /// Initialises this instance for a segmented reliable send.
+        /// Initialises this instance for a reliable send.
         /// </summary>
-        /// <param name="segments">Rented list of per-segment wire buffers.</param>
-        /// <param name="segmentCount">Logical count of valid entries in <paramref name="segments"/>.</param>
+        /// <param name="segments">Rented list of wire-ready slices of <paramref name="backingArray"/>.</param>
+        /// <param name="backingArray">The single rented buffer backing all entries in <paramref name="segments"/>.</param>
         /// <param name="sentTicks">UTC ticks at the time of the initial send.</param>
         [PoolResettableMethod]
-        public void Initialize(List<ArraySegment<byte>> segments, int segmentCount, long sentTicks)
+        public void Initialize(List<ArraySegment<byte>> segments, byte[] backingArray, long sentTicks)
         {
             Segments = segments;
-            SegmentCount = segmentCount;
-            SentTicks = sentTicks;
-        }
-
-        /// <summary>
-        /// Initialises this instance for an unsegmented reliable send.
-        /// </summary>
-        /// <param name="payload">Rented buffer containing the full wire packet (header + payload).</param>
-        /// <param name="packetLength">Logical byte length of the wire packet within <paramref name="payload"/>.</param>
-        /// <param name="sentTicks">UTC ticks at the time of the initial send.</param>
-        [PoolResettableMethod]
-        public void Initialize(byte[] payload, int packetLength, long sentTicks)
-        {
-            Payload = payload;
-            PacketLength = packetLength;
+            BackingArray = backingArray;
             SentTicks = sentTicks;
         }
 
@@ -218,23 +195,18 @@ public sealed class SynapseConnection : IPoolResettable
         public void OnReturn()
         {
             Retries = 0;
-            PacketLength = 0;
-            SegmentCount = 0;
             SentTicks = 0;
 
-            /* Only Segments or Payload will have value, never both. */
+            if (BackingArray is not null)
+            {
+                ArrayPool<byte>.Shared.Return(BackingArray);
+                BackingArray = null;
+            }
+
             if (Segments is not null)
             {
-                foreach (ArraySegment<byte> arraySegment in Segments)
-                    arraySegment.PoolArrayIntoShared();
-
                 ListPool<ArraySegment<byte>>.Return(Segments);
                 Segments = null;
-            }
-            else if (Payload is not null)
-            {
-                ArrayPool<byte>.Shared.Return(Payload);
-                Payload = null;
             }
         }
     }
@@ -242,7 +214,6 @@ public sealed class SynapseConnection : IPoolResettable
     /// <summary>
     /// Returns all pooled memory held by <paramref name="pendingReliable"/> back to <see cref="ArrayPool{T}.Shared"/>
     /// and returns the <see cref="PendingReliable"/> instance itself to its <see cref="ResettableObjectPool{T}"/>.
-    /// For segmented sends, returns each segment's backing array and the outer segments array.
     /// Safe to call from any context (ingress ACK path, maintenance sweep, or on kick).
     /// </summary>
     internal static void ReleasePendingReliable(PendingReliable pendingReliable)

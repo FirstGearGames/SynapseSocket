@@ -272,15 +272,8 @@ public sealed partial class SynapseManager
 
             Telemetry.OnReliableResend();
 
-            if (pendingReliable.Segments is not null)
-            {
-                for (int i = 0; i < pendingReliable.SegmentCount; i++)
-                    _ = _transmissionEngine.SendRawAsync(pendingReliable.Segments[i], synapseConnection.RemoteEndPoint, cancellationToken);
-            }
-            else if (pendingReliable.Payload is not null)
-            {
-                _ = _transmissionEngine.SendRawAsync(new(pendingReliable.Payload, 0, pendingReliable.PacketLength), synapseConnection.RemoteEndPoint, cancellationToken);
-            }
+            for (int i = 0; i < pendingReliable.Segments.Count; i++)
+                _ = _transmissionEngine.SendRawAsync(pendingReliable.Segments[i], synapseConnection.RemoteEndPoint, cancellationToken);
         }
     }
 
