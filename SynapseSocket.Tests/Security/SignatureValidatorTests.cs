@@ -8,7 +8,7 @@ using SynapseSocket.Security;
 using Xunit;
 using SynapseSocket.Core.Events;
 
-namespace SynapseSocket.Tests;
+namespace SynapseSocket.Tests.Security;
 
 public class SignatureValidatorTests
 {

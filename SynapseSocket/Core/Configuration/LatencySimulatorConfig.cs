@@ -29,6 +29,15 @@ public sealed class LatencySimulatorConfig
 
     /// <summary>
     /// Probability in [0, 1] that a packet receives an extra random reorder delay.
+    /// When triggered, a random value in [0, <see cref="OutOfOrderExtraDelayMilliseconds"/>) is added
+    /// on top of <see cref="BaseLatencyMilliseconds"/> and jitter.
     /// </summary>
     public double ReorderChance = 0.0;
+
+    /// <summary>
+    /// Maximum extra delay, in milliseconds, added to packets selected for reordering.
+    /// A random value in [0, OutOfOrderExtraDelayMilliseconds) is chosen per affected packet.
+    /// Only used when <see cref="ReorderChance"/> is greater than zero.
+    /// </summary>
+    public uint OutOfOrderExtraDelayMilliseconds = 100;
 }

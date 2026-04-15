@@ -9,7 +9,7 @@ using Xunit;
 using SynapseSocket.Core.Configuration;
 using SynapseSocket.Core.Events;
 
-namespace SynapseSocket.Tests;
+namespace SynapseSocket.Tests.Lifecycle;
 
 public class EngineLifecycleTests
 {

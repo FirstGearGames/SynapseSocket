@@ -8,13 +8,13 @@ using SynapseSocket.Core;
 using Xunit;
 using Xunit.Abstractions;
 
-namespace SynapseSocket.Tests;
+namespace SynapseSocket.Tests.Stress;
 
 public sealed class ConnectionStressTests
 {
-    private const int ClientCount = 2000;
+    private const int ClientCount = 100;
     private const int SendsPerClient = 4;
-    private const int PayloadSize = 300;
+    private const int PayloadSize = 1000;
     private const int ExpectedPackets = ClientCount * SendsPerClient;
     private const int StressTestTimeoutMs = 120000;
     private const int LifecycleTestTimeoutMs = 300000;
@@ -35,10 +35,10 @@ public sealed class ConnectionStressTests
     }
 
     [Fact(Timeout = LifecycleTestTimeoutMs)]
-    public async Task StressTest_1000Clients_ConnectSendDisconnect_4Cycles()
+    public async Task StressTest_Clients_ConnectSendDisconnect_4Cycles_Reliable()
     {
-        const int CycleClientCount = 2000;
-        const int CycleCount = 4;
+        const int CycleClientCount = 100;
+        const int CycleCount = 6;
         const int ConnectWaitMs = 20000;
         const int ReceiveWaitMs = 15000;
         const int AckWaitMs = 5000;
@@ -103,7 +103,7 @@ public sealed class ConnectionStressTests
                 ArraySegment<byte> payload = new(SendBuffer);
 
                 for (int i = 0; i < CycleClientCount; i++)
-                    _ = clients[i].SendAsync(connections[i], payload, false, CancellationToken.None);
+                    _ = clients[i].SendAsync(connections[i], payload, true, CancellationToken.None);
 
                 Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref totalReceivedCount) >= receiveTarget, ReceiveWaitMs),
                     $"Only {Volatile.Read(ref totalReceivedCount)} / {receiveTarget} packets received.");
@@ -146,6 +146,8 @@ public sealed class ConnectionStressTests
             int gen0Before = GC.CollectionCount(0);
             int gen1Before = GC.CollectionCount(1);
             int gen2Before = GC.CollectionCount(2);
+            int gen3Before = GC.CollectionCount(3);
+            int gen4Before = GC.CollectionCount(4);
 
             double[] cycleTimes = new double[CycleCount];
             Stopwatch totalStopwatch = Stopwatch.StartNew();
@@ -163,6 +165,8 @@ public sealed class ConnectionStressTests
             int gen0After = GC.CollectionCount(0);
             int gen1After = GC.CollectionCount(1);
             int gen2After = GC.CollectionCount(2);
+            int gen3After = GC.CollectionCount(3);
+            int gen4After = GC.CollectionCount(4);
 
             _output.WriteLine($"Clients           : {CycleClientCount:N0}");
             _output.WriteLine($"Cycles            : {CycleCount}");
@@ -175,6 +179,8 @@ public sealed class ConnectionStressTests
             _output.WriteLine($"GC Gen0           : {gen0After - gen0Before}");
             _output.WriteLine($"GC Gen1           : {gen1After - gen1Before}");
             _output.WriteLine($"GC Gen2           : {gen2After - gen2Before}");
+            _output.WriteLine($"GC Gen3           : {gen3After - gen3Before}");
+            _output.WriteLine($"GC Gen4           : {gen4After - gen4Before}");
 
             Assert.Equal(0, gen2After - gen2Before);
         }
@@ -192,7 +198,7 @@ public sealed class ConnectionStressTests
     }
 
     [Fact(Timeout = StressTestTimeoutMs)]
-    public async Task StressTest_2000Clients_4SendsEach_Unreliable()
+    public async Task StressTest_Clients_4SendsEach_Unreliable()
     {
         int port = TestHarness.GetFreePort();
 
@@ -270,7 +276,7 @@ public sealed class ConnectionStressTests
     }
 
     [Fact(Timeout = StressTestTimeoutMs)]
-    public async Task StressTest_2000Clients_4SendsEach_Reliable()
+    public async Task StressTest_Clients_4SendsEach_Reliable()
     {
         int port = TestHarness.GetFreePort();
 

@@ -171,20 +171,59 @@ public sealed partial class TransmissionEngine
             synapseConnection.PendingReliableQueue[sequence] = pendingReliable;
 
             // Segments are now owned by PendingReliable; do NOT return them here.
-            for (int i = 0; i < segments.Count; i++)
-                await SendRawAsync(segments[i], synapseConnection.RemoteEndPoint, cancellationToken).ConfigureAwait(false);
+            if (_isLatencySimulatorEnabled)
+            {
+                // Fire all segments concurrently so each receives an independent random delay,
+                // producing genuine out-of-order arrival at the receiver when ReorderChance > 0.
+                List<Task> sendTasks = ListPool<Task>.Rent();
+                try
+                {
+                    for (int i = 0; i < segments.Count; i++)
+                        sendTasks.Add(SendRawAsync(segments[i], synapseConnection.RemoteEndPoint, cancellationToken));
+                    await Task.WhenAll(sendTasks).ConfigureAwait(false);
+                }
+                finally
+                {
+                    ListPool<Task>.Return(sendTasks);
+                }
+            }
+            else
+            {
+                for (int i = 0; i < segments.Count; i++)
+                    await SendRawAsync(segments[i], synapseConnection.RemoteEndPoint, cancellationToken).ConfigureAwait(false);
+            }
         }
         // Unreliable does not need to retain buffers.
         else
         {
-            try
+            if (_isLatencySimulatorEnabled)
             {
-                for (int i = 0; i < segmentCount; i++)
-                    await SendRawAsync(segments[i], synapseConnection.RemoteEndPoint, cancellationToken).ConfigureAwait(false);
+                // Fire all segments concurrently so each receives an independent random delay,
+                // producing genuine out-of-order arrival at the receiver when ReorderChance > 0.
+                List<Task> sendTasks = ListPool<Task>.Rent();
+                try
+                {
+                    for (int i = 0; i < segmentCount; i++)
+                        sendTasks.Add(SendRawAsync(segments[i], synapseConnection.RemoteEndPoint, cancellationToken));
+                    await Task.WhenAll(sendTasks).ConfigureAwait(false);
+                }
+                finally
+                {
+                    ListPool<Task>.Return(sendTasks);
+                    ArrayPool<byte>.Shared.Return(backingBuffer);
+                }
             }
-            finally
+            else
             {
-                ArrayPool<byte>.Shared.Return(backingBuffer);
+                try
+                {
+                    for (int i = 0; i < segmentCount; i++)
+                        await SendRawAsync(segments[i], synapseConnection.RemoteEndPoint, cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(backingBuffer);
+                }
             }
         }
     }

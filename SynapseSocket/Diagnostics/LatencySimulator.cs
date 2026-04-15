@@ -21,10 +21,21 @@ public sealed class LatencySimulator
     /// Configuration driving all simulator behavior.
     /// </summary>
     private readonly LatencySimulatorConfig _config;
+
     /// <summary>
-    /// Pseudo-random number generator used for loss rolls, jitter, and reorder decisions.
+    /// Per-thread <see cref="Random"/> instance. <see cref="Random"/> is not thread-safe,
+    /// and <see cref="ProcessAsync"/> is called concurrently from many send paths.
+    /// Using a thread-local avoids locking while still giving each thread independent state.
+    /// Minor statistical imperfection (e.g., occasional repeats across threads) is acceptable
+    /// for a latency simulator.
     /// </summary>
-    private readonly Random _random = new();
+    [ThreadStatic]
+    private static Random? _threadRandom;
+
+    /// <summary>
+    /// Lazily initializes and returns the per-thread <see cref="Random"/>.
+    /// </summary>
+    private static Random ThreadRandom => _threadRandom ??= new Random(unchecked(Environment.TickCount * 397) ^ Environment.CurrentManagedThreadId);
 
     /// <summary>
     /// Creates a simulator from the provided configuration.
@@ -46,12 +57,13 @@ public sealed class LatencySimulator
     /// <returns>A task that completes when the packet has been passed to <paramref name="sender"/> or dropped.</returns>
     public Task ProcessAsync(ArraySegment<byte> segment, IPEndPoint target, Func<ArraySegment<byte>, IPEndPoint, Task> sender, CancellationToken cancellationToken)
     {
-        double lossRoll = _random.NextDouble();
-        int jitter = _config.JitterMilliseconds > 0 ? _random.Next(0, (int)_config.JitterMilliseconds) : 0;
+        Random random = ThreadRandom;
+        double lossRoll = random.NextDouble();
+        int jitter = _config.JitterMilliseconds > 0 ? random.Next(0, (int)_config.JitterMilliseconds) : 0;
         int delayMilliseconds = (int)_config.BaseLatencyMilliseconds + jitter;
 
-        if (_random.NextDouble() < _config.ReorderChance)
-            delayMilliseconds += _random.Next(0, 50);
+        if (_config.ReorderChance > 0 && random.NextDouble() < _config.ReorderChance)
+            delayMilliseconds += _config.OutOfOrderExtraDelayMilliseconds > 0 ? random.Next(0, (int)_config.OutOfOrderExtraDelayMilliseconds) : 0;
 
         if (lossRoll < _config.PacketLossChance)
             return Task.CompletedTask;

@@ -6,7 +6,7 @@ using SynapseSocket.Connections;
 using SynapseSocket.Core;
 using Xunit;
 
-namespace SynapseSocket.Tests;
+namespace SynapseSocket.Tests.Stress;
 
 public sealed class GarbageCollectionTests
 {

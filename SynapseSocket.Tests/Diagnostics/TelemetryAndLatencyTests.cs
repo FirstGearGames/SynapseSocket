@@ -7,7 +7,7 @@ using SynapseSocket.Connections;
 using SynapseSocket.Core;
 using Xunit;
 
-namespace SynapseSocket.Tests;
+namespace SynapseSocket.Tests.Diagnostics;
 
 public class TelemetryAndLatencyTests
 {

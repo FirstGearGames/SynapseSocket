@@ -8,7 +8,7 @@ using SynapseSocket.Core;
 using Xunit;
 using SynapseSocket.Core.Events;
 
-namespace SynapseSocket.Tests;
+namespace SynapseSocket.Tests.Lifecycle;
 
 public class KeepAliveAndTimeoutTests
 {

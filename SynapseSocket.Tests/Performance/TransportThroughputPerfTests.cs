@@ -11,7 +11,7 @@ using SynapseSocket.Connections;
 using SynapseSocket.Core;
 using Xunit;
 using Xunit.Abstractions;
-namespace SynapseSocket.Tests;
+namespace SynapseSocket.Tests.Performance;
 
 public sealed class TransportThroughputPerfTests
 {
