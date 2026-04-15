@@ -60,6 +60,17 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     public event UnhandledExceptionDelegate? UnhandledException;
     /// <summary>
+    /// Raised when the ingress path receives a datagram whose leading type byte is not a recognised
+    /// Synapse <see cref="SynapseSocket.Packets.PacketType"/>. Enables external protocols (e.g. a
+    /// rendezvous/beacon client) to piggyback on the UDP socket so the NAT mapping opened by talking
+    /// to the external service is the same mapping used for P2P traffic.
+    /// <para>
+    /// The packet bytes reference the internal receive buffer and are only valid for the duration
+    /// of the callback. Copy anything the handler needs to retain.
+    /// </para>
+    /// </summary>
+    public event UnknownPacketReceivedDelegate? UnknownPacketReceived;
+    /// <summary>
     /// The configuration the engine was constructed with.
     /// </summary>
     public SynapseConfig Config { get; }
@@ -140,7 +151,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             throw new ArgumentOutOfRangeException(nameof(config), "SegmentAssemblyTimeoutMilliseconds must not exceed 300000 (5 minutes).");
 
         ISignatureProvider signatureProvider = Config.SignatureProvider ?? new DefaultSignatureProvider();
-        Security = new(signatureProvider, Config.MaximumPacketsPerSecond, Config.MaximumPacketSize);
+        Security = new(signatureProvider, Config.MaximumPacketsPerSecond, Config.MaximumBytesPerSecond, Config.MaximumPacketSize);
         Connections = new();
         Telemetry = new(Config.EnableTelemetry);
         _latencySimulator = new(Config.LatencySimulator);
@@ -162,6 +173,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         uint segmentAssemblyTimeoutMilliseconds = config.SegmentAssemblyTimeoutMilliseconds;
         _segmentAssemblyTimeoutTicks = _isSegmentingEnabled && segmentAssemblyTimeoutMilliseconds != SynapseConfig.DisabledSegmentAssemblyTimeout ? TimeSpan.FromMilliseconds(segmentAssemblyTimeoutMilliseconds).Ticks : UnsetSegmentAssemblyTimeoutTicks;
         _maximumPacketsPerSecond = Config.MaximumPacketsPerSecond;
+        _maximumBytesPerSecond = Config.MaximumBytesPerSecond;
     }
 
     /// <summary>
@@ -189,6 +201,13 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
 
                 if (bindEndPoint.AddressFamily == AddressFamily.InterNetworkV6)
                     socket.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, false);
+
+                // Raise kernel UDP buffers before bind. The OS default (8–64 KiB on Windows) is too small
+                // for bursty loopback traffic with many concurrent peers and causes silent datagram drops.
+                if (Config.SocketReceiveBufferBytes != SynapseConfig.DisabledSocketBufferOverride)
+                    socket.ReceiveBufferSize = Config.SocketReceiveBufferBytes;
+                if (Config.SocketSendBufferBytes != SynapseConfig.DisabledSocketBufferOverride)
+                    socket.SendBufferSize = Config.SocketSendBufferBytes;
 
                 socket.Bind(bindEndPoint);
             }
@@ -221,10 +240,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             ingressEngine.ConnectionFailed += RaiseConnectionFailed;
             ingressEngine.ViolationOccurred += HandleViolation;
             ingressEngine.UnhandledException += OnUnhandledException;
-            ingressEngine.NatPeerReady += OnNatPeerReady;
-            ingressEngine.NatSessionFull += OnNatSessionFull;
-            ingressEngine.NatSessionCreated += OnNatSessionCreated;
-            ingressEngine.NatSessionUnavailable += OnNatSessionUnavailable;
+            ingressEngine.UnknownPacketReceived += OnUnknownPacketReceivedInternal;
 
             _ingressTasks.Add(ingressEngine.StartAsync(_cancellationTokenSource.Token));
         }
@@ -325,6 +341,27 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
 
         await _transmissionEngine!.SendSegmentedAsync(synapseConnection, payload, isReliable, GetOrRentSplitter(synapseConnection), cancellationToken).ConfigureAwait(false);
         RaisePacketSent(synapseConnection.RemoteEndPoint, payload, isReliable);
+    }
+
+    /// <summary>
+    /// Sends arbitrary bytes directly to the given endpoint over the engine's UDP socket,
+    /// bypassing Synapse's connection, handshake, and packet framing. Intended for external
+    /// protocols (e.g. a rendezvous/beacon client) that piggyback on the socket so their traffic
+    /// shares the same NAT mapping as Synapse's peer-to-peer traffic.
+    /// <para>
+    /// External protocols must use a leading byte strictly greater than
+    /// <see cref="SynapseSocket.Packets.PacketType.NatChallenge"/> so the ingress path can
+    /// distinguish their packets from Synapse packets and route them through
+    /// <see cref="UnknownPacketReceived"/>.
+    /// </para>
+    /// </summary>
+    /// <param name="target">The remote endpoint to send to.</param>
+    /// <param name="data">The wire-ready bytes to send.</param>
+    /// <param name="cancellationToken">Token to cancel the send operation.</param>
+    public Task SendRawAsync(IPEndPoint target, ArraySegment<byte> data, CancellationToken cancellationToken)
+    {
+        EnsureRunning();
+        return _transmissionEngine!.SendRawAsync(data, target, cancellationToken);
     }
 
     /// <summary>
@@ -512,6 +549,22 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// Forwards a background-loop exception to the <see cref="UnhandledException"/> event.
     /// </summary>
     private void OnUnhandledException(Exception exception) => UnhandledException?.Invoke(exception);
+
+    /// <summary>
+    /// Forwards an unknown packet received on the ingress path to the <see cref="UnknownPacketReceived"/> event.
+    /// Swallows listener exceptions so external handlers cannot crash the ingress loop.
+    /// </summary>
+    private void OnUnknownPacketReceivedInternal(IPEndPoint fromEndPoint, ArraySegment<byte> packet)
+    {
+        try
+        {
+            UnknownPacketReceived?.Invoke(fromEndPoint, packet);
+        }
+        catch (Exception listenerException)
+        {
+            UnhandledException?.Invoke(listenerException);
+        }
+    }
 
     /// <summary>
     /// Throws <see cref="InvalidOperationException"/> if the engine is not currently running.

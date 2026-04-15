@@ -298,8 +298,9 @@ public sealed partial class SynapseConnection : IPoolResettable
         ResettableObjectPool<PacketReassembler>.ReturnAndNullifyReference(ref Reassembler);
         
         /* Security. */
-        _receivedPacketCountResetTick = 0;
+        _inboundRateCountersResetTick = 0;
         _receivedByPacketCount = 0;
+        _receivedByBytesCount = 0;
     }
 
     /// <inheritdoc/>

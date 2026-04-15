@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
+using SynapseSocket.Core.Configuration;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -12,55 +13,164 @@ namespace SynapseSocket.Tests.Stress;
 
 public sealed class ConnectionStressTests
 {
-    private const int ClientCount = 100;
-    private const int SendsPerClient = 4;
-    private const int PayloadSize = 1000;
-    private const int ExpectedPackets = ClientCount * SendsPerClient;
-    private const int StressTestTimeoutMs = 120000;
-    private const int LifecycleTestTimeoutMs = 300000;
-
-    private static readonly byte[] SendBuffer;
+    private const int StressTestTimeoutMs = 6000;
+    private const int LifecycleTestTimeoutMs = 6000;
 
     private readonly ITestOutputHelper _output;
-
-    static ConnectionStressTests()
-    {
-        SendBuffer = new byte[PayloadSize];
-        Array.Fill(SendBuffer, (byte)0xAB);
-    }
 
     public ConnectionStressTests(ITestOutputHelper output)
     {
         _output = output;
     }
 
+    [Fact(Timeout = StressTestTimeoutMs)]
+    public Task StressTest_Clients_RapidSends_Reliable() => RunRapidSendStressAsync(reliable: true);
+
+    [Fact(Timeout = StressTestTimeoutMs)]
+    public Task StressTest_Clients_RapidSends_Unreliable() => RunRapidSendStressAsync(reliable: false);
+
     [Fact(Timeout = LifecycleTestTimeoutMs)]
-    public async Task StressTest_Clients_ConnectSendDisconnect_4Cycles_Reliable()
+    public Task StressTest_Clients_ConnectSendDisconnect_Cycles_Reliable() => RunConnectSendDisconnectCyclesAsync(reliable: true);
+
+    [Fact(Timeout = LifecycleTestTimeoutMs)]
+    public Task StressTest_Clients_ConnectSendDisconnect_Cycles_Unreliable() => RunConnectSendDisconnectCyclesAsync(reliable: false);
+
+    private async Task RunRapidSendStressAsync(bool reliable)
     {
-        const int CycleClientCount = 100;
-        const int CycleCount = 6;
+        const int ClientCount = 2000;
+        const int RapidSendsPerClient = 15;
+        const int PayloadSize = 1000;
+
+        byte[] sendBuffer = new byte[PayloadSize];
+        Array.Fill(sendBuffer, (byte)0xAB);
+
+        int expectedPackets = ClientCount * RapidSendsPerClient;
+        int port = TestHarness.GetFreePort();
+
+        SynapseManager server = new(TestHarness.ServerConfig(port, c => c.MaximumSegments = 2));
+        SynapseManager[] clients = new SynapseManager[ClientCount];
+        SynapseConnection[] clientToServerConnections = new SynapseConnection[ClientCount];
+
+        for (int i = 0; i < ClientCount; i++)
+        {
+            clients[i] = new(TestHarness.ClientConfig(c =>
+            {
+                c.MaximumSegments = 2;
+
+                if (reliable)
+                    c.Reliable.MaximumPending = RapidSendsPerClient * 2;
+            }));
+        }
+
+        using TestHarness.FailureObserver failureObserver = TestHarness.ObserveFailures([server, .. clients]);
+
+        try
+        {
+            await server.StartAsync(CancellationToken.None);
+
+            int connectedCount = 0;
+            server.ConnectionEstablished += _ => Interlocked.Increment(ref connectedCount);
+
+            Task[] connectTasks = new Task[ClientCount];
+
+            for (int i = 0; i < ClientCount; i++)
+            {
+                int idx = i;
+                connectTasks[idx] = Task.Run(async () =>
+                {
+                    await clients[idx].StartAsync(CancellationToken.None);
+                    clientToServerConnections[idx] = await clients[idx].ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
+                });
+            }
+
+            await Task.WhenAll(connectTasks);
+
+            Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref connectedCount) >= ClientCount, 30000),
+                $"Only {Volatile.Read(ref connectedCount)} / {ClientCount} clients connected within timeout.");
+
+            int receivedCount = 0;
+            server.PacketReceived += _ => Interlocked.Increment(ref receivedCount);
+
+            ArraySegment<byte> payload = new(sendBuffer);
+            Stopwatch stopwatch = Stopwatch.StartNew();
+
+            for (int i = 0; i < ClientCount; i++)
+            {
+                for (int s = 0; s < RapidSendsPerClient; s++)
+                    failureObserver.ObserveSend(clients[i].SendAsync(clientToServerConnections[i], payload, reliable, CancellationToken.None));
+            }
+
+            while (Volatile.Read(ref receivedCount) < expectedPackets && !failureObserver.HasFailures)
+                await Task.Delay(1).ConfigureAwait(false);
+
+            stopwatch.Stop();
+
+            double elapsedMs = stopwatch.Elapsed.TotalMilliseconds;
+            double elapsedSec = stopwatch.Elapsed.TotalSeconds;
+            double messagesPerSec = expectedPackets / elapsedSec;
+
+            _output.WriteLine($"Channel           : {(reliable ? "Reliable" : "Unreliable")}");
+            _output.WriteLine($"Clients           : {ClientCount:N0}");
+            _output.WriteLine($"Sends per client  : {RapidSendsPerClient}");
+            _output.WriteLine($"Payload size      : {PayloadSize} bytes");
+            _output.WriteLine($"Packets received  : {Volatile.Read(ref receivedCount):N0} / {expectedPackets:N0}");
+            _output.WriteLine($"Elapsed           : {elapsedMs:F2} ms");
+            _output.WriteLine($"Message rate      : {messagesPerSec:F0} msg/s");
+
+            failureObserver.AssertNoFailures();
+            Assert.Equal(expectedPackets, Volatile.Read(ref receivedCount));
+        }
+        finally
+        {
+            await server.DisposeAsync();
+
+            Task[] disposeTasks = new Task[ClientCount];
+
+            for (int i = 0; i < ClientCount; i++)
+                disposeTasks[i] = clients[i].DisposeAsync().AsTask();
+
+            await Task.WhenAll(disposeTasks);
+        }
+    }
+
+    private async Task RunConnectSendDisconnectCyclesAsync(bool reliable)
+    {
+        const int ClientCount = 2000;
+        const int ReconnectSendsPerClient = 4;
+        const int PayloadSize = 1000;
+
+        const int CycleCount = 4;
         const int ConnectWaitMs = 20000;
         const int ReceiveWaitMs = 15000;
         const int AckWaitMs = 5000;
         const int DisconnectWaitMs = 20000;
-        const bool WaitForAck = true;
+        const int DisconnectDelayMilliseconds = 500;
+
+        byte[] sendBuffer = new byte[PayloadSize];
+        Array.Fill(sendBuffer, (byte)0xAB);
 
         int port = TestHarness.GetFreePort();
-        SynapseManager server = new(TestHarness.ServerConfig(port, c => c.DisableHandshakeReplayProtection = true));
-        SynapseManager[] clients = new SynapseManager[CycleClientCount];
-        SynapseConnection[] connections = new SynapseConnection[CycleClientCount];
 
-        for (int i = 0; i < CycleClientCount; i++)
-            clients[i] = new(TestHarness.ClientConfig(c => c.Reliable.MaximumRetries = 120));
+        SynapseManager server = new(TestHarness.ServerConfig(port, c =>
+        {
+            c.MaximumBytesPerSecond = CycleCount * PayloadSize * ReconnectSendsPerClient;
+            c.MaximumSegments = 2;
+            c.DisableHandshakeReplayProtection = true;
+        }));
+        SynapseManager[] clients = new SynapseManager[ClientCount];
+        SynapseConnection[] connections = new SynapseConnection[ClientCount];
+
+        for (int i = 0; i < ClientCount; i++)
+            clients[i] = new(TestHarness.ClientConfig());
 
         try
         {
             await server.StartAsync(CancellationToken.None);
 
             // Start all clients once; they reconnect each cycle.
-            Task[] startTasks = new Task[CycleClientCount];
+            Task[] startTasks = new Task[ClientCount];
 
-            for (int i = 0; i < CycleClientCount; i++)
+            for (int i = 0; i < ClientCount; i++)
             {
                 int idx = i;
                 startTasks[idx] = clients[idx].StartAsync(CancellationToken.None);
@@ -77,18 +187,18 @@ public sealed class ConnectionStressTests
 
             // Client-side close is guaranteed: DisconnectAsync fires ConnectionClosed synchronously
             // after removing the connection, regardless of whether the server received the packet.
-            for (int i = 0; i < CycleClientCount; i++)
+            for (int i = 0; i < ClientCount; i++)
                 clients[i].ConnectionClosed += _ => Interlocked.Increment(ref totalClientClosedCount);
 
             async Task RunCycleAsync()
             {
-                int connectTarget = Volatile.Read(ref totalConnectedCount) + CycleClientCount;
-                int receiveTarget = Volatile.Read(ref totalReceivedCount) + CycleClientCount;
-                int closeTarget = Volatile.Read(ref totalClientClosedCount) + CycleClientCount;
+                int connectTarget = Volatile.Read(ref totalConnectedCount) + ClientCount;
+                int receiveTarget = Volatile.Read(ref totalReceivedCount) + ClientCount * ReconnectSendsPerClient;
+                int closeTarget = Volatile.Read(ref totalClientClosedCount) + ClientCount;
 
-                Task[] connectTasks = new Task[CycleClientCount];
+                Task[] connectTasks = new Task[ClientCount];
 
-                for (int i = 0; i < CycleClientCount; i++)
+                for (int i = 0; i < ClientCount; i++)
                 {
                     int idx = i;
                     connectTasks[idx] = Task.Run(async () =>
@@ -100,19 +210,22 @@ public sealed class ConnectionStressTests
                 Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref totalConnectedCount) >= connectTarget, ConnectWaitMs),
                     $"Only {Volatile.Read(ref totalConnectedCount)} / {connectTarget} clients connected.");
 
-                ArraySegment<byte> payload = new(SendBuffer);
+                ArraySegment<byte> payload = new(sendBuffer);
 
-                for (int i = 0; i < CycleClientCount; i++)
-                    _ = clients[i].SendAsync(connections[i], payload, true, CancellationToken.None);
+                for (int i = 0; i < ClientCount; i++)
+                {
+                    for (int s = 0; s < ReconnectSendsPerClient; s++)
+                        _ = clients[i].SendAsync(connections[i], payload, reliable, CancellationToken.None);
+                }
 
                 Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref totalReceivedCount) >= receiveTarget, ReceiveWaitMs),
                     $"Only {Volatile.Read(ref totalReceivedCount)} / {receiveTarget} packets received.");
 
-                if (WaitForAck)
+                if (reliable)
                 {
                     Assert.True(await TestHarness.WaitFor(() =>
                     {
-                        for (int i = 0; i < CycleClientCount; i++)
+                        for (int i = 0; i < ClientCount; i++)
                         {
                             if (!connections[i].PendingReliableQueue.IsEmpty)
                                 return false;
@@ -121,10 +234,14 @@ public sealed class ConnectionStressTests
                         return true;
                     }, AckWaitMs), "Not all reliable sends were acknowledged within the ACK wait window.");
                 }
+                else
+                {
+                    await Task.Delay(DisconnectDelayMilliseconds);
+                }
 
-                Task[] disconnectTasks = new Task[CycleClientCount];
+                Task[] disconnectTasks = new Task[ClientCount];
 
-                for (int i = 0; i < CycleClientCount; i++)
+                for (int i = 0; i < ClientCount; i++)
                 {
                     int idx = i;
                     disconnectTasks[idx] = clients[idx].DisconnectAsync(connections[idx], CancellationToken.None);
@@ -168,8 +285,10 @@ public sealed class ConnectionStressTests
             int gen3After = GC.CollectionCount(3);
             int gen4After = GC.CollectionCount(4);
 
-            _output.WriteLine($"Clients           : {CycleClientCount:N0}");
+            _output.WriteLine($"Channel           : {(reliable ? "Reliable" : "Unreliable")}");
+            _output.WriteLine($"Clients           : {ClientCount:N0}");
             _output.WriteLine($"Cycles            : {CycleCount}");
+            _output.WriteLine($"Sends per client  : {ReconnectSendsPerClient}");
             _output.WriteLine($"Payload size      : {PayloadSize} bytes");
 
             for (int i = 0; i < CycleCount; i++)
@@ -188,165 +307,8 @@ public sealed class ConnectionStressTests
         {
             await server.DisposeAsync();
 
-            Task[] disposeTasks = new Task[CycleClientCount];
-
-            for (int i = 0; i < CycleClientCount; i++)
-                disposeTasks[i] = clients[i].DisposeAsync().AsTask();
-
-            await Task.WhenAll(disposeTasks);
-        }
-    }
-
-    [Fact(Timeout = StressTestTimeoutMs)]
-    public async Task StressTest_Clients_4SendsEach_Unreliable()
-    {
-        int port = TestHarness.GetFreePort();
-
-        SynapseManager server = new(TestHarness.ServerConfig(port));
-        SynapseManager[] clients = new SynapseManager[ClientCount];
-        SynapseConnection[] clientToServerConnections = new SynapseConnection[ClientCount];
-
-        for (int i = 0; i < ClientCount; i++)
-            clients[i] = new(TestHarness.ClientConfig());
-
-        try
-        {
-            await server.StartAsync(CancellationToken.None);
-
-            int connectedCount = 0;
-            server.ConnectionEstablished += _ => Interlocked.Increment(ref connectedCount);
-
-            Task[] connectTasks = new Task[ClientCount];
-
-            for (int i = 0; i < ClientCount; i++)
-            {
-                int idx = i;
-                connectTasks[idx] = Task.Run(async () =>
-                {
-                    await clients[idx].StartAsync(CancellationToken.None);
-                    clientToServerConnections[idx] = await clients[idx].ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
-                });
-            }
-
-            await Task.WhenAll(connectTasks);
-
-            Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref connectedCount) >= ClientCount, 30000),
-                $"Only {Volatile.Read(ref connectedCount)} / {ClientCount} clients connected within timeout.");
-
-            int receivedCount = 0;
-            server.PacketReceived += _ => Interlocked.Increment(ref receivedCount);
-
-            ArraySegment<byte> payload = new(SendBuffer);
-            Stopwatch stopwatch = Stopwatch.StartNew();
-
-            for (int i = 0; i < ClientCount; i++)
-            {
-                for (int s = 0; s < SendsPerClient; s++)
-                    _ = clients[i].SendAsync(clientToServerConnections[i], payload, false, CancellationToken.None);
-            }
-
-            while (Volatile.Read(ref receivedCount) < ExpectedPackets)
-                await Task.Delay(1).ConfigureAwait(false);
-
-            stopwatch.Stop();
-
-            double elapsedMs = stopwatch.Elapsed.TotalMilliseconds;
-            double elapsedSec = stopwatch.Elapsed.TotalSeconds;
-            double messagesPerSec = ExpectedPackets / elapsedSec;
-
-            _output.WriteLine($"Clients           : {ClientCount:N0}");
-            _output.WriteLine($"Sends per client  : {SendsPerClient}");
-            _output.WriteLine($"Payload size      : {PayloadSize} bytes");
-            _output.WriteLine($"Packets received  : {Volatile.Read(ref receivedCount):N0} / {ExpectedPackets:N0}");
-            _output.WriteLine($"Elapsed           : {elapsedMs:F2} ms");
-            _output.WriteLine($"Message rate      : {messagesPerSec:F0} msg/s");
-
-            Assert.Equal(ExpectedPackets, Volatile.Read(ref receivedCount));
-        }
-        finally
-        {
-            await server.DisposeAsync();
-
             Task[] disposeTasks = new Task[ClientCount];
-            for (int i = 0; i < ClientCount; i++)
-                disposeTasks[i] = clients[i].DisposeAsync().AsTask();
 
-            await Task.WhenAll(disposeTasks);
-        }
-    }
-
-    [Fact(Timeout = StressTestTimeoutMs)]
-    public async Task StressTest_Clients_4SendsEach_Reliable()
-    {
-        int port = TestHarness.GetFreePort();
-
-        SynapseManager server = new(TestHarness.ServerConfig(port));
-        SynapseManager[] clients = new SynapseManager[ClientCount];
-        SynapseConnection[] clientToServerConnections = new SynapseConnection[ClientCount];
-
-        for (int i = 0; i < ClientCount; i++)
-            clients[i] = new(TestHarness.ClientConfig(c => c.Reliable.MaximumPending = SendsPerClient * 2));
-
-        try
-        {
-            await server.StartAsync(CancellationToken.None);
-
-            int connectedCount = 0;
-            server.ConnectionEstablished += _ => Interlocked.Increment(ref connectedCount);
-
-            // Start and connect all clients concurrently.
-            Task[] connectTasks = new Task[ClientCount];
-
-            for (int i = 0; i < ClientCount; i++)
-            {
-                int idx = i;
-                connectTasks[idx] = Task.Run(async () =>
-                {
-                    await clients[idx].StartAsync(CancellationToken.None);
-                    clientToServerConnections[idx] = await clients[idx].ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
-                });
-            }
-
-            await Task.WhenAll(connectTasks);
-
-            Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref connectedCount) >= ClientCount, 30000),
-                $"Only {Volatile.Read(ref connectedCount)} / {ClientCount} clients connected within timeout.");
-
-            int receivedCount = 0;
-            server.PacketReceived += _ =>  Interlocked.Increment(ref receivedCount);
-
-            ArraySegment<byte> payload = new(SendBuffer);
-            Stopwatch stopwatch = Stopwatch.StartNew();
-
-            for (int i = 0; i < ClientCount; i++)
-            {
-                for (int s = 0; s < SendsPerClient; s++)
-                    _ = clients[i].SendAsync(clientToServerConnections[i], payload, true, CancellationToken.None);
-            }
-
-            while (Volatile.Read(ref receivedCount) < ExpectedPackets)
-                await Task.Delay(1).ConfigureAwait(false);
-
-            stopwatch.Stop();
-
-            double elapsedMs = stopwatch.Elapsed.TotalMilliseconds;
-            double elapsedSec = stopwatch.Elapsed.TotalSeconds;
-            double messagesPerSec = ExpectedPackets / elapsedSec;
-
-            _output.WriteLine($"Clients           : {ClientCount:N0}");
-            _output.WriteLine($"Sends per client  : {SendsPerClient}");
-            _output.WriteLine($"Payload size      : {PayloadSize} bytes");
-            _output.WriteLine($"Packets received  : {Volatile.Read(ref receivedCount):N0} / {ExpectedPackets:N0}");
-            _output.WriteLine($"Elapsed           : {elapsedMs:F2} ms");
-            _output.WriteLine($"Message rate      : {messagesPerSec:F0} msg/s");
-
-            Assert.Equal(ExpectedPackets, Volatile.Read(ref receivedCount));
-        }
-        finally
-        {
-            await server.DisposeAsync();
-
-            Task[] disposeTasks = new Task[ClientCount];
             for (int i = 0; i < ClientCount; i++)
                 disposeTasks[i] = clients[i].DisposeAsync().AsTask();
 

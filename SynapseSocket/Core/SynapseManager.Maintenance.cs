@@ -42,6 +42,12 @@ public sealed partial class SynapseManager
     /// </summary>
     private readonly uint _maximumPacketsPerSecond;
     /// <summary>
+    /// Maximum number of bytes a single connection may receive per second before further packets are dropped.
+    /// Derived from <see cref="SynapseSocket.Core.Configuration.SynapseConfig.MaximumBytesPerSecond"/>.
+    /// Set to <see cref="SynapseSocket.Core.Configuration.SynapseConfig.DisabledMaximumBytesPerSecond"/> when the limit is disabled.
+    /// </summary>
+    private readonly uint _maximumBytesPerSecond;
+    /// <summary>
     /// Cached value of <see cref="SynapseSocket.Core.Configuration.ReliableConfig.AckBatchingEnabled"/> to avoid repeated config lookups on the hot maintenance path.
     /// </summary>
     private readonly bool _isAckBatchingEnabled;
@@ -92,7 +98,7 @@ public sealed partial class SynapseManager
                     {
                         RetransmitReliable(nowTicks, connection, cancellationToken);
                         TimeoutAssembledSegments(nowTicks, connection);
-                        ResetReceivedByPacketCount(nowTicks, connection);
+                        ResetInboundRateCounters(nowTicks, connection);
                     }
                 }
             }
@@ -254,15 +260,18 @@ public sealed partial class SynapseManager
     }
 
     /// <summary>
-    /// Resets the per-connection inbound packet counter for <paramref name="synapseConnection"/> if the one-second window has elapsed.
-    /// No-op when <see cref="SynapseSocket.Core.Configuration.SynapseConfig.MaximumPacketsPerSecond"/> is disabled.
+    /// Resets the per-connection inbound packet and byte counters for <paramref name="synapseConnection"/>
+    /// if the one-second window has elapsed. No-op when both
+    /// <see cref="SynapseSocket.Core.Configuration.SynapseConfig.MaximumPacketsPerSecond"/> and
+    /// <see cref="SynapseSocket.Core.Configuration.SynapseConfig.MaximumBytesPerSecond"/> are disabled.
     /// </summary>
-    private void ResetReceivedByPacketCount(long nowTicks, SynapseConnection synapseConnection)
+    private void ResetInboundRateCounters(long nowTicks, SynapseConnection synapseConnection)
     {
-        if (_maximumPacketsPerSecond == SynapseConfig.DisabledMaximumPacketsPerSecond)
+        if (_maximumPacketsPerSecond == SynapseConfig.DisabledMaximumPacketsPerSecond
+            && _maximumBytesPerSecond == SynapseConfig.DisabledMaximumBytesPerSecond)
             return;
 
-        synapseConnection.ResetReceivedByPacketCount(nowTicks);
+        synapseConnection.ResetInboundRateCounters(nowTicks);
     }
     
     /// <summary>

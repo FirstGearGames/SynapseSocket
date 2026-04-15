@@ -34,7 +34,18 @@ public sealed class SynapseConfig
     /// Maximum packets per second allowed per signature.
     /// Set to <see cref="DisabledMaximumPacketsPerSecond"/> (0) to disable packet rate limiting.
     /// </summary>
-    public uint MaximumPacketsPerSecond = 2000;
+    public uint MaximumPacketsPerSecond = 500;
+
+    /// <summary>
+    /// Maximum received bytes per second allowed per signature.
+    /// Paired with <see cref="MaximumPacketsPerSecond"/>: the packet count alone cannot catch
+    /// a peer sending near the pps cap at maximum packet size, which would sustain
+    /// <c>MaximumPacketsPerSecond * MaximumPacketSize</c> bytes/sec — well above a realistic
+    /// realtime-game upstream. Defaults to 2 MiB/s, which allows comfortable legitimate headroom
+    /// while cutting off bandwidth floods.
+    /// Set to <see cref="DisabledMaximumBytesPerSecond"/> (0) to disable bytes rate limiting.
+    /// </summary>
+    public uint MaximumBytesPerSecond = 2 * 1024 * 1024;
     /// <summary>
     /// Maximum number of segments a segmented payload may be split into.
     /// Set to <see cref="DisabledMaximumSegments"/> to disable this feature.
@@ -80,6 +91,26 @@ public sealed class SynapseConfig
     /// Set to 0 to disable this check.
     /// </summary>
     public uint MaximumReassembledPacketSize = 0;
+
+    /// <summary>
+    /// Kernel-level UDP socket receive buffer size (SO_RCVBUF) in bytes, applied on bind.
+    /// Defaults to 1 MiB: the OS default (~64 KiB on Windows) is too small to absorb bursty
+    /// fan-in from many peers sending segmented payloads concurrently, and undersized buffers
+    /// cause silent datagram drops that also let a single noisy peer degrade delivery for
+    /// other peers until the rate limiter kicks them. 1 MiB comfortably absorbs hundreds of
+    /// concurrent segments and matches what most production realtime-UDP libraries default to.
+    /// Set to <see cref="DisabledSocketBufferOverride"/> (0) to leave the OS default untouched.
+    /// </summary>
+    public int SocketReceiveBufferBytes = 1 * 1024 * 1024;
+
+    /// <summary>
+    /// Kernel-level UDP socket send buffer size (SO_SNDBUF) in bytes, applied on bind.
+    /// Defaults to <see cref="DisabledSocketBufferOverride"/> (leave the OS default untouched) —
+    /// send-side traffic is fan-out from a single process and paced by the app loop, so the
+    /// typical OS default (~64 KiB) easily absorbs the small runs of segments a sender emits.
+    /// Raise this only if you observe send-side back-pressure under genuine burst workloads.
+    /// </summary>
+    public int SocketSendBufferBytes = DisabledSocketBufferOverride;
 
     /// <summary>
     /// When true (default), received payloads are copied into a fresh buffer before being dispatched via <see cref="SynapseManager.PacketReceived"/>.
@@ -148,7 +179,18 @@ public sealed class SynapseConfig
     public const uint DisabledMaximumPacketsPerSecond = 0;
 
     /// <summary>
+    /// Sentinel value: pass as <see cref="MaximumBytesPerSecond"/> to disable bytes rate limiting.
+    /// </summary>
+    public const uint DisabledMaximumBytesPerSecond = 0;
+
+    /// <summary>
     /// Sentinel value: pass as <see cref="SegmentAssemblyTimeoutMilliseconds"/> to disable assembly timeout.
     /// </summary>
     public const uint DisabledSegmentAssemblyTimeout = 0;
+
+    /// <summary>
+    /// Sentinel value: pass as <see cref="SocketReceiveBufferBytes"/> or <see cref="SocketSendBufferBytes"/>
+    /// to leave the OS default untouched.
+    /// </summary>
+    public const int DisabledSocketBufferOverride = 0;
 }

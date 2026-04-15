@@ -192,22 +192,12 @@ SynapseConfig config = new()
 
 ### Server-assisted (rendezvous)
 
-A lightweight rendezvous server registers both peers and relays their external endpoints. Once each peer knows the other's address, the engine handles the punch autonomously — no relay traffic after the handshake.
-
-```csharp
-SynapseConfig config = new()
-{
-    NatTraversal =
-    {
-        Mode = NatTraversalMode.Server,
-        Server =
-        {
-            ServerEndPoint = new IPEndPoint(IPAddress.Parse("1.2.3.4"), 5000),
-            SessionId = "my-lobby-session"
-        }
-    }
-};
-```
+Server-assisted rendezvous — where a small signalling service matches peers and exchanges their
+external endpoints before hole-punching — lives in the companion **[SynapseBeacon](SynapseBeacon/)**
+project. SynapseBeacon piggybacks on the Synapse UDP socket via the `SynapseManager.SendRawAsync` +
+`UnknownPacketReceived` extension hooks, so the NAT mapping opened to the beacon server is the same
+mapping used for peer-to-peer traffic after the punch. See `SynapseBeacon.Demo` for an end-to-end
+example.
 
 ---
 
@@ -234,9 +224,9 @@ SynapseSocket is structured as a set of partial classes and focused subsystems:
 ```
 SynapseManager          — public API; owns sockets, lifecycle, and event dispatch
 ├── IngressEngine       — per-socket receive loop; security pipeline; packet dispatch
-│   └── IngressEngine.Nat.cs   — NAT probe and rendezvous-server packet handling
+│   └── IngressEngine.Nat.cs   — NAT probe + challenge-response handling (FullCone)
 ├── TransmissionEngine  — send path; reliable queue; keep-alive; disconnect packets
-│   └── TransmissionEngine.Nat.cs  — NAT probe and registration sends
+│   └── TransmissionEngine.Nat.cs  — NAT probe + challenge sends (FullCone)
 ├── SynapseManager.Maintenance.cs  — background loop: keep-alive sweep, reliable
 │                                     retransmit, segment eviction, rate-bucket sweep
 └── SynapseManager.NatTraversal.cs — outbound hole-punch orchestration

@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <LangVersion>12.0</LangVersion>
+        <Nullable>enable</Nullable>
+        <AssemblyName>SynapseBeacon</AssemblyName>
+        <RootNamespace>SynapseBeacon</RootNamespace>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <NoWarn>$(NoWarn);CS1591</NoWarn>
+        <!-- Suppress warnings that originate in CodeBoost source files. -->
+        <NoWarn>$(NoWarn);CS8618;CS8625;CS0067</NoWarn>
+        <Description>SynapseBeacon - UDP rendezvous signalling service for Synapse peer-to-peer hole punching</Description>
+        <Version>1.0.0</Version>
+        <TargetFrameworks>netstandard2.1;net8.0</TargetFrameworks>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\submodules\CodeBoost\CodeBoost.CodeAnalysis.Analyzers\CodeBoost.CodeAnalysis.Analyzers.csproj"
+                          OutputItemType="Analyzer"
+                          ReferenceOutputAssembly="false"/>
+
+        <!-- CodeBoost source is transitively compiled into SynapseSocket; reference that for pools etc. -->
+        <ProjectReference Include="..\SynapseSocket\SynapseSocket.csproj" />
+    </ItemGroup>
+
+</Project>

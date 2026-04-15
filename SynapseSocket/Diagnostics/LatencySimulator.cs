@@ -35,7 +35,7 @@ public sealed class LatencySimulator
     /// <summary>
     /// Lazily initializes and returns the per-thread <see cref="Random"/>.
     /// </summary>
-    private static Random ThreadRandom => _threadRandom ??= new Random(unchecked(Environment.TickCount * 397) ^ Environment.CurrentManagedThreadId);
+    private static Random ThreadRandom => _threadRandom ??= new(unchecked(Environment.TickCount * 397) ^ Environment.CurrentManagedThreadId);
 
     /// <summary>
     /// Creates a simulator from the provided configuration.

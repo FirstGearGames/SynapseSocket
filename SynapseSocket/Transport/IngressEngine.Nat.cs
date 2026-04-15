@@ -5,7 +5,6 @@ using System.Threading;
 using SynapseSocket.Connections;
 using SynapseSocket.Packets;
 using SynapseSocket.Core.Configuration;
-using SynapseSocket.Core.Events;
 
 namespace SynapseSocket.Transport;
 
@@ -16,22 +15,6 @@ namespace SynapseSocket.Transport;
 /// </summary>
 public sealed partial class IngressEngine
 {
-    /// <summary>
-    /// Raised when a NAT rendezvous server reports the peer's external endpoint.
-    /// </summary>
-    public event NatPeerReadyDelegate? NatPeerReady;
-    /// <summary>
-    /// Raised when a NAT rendezvous server rejects the session because it is full or was not found.
-    /// </summary>
-    public event NatSessionFullDelegate? NatSessionFull;
-    /// <summary>
-    /// Raised when a NAT rendezvous server responds with the server-assigned session ID.
-    /// </summary>
-    public event NatSessionCreatedDelegate? NatSessionCreated;
-    /// <summary>
-    /// Raised when a NAT rendezvous server rejects a session-creation request because its concurrent session limit has been reached.
-    /// </summary>
-    public event NatSessionUnavailableDelegate? NatSessionUnavailable;
     /// <summary>
     /// True if NAT is enabled for any configuration.
     /// </summary>
@@ -128,46 +111,6 @@ public sealed partial class IngressEngine
     }
 
     /// <summary>
-    /// Routes an inbound packet from the configured NAT rendezvous server to the appropriate handler.
-    /// </summary>
-    private void ProcessNatServerPacket(IPEndPoint fromEndPoint, PacketType packetType, ReadOnlySpan<byte> payload)
-    {
-        if (!_isNatEnabled || _config.NatTraversal.Mode != NatTraversalMode.Server)
-            return;
-
-        if (_config.NatTraversal.Server.ServerEndPoint is null)
-            return;
-
-        if (!fromEndPoint.Equals(_config.NatTraversal.Server.ServerEndPoint))
-            return;
-
-        switch (packetType)
-        {
-            case PacketType.NatPeerReady:
-                IPEndPoint? peerEndPoint = TryParsePeerEndPoint(payload);
-                if (peerEndPoint is not null)
-                    NatPeerReady?.Invoke(peerEndPoint);
-                break;
-
-            case PacketType.NatSessionFull:
-                NatSessionFull?.Invoke();
-                break;
-
-            case PacketType.NatSessionCreated:
-                if (TryParseNatSessionId(payload, out uint sessionId))
-                    NatSessionCreated?.Invoke(sessionId);
-                break;
-
-            case PacketType.NatSessionUnavailable:
-                NatSessionUnavailable?.Invoke();
-                break;
-
-            case PacketType.NatHeartbeatAck:
-                break;
-        }
-    }
-
-    /// <summary>
     /// Computes a truncated HMAC-SHA256 token bound to <paramref name="endPoint"/> and <paramref name="timeBucket"/>.
     /// Writes exactly <see cref="NatTokenSize"/> bytes into <paramref name="destination"/>.
     /// </summary>
@@ -213,49 +156,4 @@ public sealed partial class IngressEngine
     /// Evicts stale entries from the NAT probe response-time dictionary.
     /// </summary>
     private void RemoveExpiredProbeLimitEntries(long nowTicks, long staleTicks) => RemoveExpiredEntries(_natProbeLastResponseTicks, nowTicks, staleTicks);
-
-    /// <summary>
-    /// Parses the uint session ID from a <see cref="PacketType.NatSessionCreated"/> payload.
-    /// Returns false if the payload is too short.
-    /// </summary>
-    private static bool TryParseNatSessionId(ReadOnlySpan<byte> payload, out uint sessionId)
-    {
-        if (payload.Length < NatWireFormat.SessionIdBytes)
-        {
-            sessionId = 0;
-            return false;
-        }
-
-        sessionId = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(payload[..NatWireFormat.SessionIdBytes]);
-        return true;
-    }
-
-    /// <summary>
-    /// Parses a NAT server packet body into an <see cref="IPEndPoint"/>.
-    /// Returns null if the body is malformed or too short.
-    /// </summary>
-    private static IPEndPoint? TryParsePeerEndPoint(ReadOnlySpan<byte> body)
-    {
-        if (body.Length < 1)
-            return null;
-
-        byte addrFamily = body[0];
-        ReadOnlySpan<byte> rest = body[1..];
-
-        if (addrFamily == 4 && rest.Length >= 6)
-        {
-            IPAddress ip = new(rest[..4]);
-            ushort port = (ushort)(rest[4] | (rest[5] << 8));
-            return new(ip, port);
-        }
-
-        if (addrFamily == 6 && rest.Length >= 18)
-        {
-            IPAddress ip = new(rest[..16]);
-            ushort port = (ushort)(rest[16] | (rest[17] << 8));
-            return new(ip, port);
-        }
-
-        return null;
-    }
 }

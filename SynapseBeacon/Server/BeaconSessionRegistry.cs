@@ -3,30 +3,26 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
 using CodeBoost.Performance;
-using SynapseSocket.Packets;
 
-namespace SynapseSocket.NatServer;
+namespace SynapseBeacon.Server;
 
 /// <summary>
-/// Tracks pending NAT rendezvous sessions keyed by a server-assigned 6-digit numeric session ID.
-/// Sessions are created when a host sends <c>NatRequestSession</c> and remain open until the host
-/// explicitly closes them via <c>NatCloseSession</c> or the session times out.
-/// Multiple joiners may register against the same session ID; each is matched directly to the host.
+/// Tracks pending rendezvous sessions keyed by a server-assigned numeric session ID.
+/// Sessions are created when a host sends <see cref="Wire.BeaconPacketType.RequestSession"/> and
+/// remain open until the host explicitly closes them via <see cref="Wire.BeaconPacketType.CloseSession"/>
+/// or the session times out. Multiple joiners may register against the same session ID; each is
+/// matched directly to the host.
 /// </summary>
-internal sealed class NatSessionRegistry
+internal sealed class BeaconSessionRegistry
 {
     /// <summary>
     /// Holds the state for a single active rendezvous session.
     /// </summary>
     private sealed class Entry
     {
-        /// <summary>
-        /// External endpoint of the host that created this session.
-        /// </summary>
+        /// <summary>External endpoint of the host that created this session.</summary>
         internal readonly IPEndPoint Host;
-        /// <summary>
-        /// UTC ticks of the last heartbeat received from the host. Used to evict stale sessions.
-        /// </summary>
+        /// <summary>UTC ticks of the last heartbeat received from the host. Used to evict stale sessions.</summary>
         internal long LastHeartbeatTicks;
 
         internal Entry(IPEndPoint host)
@@ -39,6 +35,18 @@ internal sealed class NatSessionRegistry
     private readonly ConcurrentDictionary<uint, Entry> _sessions = new();
     private readonly long _timeoutTicks;
     private readonly int _maximumConcurrentSessions;
+    [ThreadStatic]
+    private static Random? _threadRandom;
+
+    /// <summary>
+    /// Lazily initializes and returns a per-thread <see cref="Random"/> instance.
+    /// Avoids locking when generating session IDs under concurrent requests.
+    /// </summary>
+    private static Random ThreadRandom => _threadRandom ??= new Random(unchecked(Environment.TickCount * 397) ^ Environment.CurrentManagedThreadId);
+
+    /// <summary>
+    /// Milliseconds of heartbeat silence before a session is evicted.
+    /// </summary>
     internal uint SessionTimeoutMilliseconds { get; }
 
     /// <summary>
@@ -46,7 +54,7 @@ internal sealed class NatSessionRegistry
     /// </summary>
     /// <param name="sessionTimeoutMilliseconds">Milliseconds of heartbeat silence before a session is evicted.</param>
     /// <param name="maximumConcurrentSessions">Maximum number of sessions that may be open simultaneously. 0 = unlimited.</param>
-    internal NatSessionRegistry(uint sessionTimeoutMilliseconds = 300_000, int maximumConcurrentSessions = 0)
+    internal BeaconSessionRegistry(uint sessionTimeoutMilliseconds = 300_000, int maximumConcurrentSessions = 0)
     {
         SessionTimeoutMilliseconds = sessionTimeoutMilliseconds;
         _timeoutTicks = TimeSpan.FromMilliseconds(sessionTimeoutMilliseconds).Ticks;
@@ -81,7 +89,7 @@ internal sealed class NatSessionRegistry
     }
 
     /// <summary>
-    /// Registers <paramref name="endpoint"/> as a new joiner for an existing session.
+    /// Registers <paramref name="endpoint"/> as a joiner for an existing session.
     /// Returns <c>(matched: true, host, joiner)</c> when the joiner is accepted,
     /// <c>(matched: false, notFound: true, ...)</c> when the session ID does not exist or has expired, or
     /// <c>(matched: false, notFound: false, ...)</c> when the host re-registers (heartbeat refresh).
@@ -148,20 +156,7 @@ internal sealed class NatSessionRegistry
     }
 
     /// <summary>
-    /// Parses a fixed-length uint session ID from raw packet bytes.
-    /// Returns false if the slice is too short.
+    /// Generates a random session ID in the range [100000, 1000000).
     /// </summary>
-    internal static bool TryParseSessionId(byte[] data, int offset, out uint sessionId)
-    {
-        if (data.Length < offset + NatWireFormat.SessionIdBytes)
-        {
-            sessionId = 0;
-            return false;
-        }
-
-        sessionId = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(offset, NatWireFormat.SessionIdBytes));
-        return true;
-    }
-
-    private static uint GenerateId() => (uint)Random.Shared.Next(100000, 1000000);
+    private static uint GenerateId() => (uint)ThreadRandom.Next(100000, 1000000);
 }

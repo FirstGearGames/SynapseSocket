@@ -99,6 +99,11 @@ public sealed partial class IngressEngine
     /// </summary>
     public event UnhandledExceptionDelegate? UnhandledException;
     /// <summary>
+    /// Raised when the ingress path receives a datagram whose leading type byte is not a recognised
+    /// Synapse <see cref="PacketType"/>. Allows external protocols to piggyback on the UDP socket.
+    /// </summary>
+    public event UnknownPacketReceivedDelegate? UnknownPacketReceived;
+    /// <summary>
     /// True when Ack batching is enabled and the interval is not unset.
     /// </summary>
     private bool _isAckBatchingEnabled;
@@ -228,7 +233,7 @@ public sealed partial class IngressEngine
                     continue;
                 }
 
-                //_telemetry.OnReceived(receivedLength);
+                _telemetry.OnReceived(receivedLength);
                 ProcessPacket(rentedBuffer, receivedLength, fromEndPoint, synapseConnection, nowTicks, cancellationToken, ref isPayloadCopied);
             }
             catch (OperationCanceledException)
@@ -295,6 +300,16 @@ public sealed partial class IngressEngine
             return;
         }
 
+        // Unknown packet type — fire the external hook (e.g. beacon/rendezvous client) and return.
+        // External protocols must use a leading byte outside the Synapse PacketType range.
+        byte typeByte = buffer[0];
+
+        if (typeByte > (byte)PacketType.NatChallenge)
+        {
+            UnknownPacketReceived?.Invoke(fromEndPoint, new(buffer, 0, length));
+            return;
+        }
+
         PacketType type;
         ushort sequence;
         ushort segmentId;
@@ -327,14 +342,6 @@ public sealed partial class IngressEngine
 
             case PacketType.NatChallenge:
                 ProcessNatChallengeExchange(fromEndPoint, buffer.AsSpan(headerSize, length - headerSize), cancellationToken);
-                return;
-
-            case PacketType.NatRegister:
-            case PacketType.NatHeartbeat:
-            case PacketType.NatHeartbeatAck:
-            case PacketType.NatPeerReady:
-            case PacketType.NatSessionFull:
-                ProcessNatServerPacket(fromEndPoint, type, buffer.AsSpan(headerSize, length - headerSize));
                 return;
         }
 

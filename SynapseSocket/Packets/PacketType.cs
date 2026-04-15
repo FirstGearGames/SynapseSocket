@@ -10,6 +10,10 @@ namespace SynapseSocket.Packets;
 /// <item><see cref="ReliableSegmented"/> — sequence number, then segment fields.</item>
 /// </list>
 /// All other types carry no additional header fields; any further bytes are payload.
+/// <para>
+/// Byte values strictly greater than <see cref="NatChallenge"/> are reserved for external protocols
+/// that piggyback on the Synapse UDP socket via <c>SynapseManager.UnknownPacketReceived</c>.
+/// </para>
 /// </summary>
 public enum PacketType : byte
 {
@@ -41,32 +45,5 @@ public enum PacketType : byte
     NatProbe = 8,
 
     /// <summary>NAT challenge or challenge echo. Payload is an 8-byte HMAC token.</summary>
-    NatChallenge = 9,
-
-    /// <summary>Registers with a NAT rendezvous server. Payload is the ASCII session ID.</summary>
-    NatRegister = 10,
-
-    /// <summary>Keep-alive heartbeat to a NAT rendezvous server. Payload is the ASCII session ID.</summary>
-    NatHeartbeat = 11,
-
-    /// <summary>Rendezvous server acknowledges a heartbeat. No payload.</summary>
-    NatHeartbeatAck = 12,
-
-    /// <summary>Rendezvous server reports the peer's external endpoint. Payload: address family byte + IP bytes + port (2 bytes LE).</summary>
-    NatPeerReady = 13,
-
-    /// <summary>Rendezvous server rejects a registration because the session is full or was not found. No payload.</summary>
-    NatSessionFull = 14,
-
-    /// <summary>Client requests the rendezvous server to create and assign a new session ID. No payload.</summary>
-    NatRequestSession = 15,
-
-    /// <summary>Rendezvous server responds with the newly created session ID. Payload is the ASCII session ID.</summary>
-    NatSessionCreated = 16,
-
-    /// <summary>Host requests the rendezvous server to close a session and stop accepting new joiners. Payload is the ASCII session ID.</summary>
-    NatCloseSession = 17,
-
-    /// <summary>Rendezvous server rejects a session-creation request because its concurrent session limit has been reached. No payload.</summary>
-    NatSessionUnavailable = 18,
+    NatChallenge = 9
 }

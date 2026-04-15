@@ -25,6 +25,10 @@ public sealed class SecurityProvider
     /// </summary>
     private readonly uint _maximumPacketsPerSecond;
     /// <summary>
+    /// Maximum number of bytes a single peer may send per second. Zero disables bytes rate limiting.
+    /// </summary>
+    private readonly uint _maximumBytesPerSecond;
+    /// <summary>
     /// Maximum permitted size of a single incoming packet in bytes. Packets exceeding this are rejected.
     /// </summary>
     private readonly uint _maximumPacketSize;
@@ -39,11 +43,13 @@ public sealed class SecurityProvider
     /// </summary>
     /// <param name="signatureProvider">The signature provider used to identify remote peers.</param>
     /// <param name="maximumPacketsPerSecond">Per-peer packet rate limit. Zero disables packet rate limiting.</param>
+    /// <param name="maximumBytesPerSecond">Per-peer byte rate limit. Zero disables byte rate limiting.</param>
     /// <param name="maximumPacketSize">Maximum permitted packet size in bytes.</param>
-    public SecurityProvider(ISignatureProvider signatureProvider, uint maximumPacketsPerSecond, uint maximumPacketSize)
+    public SecurityProvider(ISignatureProvider signatureProvider, uint maximumPacketsPerSecond, uint maximumBytesPerSecond, uint maximumPacketSize)
     {
         SignatureProvider = signatureProvider ?? throw new ArgumentNullException(nameof(signatureProvider));
         _maximumPacketsPerSecond = maximumPacketsPerSecond;
+        _maximumBytesPerSecond = maximumBytesPerSecond;
         _maximumPacketSize = maximumPacketSize;
     }
 
@@ -88,11 +94,16 @@ public sealed class SecurityProvider
         if (packetLength <= 0 || packetLength > _maximumPacketSize)
             return FilterResult.Oversized;
 
-        /* Bytes per second are intentionally not checked. Maximum packet size with maximum
-         * packets per second is sufficient. */
-        if (_maximumPacketsPerSecond != SynapseConfig.DisabledMaximumPacketsPerSecond && !synapseConnection.AllowReceivePacket(_maximumPacketsPerSecond))
+        // Packet-count and byte-count caps run as paired per-receive checks against
+        // counters that the maintenance loop resets once per second. They catch two
+        // distinct abuse shapes: packet floods (many tiny packets) and bandwidth floods
+        // (fewer but larger packets that stay under the pps cap).
+        if (_maximumPacketsPerSecond is not SynapseConfig.DisabledMaximumPacketsPerSecond && !synapseConnection.AllowReceivePacket(_maximumPacketsPerSecond))
             return FilterResult.RateLimited;
-        
+
+        if (_maximumBytesPerSecond is not SynapseConfig.DisabledMaximumBytesPerSecond && !synapseConnection.AllowReceiveBytes(packetLength, _maximumBytesPerSecond))
+            return FilterResult.RateLimited;
+
         return FilterResult.Allowed;
     }
 

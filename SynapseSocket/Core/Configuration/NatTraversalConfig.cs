@@ -3,8 +3,8 @@ namespace SynapseSocket.Core.Configuration;
 /// <summary>
 /// Configuration for NAT traversal. Assign to <see cref="SynapseConfig.NatTraversal"/>.
 /// <para>
-/// Shared probe settings (<see cref="ProbeCount"/>, <see cref="IntervalMilliseconds"/>, <see cref="MaximumAttempts"/>) apply to both <see cref="NatTraversalMode.FullCone"/> and <see cref="NatTraversalMode.Server"/> modes once an endpoint is known.
-/// Mode-exclusive settings live in <see cref="FullCone"/> and <see cref="Server"/> respectively.
+/// Shared probe settings (<see cref="ProbeCount"/>, <see cref="IntervalMilliseconds"/>, <see cref="MaximumAttempts"/>) apply to <see cref="NatTraversalMode.FullCone"/> once an endpoint is known.
+/// Mode-exclusive settings live in <see cref="FullCone"/>.
 /// </para>
 /// </summary>
 public sealed class NatTraversalConfig
@@ -38,9 +38,4 @@ public sealed class NatTraversalConfig
     /// Settings exclusive to <see cref="NatTraversalMode.FullCone"/> direct hole-punching.
     /// </summary>
     public FullConeNatConfig FullCone = new();
-
-    /// <summary>
-    /// Settings exclusive to <see cref="NatTraversalMode.Server"/> rendezvous-assisted punching.
-    /// </summary>
-    public ServerNatConfig Server = new();
 }

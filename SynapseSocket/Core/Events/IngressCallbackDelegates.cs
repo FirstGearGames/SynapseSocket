@@ -25,21 +25,15 @@ public delegate void ConnectionFailedCallbackDelegate(IPEndPoint? endPoint, Conn
 public delegate void ViolationCallbackDelegate(IPEndPoint endPoint, ulong signature, ViolationReason violationReason, int packetSize, string? details, ViolationAction initialViolationAction);
 
 /// <summary>
-/// Internal callback: a NAT rendezvous server has reported the peer's external endpoint.
+/// Raised when the ingress path receives a datagram whose first byte is not a recognised
+/// Synapse <see cref="SynapseSocket.Packets.PacketType"/> value. Allows external protocols
+/// (e.g. a rendezvous/beacon client) to piggyback on the Synapse UDP socket so that the NAT
+/// mapping opened by talking to the external service is the same mapping used for P2P traffic.
+/// <para>
+/// The <paramref name="packet"/> segment references the internal receive buffer and is only
+/// valid for the duration of the callback. Copy any bytes the handler needs to retain.
+/// </para>
 /// </summary>
-public delegate void NatPeerReadyDelegate(IPEndPoint peerEndPoint);
-
-/// <summary>
-/// Internal callback: a NAT rendezvous server rejected the registration because the session is full or was not found.
-/// </summary>
-public delegate void NatSessionFullDelegate();
-
-/// <summary>
-/// Internal callback: a NAT rendezvous server assigned a new session ID in response to a session request.
-/// </summary>
-public delegate void NatSessionCreatedDelegate(uint sessionId);
-
-/// <summary>
-/// Internal callback: a NAT rendezvous server rejected a session-creation request because its concurrent session limit has been reached.
-/// </summary>
-public delegate void NatSessionUnavailableDelegate();
+/// <param name="fromEndPoint">The source endpoint of the datagram.</param>
+/// <param name="packet">The full raw packet bytes, including the leading type byte.</param>
+public delegate void UnknownPacketReceivedDelegate(IPEndPoint fromEndPoint, ArraySegment<byte> packet);
