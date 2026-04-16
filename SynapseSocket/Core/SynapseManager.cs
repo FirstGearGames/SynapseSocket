@@ -61,9 +61,16 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     public event UnhandledExceptionDelegate? UnhandledException;
     /// <summary>
     /// Raised when the ingress path receives a datagram whose leading type byte is not a recognised
-    /// Synapse <see cref="SynapseSocket.Packets.PacketType"/>. Enables external protocols (e.g. a
-    /// rendezvous/beacon client) to piggyback on the UDP socket so the NAT mapping opened by talking
-    /// to the external service is the same mapping used for P2P traffic.
+    /// Synapse <see cref="SynapseSocket.Packets.PacketType"/> and
+    /// <see cref="SynapseSocket.Core.Configuration.SynapseConfig.AllowUnknownPackets"/> is true.
+    /// Enables external protocols (e.g. a rendezvous/beacon client) to piggyback on the UDP socket
+    /// so the NAT mapping opened by talking to the external service is the same mapping used for P2P traffic.
+    /// <para>
+    /// The handler must return <see cref="SynapseSocket.Security.FilterResult.Allowed"/> to accept the
+    /// packet. Any other value raises a <see cref="SynapseSocket.Core.Events.ViolationReason.UnknownPacket"/>
+    /// violation and takes the default action (<see cref="SynapseSocket.Core.Events.ViolationAction.KickAndBlacklist"/>),
+    /// which subscribers may override via <see cref="ViolationDetected"/>.
+    /// </para>
     /// <para>
     /// The packet bytes reference the internal receive buffer and are only valid for the duration
     /// of the callback. Copy anything the handler needs to retain.
@@ -383,29 +390,29 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Central violation handler.
-    /// Builds a <see cref="ViolationEventArgs"/> via the pool, applies the caller-supplied <paramref name="initialAction"/>
-    /// as the default response, invokes any user listener (which may mutate <see cref="ViolationEventArgs.Action"/>),
-    /// and then applies the final action.
+    /// Constructs a <see cref="ViolationEventArgs"/> from the supplied parameters, invokes
+    /// <see cref="ViolationDetected"/> (if subscribed) to obtain the desired <see cref="ViolationAction"/>,
+    /// and applies that action. Falls back to <paramref name="initialAction"/> when no subscriber is attached.
     /// </summary>
     internal void HandleViolation(IPEndPoint endPoint, ulong signature, ViolationReason violationReason, int packetSize, string? details, ViolationAction initialAction = ViolationAction.KickAndBlacklist)
     {
         Connections.ConnectionsByEndPoint.TryGetValue(endPoint, out SynapseConnection? synapseConnection);
 
-        ViolationEventArgs violationEventArgs = ResettableObjectPool<ViolationEventArgs>.Rent();
-        violationEventArgs.Initialize(endPoint, signature, violationReason, synapseConnection, packetSize, details, initialAction);
+        ViolationEventArgs violationEventArgs = new(endPoint, signature, violationReason, synapseConnection, packetSize, details, initialAction);
+        ViolationAction returnedViolationAction = initialAction;
 
         try
         {
             try
             {
-                ViolationDetected?.Invoke(violationEventArgs);
+                returnedViolationAction = ViolationDetected?.Invoke(violationEventArgs) ?? initialAction;
             }
             catch
             {
                 /* never let a listener crash the ingress path */
             }
 
-            switch (violationEventArgs.Action)
+            switch (returnedViolationAction)
             {
                 case ViolationAction.Ignore:
                     return;
@@ -426,10 +433,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
                     return;
             }
         }
-        finally
-        {
-            ResettableObjectPool<ViolationEventArgs>.Return(violationEventArgs);
-        }
+        catch { }
     }
 
     /// <summary>
@@ -551,18 +555,21 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     private void OnUnhandledException(Exception exception) => UnhandledException?.Invoke(exception);
 
     /// <summary>
-    /// Forwards an unknown packet received on the ingress path to the <see cref="UnknownPacketReceived"/> event.
-    /// Swallows listener exceptions so external handlers cannot crash the ingress loop.
+    /// Forwards an unknown packet received on the ingress path to the <see cref="UnknownPacketReceived"/> event
+    /// and returns the delegate's <see cref="SynapseSocket.Security.FilterResult"/> to the ingress path.
+    /// Returns <see cref="SynapseSocket.Security.FilterResult.Allowed"/> when no subscribers are attached or
+    /// when a subscriber throws, so listener exceptions cannot crash the ingress loop.
     /// </summary>
-    private void OnUnknownPacketReceivedInternal(IPEndPoint fromEndPoint, ArraySegment<byte> packet)
+    private FilterResult OnUnknownPacketReceivedInternal(IPEndPoint fromEndPoint, ArraySegment<byte> packet)
     {
         try
         {
-            UnknownPacketReceived?.Invoke(fromEndPoint, packet);
+            return UnknownPacketReceived?.Invoke(fromEndPoint, packet) ?? FilterResult.Allowed;
         }
         catch (Exception listenerException)
         {
             UnhandledException?.Invoke(listenerException);
+            return FilterResult.Allowed;
         }
     }
 
@@ -655,17 +662,13 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     private void OnConnectionEstablishedInternal(SynapseConnection synapseConnection)
     {
-        ConnectionEventArgs connectionEventArgs = ResettableObjectPool<ConnectionEventArgs>.Rent();
-        connectionEventArgs.Initialize(synapseConnection);
+        ConnectionEventArgs connectionEventArgs = new(synapseConnection);
 
         try
         {
             ConnectionEstablished?.Invoke(connectionEventArgs);
         }
-        finally
-        {
-            ResettableObjectPool<ConnectionEventArgs>.Return(connectionEventArgs);
-        }
+        catch { }
     }
 
     /// <summary>
@@ -673,17 +676,13 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     private void OnConnectionClosedInternal(SynapseConnection synapseConnection)
     {
-        ConnectionEventArgs connectionEventArgs = ResettableObjectPool<ConnectionEventArgs>.Rent();
-        connectionEventArgs.Initialize(synapseConnection);
+        ConnectionEventArgs connectionEventArgs = new(synapseConnection);
 
         try
         {
             ConnectionClosed?.Invoke(connectionEventArgs);
         }
-        finally
-        {
-            ResettableObjectPool<ConnectionEventArgs>.Return(connectionEventArgs);
-        }
+        catch { }
     }
 
     /// <summary>
@@ -691,17 +690,13 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     private void RaisePacketSent(IPEndPoint endPoint, ArraySegment<byte> payload, bool isReliable)
     {
-        PacketSentEventArgs packetSentEventArgs = ResettableObjectPool<PacketSentEventArgs>.Rent();
-        packetSentEventArgs.Initialize(endPoint, payload, isReliable);
+        PacketSentEventArgs packetSentEventArgs = new(endPoint, payload, isReliable);
 
         try
         {
             PacketSent?.Invoke(packetSentEventArgs);
         }
-        finally
-        {
-            ResettableObjectPool<PacketSentEventArgs>.Return(packetSentEventArgs);
-        }
+        catch { }
     }
 
     /// <summary>
@@ -709,17 +704,13 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     private void RaiseConnectionClosed(SynapseConnection synapseConnection)
     {
-        ConnectionEventArgs connectionEventArgs = ResettableObjectPool<ConnectionEventArgs>.Rent();
-        connectionEventArgs.Initialize(synapseConnection);
+        ConnectionEventArgs connectionEventArgs = new(synapseConnection);
 
         try
         {
             ConnectionClosed?.Invoke(connectionEventArgs);
         }
-        finally
-        {
-            ResettableObjectPool<ConnectionEventArgs>.Return(connectionEventArgs);
-        }
+        catch { }
     }
 
     /// <summary>
@@ -727,17 +718,13 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     private void RaiseConnectionFailed(IPEndPoint? endPoint, ConnectionRejectedReason connectionRejectedReason, string? message)
     {
-        ConnectionFailedEventArgs connectionFailedEventArgs = ResettableObjectPool<ConnectionFailedEventArgs>.Rent();
-        connectionFailedEventArgs.Initialize(endPoint, connectionRejectedReason, message);
+        ConnectionFailedEventArgs connectionFailedEventArgs = new(endPoint, connectionRejectedReason, message);
 
         try
         {
             ConnectionFailed?.Invoke(connectionFailedEventArgs);
         }
-        finally
-        {
-            ResettableObjectPool<ConnectionFailedEventArgs>.Return(connectionFailedEventArgs);
-        }
+        catch { }
     }
 
     /// <summary>

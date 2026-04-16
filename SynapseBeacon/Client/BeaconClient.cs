@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using SynapseBeacon.Wire;
 using SynapseSocket.Core;
+using SynapseSocket.Security;
 
 namespace SynapseBeacon.Client;
 
@@ -27,19 +28,31 @@ namespace SynapseBeacon.Client;
 /// </summary>
 public sealed class BeaconClient : IDisposable
 {
+    /// <summary>
+    /// The <see cref="SynapseManager"/> whose socket carries all beacon traffic.
+    /// </summary>
     private readonly SynapseManager _synapse;
+
+    /// <summary>
+    /// Client configuration, including the beacon server endpoint and timeout values.
+    /// </summary>
     private readonly BeaconClientConfig _config;
+
+    /// <summary>
+    /// Cached beacon server endpoint from <see cref="_config"/> to avoid repeated property reads on the hot path.
+    /// </summary>
     private readonly IPEndPoint _serverEndPoint;
 
     /// <summary>
     /// Pending <see cref="BeaconPacketType.RequestSession"/> call. Completed by the next
-    /// <see cref="BeaconPacketType.SessionCreated"/> or <see cref="BeaconPacketType.SessionUnavailable"/>.
+    /// <see cref="BeaconPacketType.SessionCreated"/> or <see cref="BeaconPacketType.ServerAtCapacity"/>.
     /// </summary>
     private TaskCompletionSource<uint>? _pendingSessionRequest;
 
     /// <summary>
-    /// Pending <see cref="BeaconPacketType.Register"/> calls keyed by session ID. Completed by
-    /// the matching <see cref="BeaconPacketType.PeerReady"/> or <see cref="BeaconPacketType.SessionFull"/>.
+    /// Pending <see cref="BeaconPacketType.JoinSession"/> calls keyed by session ID. Completed by
+    /// the matching <see cref="BeaconPacketType.PeerReady"/>, or faulted by
+    /// <see cref="BeaconPacketType.SessionNotFound"/> if the ID does not exist on the server.
     /// </summary>
     private readonly ConcurrentDictionary<uint, TaskCompletionSource<IPEndPoint>> _pendingRegistrations = new();
 
@@ -49,18 +62,30 @@ public sealed class BeaconClient : IDisposable
     /// </summary>
     private readonly ConcurrentDictionary<uint, BeaconHostSession> _hostSessions = new();
 
+    /// <summary>
+    /// Non-zero once <see cref="Dispose"/> has been called. Guards against double-dispose.
+    /// </summary>
     private int _isDisposed;
 
     /// <summary>
     /// Creates a new client bound to <paramref name="synapseManager"/>'s UDP socket.
     /// </summary>
-    /// <param name="synapseManager">A running <see cref="SynapseManager"/>. All beacon traffic is sent and received via this engine's socket.</param>
+    /// <param name="synapseManager">
+    /// A running <see cref="SynapseManager"/> whose <see cref="SynapseSocket.Core.Configuration.SynapseConfig.AllowUnknownPackets"/>
+    /// is set to true. All beacon traffic is sent and received via this engine's socket.
+    /// </param>
     /// <param name="config">Client configuration, including the rendezvous server endpoint.</param>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when <see cref="SynapseSocket.Core.Configuration.SynapseConfig.AllowUnknownPackets"/> is false on <paramref name="synapseManager"/>.
+    /// </exception>
     public BeaconClient(SynapseManager synapseManager, BeaconClientConfig config)
     {
         _synapse = synapseManager ?? throw new ArgumentNullException(nameof(synapseManager));
         _config = config ?? throw new ArgumentNullException(nameof(config));
         _serverEndPoint = config.ServerEndPoint;
+
+        if (!synapseManager.Config.AllowUnknownPackets)
+            throw new InvalidOperationException($"{nameof(BeaconClient)} requires {nameof(SynapseSocket.Core.Configuration.SynapseConfig.AllowUnknownPackets)} = true on the {nameof(SynapseManager)}.");
 
         _synapse.UnknownPacketReceived += OnUnknownPacketReceived;
     }
@@ -111,7 +136,7 @@ public sealed class BeaconClient : IDisposable
 
         try
         {
-            await SendRegisterAsync(sessionId, cancellationToken).ConfigureAwait(false);
+            await SendJoinSessionAsync(sessionId, cancellationToken).ConfigureAwait(false);
             return await AwaitWithTimeoutAsync(tcs.Task, cancellationToken).ConfigureAwait(false);
         }
         finally
@@ -146,15 +171,16 @@ public sealed class BeaconClient : IDisposable
 
     /// <summary>
     /// Routes an inbound unknown packet from <see cref="SynapseManager.UnknownPacketReceived"/>
-    /// if it originated from the configured beacon server.
+    /// if it originated from the configured beacon server. Returns <see cref="FilterResult.Allowed"/>
+    /// unconditionally — the beacon protocol does not police other unknown-packet sources.
     /// </summary>
-    private void OnUnknownPacketReceived(IPEndPoint fromEndPoint, ArraySegment<byte> packet)
+    private FilterResult OnUnknownPacketReceived(IPEndPoint fromEndPoint, ArraySegment<byte> packet)
     {
         if (!fromEndPoint.Equals(_serverEndPoint))
-            return;
+            return FilterResult.Allowed;
 
         if (packet.Count < 1 || packet.Array is null)
-            return;
+            return FilterResult.Allowed;
 
         BeaconPacketType type = (BeaconPacketType)packet.Array[packet.Offset];
         ReadOnlySpan<byte> payload = new(packet.Array, packet.Offset + 1, packet.Count - 1);
@@ -165,22 +191,24 @@ public sealed class BeaconClient : IDisposable
                 HandleSessionCreated(payload);
                 break;
 
-            case BeaconPacketType.SessionUnavailable:
-                HandleSessionUnavailable();
+            case BeaconPacketType.ServerAtCapacity:
+                HandleServerAtCapacity();
                 break;
 
             case BeaconPacketType.PeerReady:
                 HandlePeerReady(payload);
                 break;
 
-            case BeaconPacketType.SessionFull:
-                HandleSessionFull();
+            case BeaconPacketType.SessionNotFound:
+                HandleSessionNotFound();
                 break;
 
             case BeaconPacketType.HeartbeatAck:
                 /* no-op — keep-alive acknowledgement */
                 break;
         }
+
+        return FilterResult.Allowed;
     }
 
     /// <summary>
@@ -196,12 +224,21 @@ public sealed class BeaconClient : IDisposable
     }
 
     /// <summary>
-    /// Fails the pending session request when the server's session limit has been reached.
+    /// Fails the pending session request when the server's concurrent session cap has been reached.
     /// </summary>
-    private void HandleSessionUnavailable()
+    private void HandleServerAtCapacity()
     {
         TaskCompletionSource<uint>? tcs = Volatile.Read(ref _pendingSessionRequest);
-        tcs?.TrySetException(new InvalidOperationException("Beacon server rejected session request: session limit reached."));
+        tcs?.TrySetException(new InvalidOperationException("Beacon server rejected session request: server at capacity."));
+    }
+
+    /// <summary>
+    /// Fails all pending registrations whose session ID was not found or has expired on the server.
+    /// </summary>
+    private void HandleSessionNotFound()
+    {
+        foreach (KeyValuePair<uint, TaskCompletionSource<IPEndPoint>> kvp in _pendingRegistrations)
+            kvp.Value.TrySetException(new InvalidOperationException($"Beacon server rejected registration: session '{kvp.Key}' not found or has expired."));
     }
 
     /// <summary>
@@ -210,7 +247,7 @@ public sealed class BeaconClient : IDisposable
     /// Because the host does not know the joiner's session ID from the packet alone, any active
     /// host session is a valid target — only a joiner's registration carries a session ID we can
     /// match against. The server only sends <c>PeerReady</c> to the host in response to a specific
-    /// joiner's <c>Register</c>, so we dispatch to all host sessions; in practice at most one will
+    /// joiner's <c>JoinSession</c>, so we dispatch to all host sessions; in practice at most one will
     /// be active per joiner endpoint.
     /// </summary>
     private void HandlePeerReady(ReadOnlySpan<byte> payload)
@@ -234,15 +271,6 @@ public sealed class BeaconClient : IDisposable
     }
 
     /// <summary>
-    /// Fails all pending registrations that the server has just rejected.
-    /// </summary>
-    private void HandleSessionFull()
-    {
-        foreach (KeyValuePair<uint, TaskCompletionSource<IPEndPoint>> kvp in _pendingRegistrations)
-            kvp.Value.TrySetException(new InvalidOperationException($"Beacon server rejected registration for session '{kvp.Key}': session not found or full."));
-    }
-
-    /// <summary>
     /// Sends a <see cref="BeaconPacketType.RequestSession"/> packet (single type byte, no payload).
     /// </summary>
     private Task SendRequestSessionAsync(CancellationToken cancellationToken)
@@ -253,11 +281,11 @@ public sealed class BeaconClient : IDisposable
     }
 
     /// <summary>
-    /// Sends a <see cref="BeaconPacketType.Register"/> packet carrying the target session ID.
+    /// Sends a <see cref="BeaconPacketType.JoinSession"/> packet carrying the target session ID.
     /// </summary>
-    private Task SendRegisterAsync(uint sessionId, CancellationToken cancellationToken)
+    private Task SendJoinSessionAsync(uint sessionId, CancellationToken cancellationToken)
     {
-        return SendTypeAndSessionIdAsync(BeaconPacketType.Register, sessionId, cancellationToken);
+        return SendTypeAndSessionIdAsync(BeaconPacketType.JoinSession, sessionId, cancellationToken);
     }
 
     /// <summary>

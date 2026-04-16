@@ -8,7 +8,6 @@ namespace SynapseSocket.Core.Events;
 
 /// <summary>
 /// Event arguments for <see cref="SynapseManager.PacketReceived"/>.
-/// Obtain instances via <see cref="ResettableObjectPool{T}"/>; do not retain after the handler returns.
 /// The <see cref="Payload"/> is backed by a pooled buffer and is only valid for the duration of the handler — copy the data if you need to retain it beyond the callback.
 /// </summary>
 public struct PacketReceivedEventArgs

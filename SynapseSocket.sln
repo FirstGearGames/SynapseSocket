@@ -13,6 +13,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SynapseBeacon", "SynapseBea
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SynapseBeacon.Demo", "SynapseBeacon.Demo\SynapseBeacon.Demo.csproj", "{7C812159-EB70-4EFB-A389-960A918B49E9}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SynapseBeacon.Host", "SynapseBeacon.Host\SynapseBeacon.Host.csproj", "{8D81215A-EB70-4EFB-A389-960A918B49EA}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -83,6 +85,18 @@ Global
 		{7C812159-EB70-4EFB-A389-960A918B49E9}.Release|x64.Build.0 = Release|Any CPU
 		{7C812159-EB70-4EFB-A389-960A918B49E9}.Release|x86.ActiveCfg = Release|Any CPU
 		{7C812159-EB70-4EFB-A389-960A918B49E9}.Release|x86.Build.0 = Release|Any CPU
+		{8D81215A-EB70-4EFB-A389-960A918B49EA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8D81215A-EB70-4EFB-A389-960A918B49EA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8D81215A-EB70-4EFB-A389-960A918B49EA}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{8D81215A-EB70-4EFB-A389-960A918B49EA}.Debug|x64.Build.0 = Debug|Any CPU
+		{8D81215A-EB70-4EFB-A389-960A918B49EA}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{8D81215A-EB70-4EFB-A389-960A918B49EA}.Debug|x86.Build.0 = Debug|Any CPU
+		{8D81215A-EB70-4EFB-A389-960A918B49EA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8D81215A-EB70-4EFB-A389-960A918B49EA}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8D81215A-EB70-4EFB-A389-960A918B49EA}.Release|x64.ActiveCfg = Release|Any CPU
+		{8D81215A-EB70-4EFB-A389-960A918B49EA}.Release|x64.Build.0 = Release|Any CPU
+		{8D81215A-EB70-4EFB-A389-960A918B49EA}.Release|x86.ActiveCfg = Release|Any CPU
+		{8D81215A-EB70-4EFB-A389-960A918B49EA}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

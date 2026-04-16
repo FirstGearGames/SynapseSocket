@@ -18,13 +18,13 @@ public sealed class BeaconClientConfig
     /// <see cref="Wire.BeaconPacketType.PeerReady"/> response before the operation fails.
     /// Default: 10 seconds.
     /// </summary>
-    public int ResponseTimeoutMilliseconds { get; set; } = 10_000;
+    public int ResponseTimeoutMilliseconds = 10_000;
 
     /// <summary>
     /// Interval between heartbeat packets sent by a host to keep its session alive.
     /// Default: 30 seconds.
     /// </summary>
-    public int HeartbeatIntervalMilliseconds { get; set; } = 30_000;
+    public int HeartbeatIntervalMilliseconds = 30_000;
 
     /// <summary>
     /// Initialises a new config instance targeting <paramref name="serverEndPoint"/>.

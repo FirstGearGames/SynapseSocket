@@ -6,6 +6,12 @@ using System.Threading.Tasks;
 namespace SynapseBeacon.Client;
 
 /// <summary>
+/// Invoked when the rendezvous server matches a joiner with a hosted session.
+/// </summary>
+/// <param name="peerEndPoint">The matched joiner's external endpoint.</param>
+public delegate void PeerReadyDelegate(IPEndPoint peerEndPoint);
+
+/// <summary>
 /// Represents an active hosted session on a <see cref="Server.BeaconServer"/>.
 /// Returned from <see cref="BeaconClient.HostAsync"/>.
 /// <para>
@@ -17,45 +23,64 @@ namespace SynapseBeacon.Client;
 /// </summary>
 public sealed class BeaconHostSession : IAsyncDisposable, IDisposable
 {
-    /// <summary>Raised whenever the rendezvous server matches a joiner with this host.</summary>
-    public event Action<IPEndPoint>? PeerReady;
+    /// <summary>
+    /// Raised whenever the rendezvous server matches a joiner with this host.
+    /// </summary>
+    public event PeerReadyDelegate? PeerReady;
 
-    /// <summary>Server-assigned session ID. Share this out-of-band with joiners.</summary>
+    /// <summary>
+    /// Server-assigned session ID. Share this out-of-band with joiners.
+    /// </summary>
     public uint SessionId { get; }
 
+    /// <summary>
+    /// The <see cref="BeaconClient"/> that owns this session and sends its heartbeats.
+    /// </summary>
     private readonly BeaconClient _client;
-    private readonly CancellationTokenSource _heartbeatCts;
+
+    /// <summary>
+    /// Cancellation source used to stop the heartbeat loop when the session is closed.
+    /// </summary>
+    private readonly CancellationTokenSource _heartbeatCancellationTokenSource;
+
+    /// <summary>
+    /// Background task running the heartbeat loop for the lifetime of this session.
+    /// </summary>
     private readonly Task _heartbeatTask;
+
+    /// <summary>
+    /// Non-zero once the session has been closed. Guards against double-close.
+    /// </summary>
     private int _isClosed;
 
     internal BeaconHostSession(BeaconClient client, uint sessionId, int heartbeatIntervalMilliseconds)
     {
         _client = client;
         SessionId = sessionId;
-        _heartbeatCts = new();
-        _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(heartbeatIntervalMilliseconds, _heartbeatCts.Token));
+        _heartbeatCancellationTokenSource = new();
+        _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(heartbeatIntervalMilliseconds, _heartbeatCancellationTokenSource.Token));
     }
 
     /// <summary>
     /// Invoked by <see cref="BeaconClient"/> when a <c>PeerReady</c> packet arrives for this session.
     /// </summary>
-    internal void RaisePeerReady(IPEndPoint joiner)
+    internal void RaisePeerReady(IPEndPoint peerEndPoint)
     {
-        PeerReady?.Invoke(joiner);
+        PeerReady?.Invoke(peerEndPoint);
     }
 
     /// <summary>
     /// Closes this session on the server and stops sending heartbeats.
-    /// Subsequent joiners with the session ID will be rejected with <c>SessionFull</c>.
+    /// Subsequent joiners with the session ID are silently dropped by the server.
     /// </summary>
-    public async Task CloseAsync(CancellationToken cancellationToken = default)
+    public async Task CloseAsync(CancellationToken cancellationToken)
     {
         if (Interlocked.Exchange(ref _isClosed, 1) != 0)
             return;
 
         try
         {
-            _heartbeatCts.Cancel();
+            _heartbeatCancellationTokenSource.Cancel();
         }
         catch
         {
@@ -82,18 +107,21 @@ public sealed class BeaconHostSession : IAsyncDisposable, IDisposable
             /* ignore */
         }
 
-        _heartbeatCts.Dispose();
+        _heartbeatCancellationTokenSource.Dispose();
     }
 
     /// <inheritdoc/>
-    public ValueTask DisposeAsync() => new(CloseAsync());
+    public ValueTask DisposeAsync()
+    {
+        return new(CloseAsync(CancellationToken.None));
+    }
 
     /// <inheritdoc/>
     public void Dispose()
     {
         try
         {
-            CloseAsync().GetAwaiter().GetResult();
+            CloseAsync(CancellationToken.None).GetAwaiter().GetResult();
         }
         catch
         {

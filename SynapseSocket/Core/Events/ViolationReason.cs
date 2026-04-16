@@ -1,7 +1,8 @@
 namespace SynapseSocket.Core.Events;
 
 /// <summary>
-/// Reasons an already-established connection committed an offense after being connected.
+/// Reasons a violation was raised on the ingress path.
+/// Some reasons apply only to established connections; others can fire pre-connection.
 /// Surfaced on the <c>ViolationDetected</c> event via <see cref="ViolationEventArgs"/>.
 /// </summary>
 public enum ViolationReason
@@ -34,5 +35,12 @@ public enum ViolationReason
     /// <summary>
     /// Received a malformed or unparseable packet header.
     /// </summary>
-    Malformed
+    Malformed,
+
+    /// <summary>
+    /// Received a datagram whose first byte is not a recognised <see cref="SynapseSocket.Packets.PacketType"/>
+    /// and <see cref="SynapseSocket.Core.Configuration.SynapseConfig.AllowUnknownPackets"/> is false,
+    /// or the <see cref="SynapseManager.UnknownPacketReceived"/> delegate explicitly rejected the packet.
+    /// </summary>
+    UnknownPacket
 }

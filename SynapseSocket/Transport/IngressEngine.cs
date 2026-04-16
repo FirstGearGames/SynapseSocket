@@ -23,12 +23,12 @@ namespace SynapseSocket.Transport;
 /// Manages incoming data and initial filtering.
 /// Applies lowest-level mitigations BEFORE any payload copy.
 /// </summary>
-public sealed partial class IngressEngine
+internal sealed partial class IngressEngine
 {
     /// <summary>
     /// True when the ingress receive loop is running.
     /// </summary>
-    public bool IsRunning { get; private set; }
+    internal bool IsRunning { get; private set; }
     /// <summary>
     /// The UDP socket this engine receives from.
     /// </summary>
@@ -77,32 +77,32 @@ public sealed partial class IngressEngine
     /// <summary>
     /// Raised when a complete payload (unsegmented or fully reassembled) is ready for the application layer.
     /// </summary>
-    public event PayloadDeliveredDelegate? PayloadDelivered;
+    internal event PayloadDeliveredDelegate? PayloadDelivered;
     /// <summary>
     /// Raised when a new connection is established via a successful handshake.
     /// </summary>
-    public event ConnectionDelegate? ConnectionEstablished;
+    internal event ConnectionDelegate? ConnectionEstablished;
     /// <summary>
     /// Raised when a remote peer sends a disconnect packet.
     /// </summary>
-    public event ConnectionDelegate? ConnectionClosed;
+    internal event ConnectionDelegate? ConnectionClosed;
     /// <summary>
     /// Raised when a connection attempt is rejected before it can be established.
     /// </summary>
-    public event ConnectionFailedCallbackDelegate? ConnectionFailed;
+    internal event ConnectionFailedCallbackDelegate? ConnectionFailed;
     /// <summary>
     /// Raised when a protocol violation is detected on the ingress path.
     /// </summary>
-    public event ViolationCallbackDelegate? ViolationOccurred;
+    internal event ViolationCallbackDelegate? ViolationOccurred;
     /// <summary>
     /// Raised when an unexpected exception escapes the receive loop.
     /// </summary>
-    public event UnhandledExceptionDelegate? UnhandledException;
+    internal event UnhandledExceptionDelegate? UnhandledException;
     /// <summary>
     /// Raised when the ingress path receives a datagram whose leading type byte is not a recognised
     /// Synapse <see cref="PacketType"/>. Allows external protocols to piggyback on the UDP socket.
     /// </summary>
-    public event UnknownPacketReceivedDelegate? UnknownPacketReceived;
+    internal event UnknownPacketReceivedDelegate? UnknownPacketReceived;
     /// <summary>
     /// True when Ack batching is enabled and the interval is not unset.
     /// </summary>
@@ -300,13 +300,29 @@ public sealed partial class IngressEngine
             return;
         }
 
-        // Unknown packet type — fire the external hook (e.g. beacon/rendezvous client) and return.
-        // External protocols must use a leading byte outside the Synapse PacketType range.
+        // Unknown packet type — byte outside the Synapse PacketType range.
+        // External protocols (e.g. beacon/rendezvous clients) piggyback here intentionally.
         byte typeByte = buffer[0];
 
         if (typeByte > (byte)PacketType.NatChallenge)
         {
-            UnknownPacketReceived?.Invoke(fromEndPoint, new(buffer, 0, length));
+            if (!_config.AllowUnknownPackets)
+            {
+                _telemetry.OnDroppedIn();
+                ulong unknownSignature = synapseConnection?.Signature ?? _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
+                ViolationOccurred?.Invoke(fromEndPoint, unknownSignature, ViolationReason.UnknownPacket, length, null, ViolationAction.KickAndBlacklist);
+                return;
+            }
+
+            FilterResult unknownFilterResult = UnknownPacketReceived?.Invoke(fromEndPoint, new(buffer, 0, length)) ?? FilterResult.Allowed;
+
+            if (unknownFilterResult != FilterResult.Allowed)
+            {
+                _telemetry.OnDroppedIn();
+                ulong unknownSignature = synapseConnection?.Signature ?? _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
+                ViolationOccurred?.Invoke(fromEndPoint, unknownSignature, ViolationReason.UnknownPacket, length, unknownFilterResult.ToString(), ViolationAction.KickAndBlacklist);
+            }
+
             return;
         }
 

@@ -13,7 +13,7 @@ namespace SynapseSocket.Transport;
 /// Manages incoming data and initial filtering.
 /// Applies lowest-level mitigations BEFORE any payload copy.
 /// </summary>
-public sealed partial class IngressEngine
+internal sealed partial class IngressEngine
 {
     /// <summary>
     /// True if NAT is enabled for any configuration.

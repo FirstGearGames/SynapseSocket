@@ -1,7 +1,6 @@
 using System;
 using System.Net;
 using CodeBoost.CodeAnalysis;
-using CodeBoost.Performance;
 
 namespace SynapseSocket.Core.Events;
 
@@ -10,12 +9,11 @@ namespace SynapseSocket.Core.Events;
 /// Fires after the send has completed — <see cref="Payload"/> is the original caller-supplied segment.
 /// Do not retain this instance after the handler returns; it is returned to the pool immediately after.
 /// </summary>
-public sealed class PacketSentEventArgs : EventArgs, IPoolResettable
+public struct PacketSentEventArgs
 {
     /// <summary>
     /// The remote endpoint the packet was sent to.
     /// </summary>
-    [PoolResettableMember]
     public IPEndPoint EndPoint { get; private set; }
 
     /// <summary>
@@ -32,25 +30,10 @@ public sealed class PacketSentEventArgs : EventArgs, IPoolResettable
     /// <summary>
     /// Initialises a new instance of <see cref="PacketSentEventArgs"/>.
     /// </summary>
-    public PacketSentEventArgs() { }
-
-    /// <summary>
-    /// Initialises the instance for reuse via the object pool.
-    /// </summary>
-    public void Initialize(IPEndPoint endPoint, ArraySegment<byte> payload, bool isReliable)
+    public PacketSentEventArgs(IPEndPoint endPoint, ArraySegment<byte> payload, bool isReliable)
     {
         EndPoint = endPoint;
         Payload = payload;
         IsReliable = isReliable;
     }
-
-    /// <inheritdoc/>
-    public void OnReturn()
-    {
-        EndPoint = null;
-        Payload = default;
-    }
-
-    /// <inheritdoc/>
-    public void OnRent() { }
 }

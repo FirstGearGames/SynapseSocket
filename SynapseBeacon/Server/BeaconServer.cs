@@ -14,7 +14,7 @@ namespace SynapseBeacon.Server;
 /// The host sends <see cref="BeaconPacketType.RequestSession"/> to obtain a server-assigned session ID.
 /// The server responds with <see cref="BeaconPacketType.SessionCreated"/> containing the ID.
 /// The host shares the ID out-of-band with any number of joiners.
-/// Each joiner sends <see cref="BeaconPacketType.Register"/> with the shared ID; the server responds
+/// Each joiner sends <see cref="BeaconPacketType.JoinSession"/> with the shared ID; the server responds
 /// to that joiner with the host's external endpoint and to the host with the joiner's endpoint,
 /// after which hole-punching proceeds directly between each pair using the caller's
 /// <c>SynapseSocket</c> engine.
@@ -25,26 +25,55 @@ namespace SynapseBeacon.Server;
 /// </summary>
 public sealed class BeaconServer : IDisposable
 {
-    /// <summary>Maximum UDP datagram size.</summary>
+    /// <summary>
+    /// Session timeout used when the caller does not supply an explicit value.
+    /// </summary>
+    public const uint DefaultSessionTimeoutMilliseconds = 300_000;
+
+    /// <summary>
+    /// Sentinel for <c>maximumConcurrentSessions</c> indicating no cap is enforced.
+    /// </summary>
+    public const int UnlimitedConcurrentSessions = 0;
+
+    /// <summary>
+    /// Maximum UDP datagram size the receive loop will allocate for.
+    /// </summary>
     private const int MaximumUdpDatagramSize = 65535;
 
+    /// <summary>
+    /// UDP socket bound to the configured port. Shared for all sends and receives.
+    /// </summary>
     private readonly UdpClient _socket;
+
+    /// <summary>
+    /// In-memory store of active rendezvous sessions.
+    /// </summary>
     private readonly BeaconSessionRegistry _registry;
+
+    /// <summary>
+    /// Periodic timer that drives session eviction on a fixed cadence.
+    /// </summary>
     private readonly Timer _evictionTimer;
+
+    /// <summary>
+    /// Optional log sink supplied by the caller. Null when logging is disabled.
+    /// </summary>
     private readonly Action<string>? _log;
 
     /// <summary>
     /// Immutable single-byte payload for <see cref="BeaconPacketType.HeartbeatAck"/>. Shared across all sends.
     /// </summary>
     private static readonly byte[] HeartbeatAckPacket = [(byte)BeaconPacketType.HeartbeatAck];
+
     /// <summary>
-    /// Immutable single-byte payload for <see cref="BeaconPacketType.SessionFull"/>. Shared across all sends.
+    /// Immutable single-byte payload for <see cref="BeaconPacketType.ServerAtCapacity"/>. Shared across all sends.
     /// </summary>
-    private static readonly byte[] SessionFullPacket = [(byte)BeaconPacketType.SessionFull];
+    private static readonly byte[] ServerAtCapacityPacket = [(byte)BeaconPacketType.ServerAtCapacity];
+
     /// <summary>
-    /// Immutable single-byte payload for <see cref="BeaconPacketType.SessionUnavailable"/>. Shared across all sends.
+    /// Immutable single-byte payload for <see cref="BeaconPacketType.SessionNotFound"/>. Shared across all sends.
     /// </summary>
-    private static readonly byte[] SessionUnavailablePacket = [(byte)BeaconPacketType.SessionUnavailable];
+    private static readonly byte[] SessionNotFoundPacket = [(byte)BeaconPacketType.SessionNotFound];
 
     /// <summary>
     /// Initialises the server bound to <paramref name="port"/> on all interfaces.
@@ -53,7 +82,7 @@ public sealed class BeaconServer : IDisposable
     /// <param name="sessionTimeoutMilliseconds">Milliseconds of heartbeat silence before a session is evicted.</param>
     /// <param name="maximumConcurrentSessions">Maximum number of sessions open simultaneously. 0 = unlimited.</param>
     /// <param name="log">Optional log sink. When null, logging is silent.</param>
-    public BeaconServer(int port, uint sessionTimeoutMilliseconds = 300_000, int maximumConcurrentSessions = 0, Action<string>? log = null)
+    public BeaconServer(int port, uint sessionTimeoutMilliseconds, int maximumConcurrentSessions, Action<string>? log)
     {
         _socket = new(port);
         _registry = new(sessionTimeoutMilliseconds, maximumConcurrentSessions);
@@ -115,7 +144,7 @@ public sealed class BeaconServer : IDisposable
                 HandleRequestSession(from);
                 break;
 
-            case BeaconPacketType.Register:
+            case BeaconPacketType.JoinSession:
                 HandleRegister(data, from);
                 break;
 
@@ -131,14 +160,14 @@ public sealed class BeaconServer : IDisposable
 
     /// <summary>
     /// Creates a new session for the requesting host and sends back a <see cref="BeaconPacketType.SessionCreated"/> response,
-    /// or <see cref="BeaconPacketType.SessionUnavailable"/> if the concurrent session limit has been reached.
+    /// or <see cref="BeaconPacketType.ServerAtCapacity"/> if the concurrent session limit has been reached.
     /// </summary>
     private void HandleRequestSession(IPEndPoint from)
     {
         if (!_registry.TryCreateSession(from, out uint sessionId))
         {
             _log?.Invoke($"[BeaconServer] session limit reached — rejecting request from {from}.");
-            SendSessionUnavailable(from);
+            SendServerAtCapacity(from);
             return;
         }
 
@@ -148,7 +177,8 @@ public sealed class BeaconServer : IDisposable
 
     /// <summary>
     /// Registers a joining peer against an existing session. Sends <see cref="BeaconPacketType.PeerReady"/> to both
-    /// the joiner and the host on success, or <see cref="BeaconPacketType.SessionFull"/> if the session was not found.
+    /// the joiner and the host on success. Registrations targeting an unknown or closed session are silently dropped so
+    /// that rejected joiners cannot clog the server with retry-driven responses.
     /// </summary>
     private void HandleRegister(byte[] data, IPEndPoint from)
     {
@@ -159,8 +189,8 @@ public sealed class BeaconServer : IDisposable
 
         if (notFound)
         {
-            _log?.Invoke($"[BeaconServer] session '{sessionId}' not found — rejecting {from}.");
-            SendSessionFull(from);
+            _log?.Invoke($"[BeaconServer] session '{sessionId}' not found — notifying {from}.");
+            SendSessionNotFound(from);
             return;
         }
 
@@ -240,19 +270,19 @@ public sealed class BeaconServer : IDisposable
     }
 
     /// <summary>
-    /// Sends a <see cref="BeaconPacketType.SessionFull"/> packet indicating the session was not found or is already full.
+    /// Sends a <see cref="BeaconPacketType.ServerAtCapacity"/> packet indicating the server's concurrent session limit has been reached.
     /// </summary>
-    private void SendSessionFull(IPEndPoint to)
+    private void SendServerAtCapacity(IPEndPoint to)
     {
-        _ = _socket.SendAsync(SessionFullPacket, SessionFullPacket.Length, to);
+        _ = _socket.SendAsync(ServerAtCapacityPacket, ServerAtCapacityPacket.Length, to);
     }
 
     /// <summary>
-    /// Sends a <see cref="BeaconPacketType.SessionUnavailable"/> packet indicating the server's concurrent session limit has been reached.
+    /// Sends a <see cref="BeaconPacketType.SessionNotFound"/> packet indicating the requested session ID does not exist or has expired.
     /// </summary>
-    private void SendSessionUnavailable(IPEndPoint to)
+    private void SendSessionNotFound(IPEndPoint to)
     {
-        _ = _socket.SendAsync(SessionUnavailablePacket, SessionUnavailablePacket.Length, to);
+        _ = _socket.SendAsync(SessionNotFoundPacket, SessionNotFoundPacket.Length, to);
     }
 
     /// <summary>

@@ -140,6 +140,17 @@ public sealed class SynapseConfig
     public ISignatureValidator? SignatureValidator;
 
     /// <summary>
+    /// When true, datagrams whose first byte does not match any known <see cref="SynapseSocket.Packets.PacketType"/>
+    /// are passed to the <see cref="SynapseManager.UnknownPacketReceived"/> delegate, which returns a
+    /// <see cref="SynapseSocket.Security.FilterResult"/> to indicate whether the packet is accepted.
+    /// A result other than <see cref="SynapseSocket.Security.FilterResult.Allowed"/> raises a violation.
+    /// When false (default), any such datagram immediately raises a violation without invoking the delegate.
+    /// Enable this only when an external protocol (e.g. a rendezvous/beacon client) intentionally
+    /// piggybacks on the Synapse UDP socket.
+    /// </summary>
+    public bool AllowUnknownPackets = false;
+
+    /// <summary>
     /// When true, the handshake replay cache is bypassed and duplicate handshake packets are accepted.
     /// Intended for testing reconnect scenarios only — never set this in production.
     /// </summary>

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Text;
 using System.Threading;
@@ -12,154 +13,214 @@ using SynapseSocket.Core.Configuration;
 namespace SynapseBeacon.Demo;
 
 /// <summary>
-/// End-to-end demo of the SynapseBeacon rendezvous service.
+/// End-to-end demo of the SynapseBeacon rendezvous service with multiple joiners.
 /// <para>
-/// The demo runs three processes inside a single console:
+/// The demo runs inside a single console:
 /// <list type="number">
 /// <item>A <see cref="BeaconServer"/> on loopback that matches host/joiner pairs.</item>
-/// <item>A host <see cref="SynapseManager"/> that requests a session and awaits a matched peer.</item>
-/// <item>A joiner <see cref="SynapseManager"/> that registers with the session ID and connects to the host.</item>
+/// <item>A host <see cref="SynapseManager"/> whose <see cref="BeaconClient"/> creates a session and accepts multiple joiners.</item>
+/// <item>Two joiner <see cref="SynapseManager"/> instances that join the same session ID via <see cref="BeaconClient"/> and connect to the host.</item>
 /// </list>
-/// On loopback there is no real NAT, so the hole-punch probe step is essentially a no-op — the
-/// demo's purpose is to prove the rendezvous flow end-to-end: session creation, registration,
-/// <c>PeerReady</c> dispatch on both sides, and a subsequent SynapseSocket handshake + reliable
-/// message exchange.
+/// Once the host has accepted <see cref="JoinerCount"/> peers it closes the beacon session, so
+/// any further joiners that attempt to join with that session ID will be silently dropped by the server.
 /// </para>
 /// </summary>
 internal static class Program
 {
+    /// <summary>
+    /// UDP port the beacon rendezvous server listens on for this demo.
+    /// </summary>
     private const int BeaconPort = 47776;
+
+    /// <summary>
+    /// UDP port the host <see cref="SynapseSocket.Core.SynapseManager"/> binds to.
+    /// </summary>
     private const int HostPort = 47001;
-    private const int JoinerPort = 47002;
+
+    /// <summary>
+    /// First UDP port assigned to joiner instances. Each joiner gets <c>JoinerBasePort + index</c>.
+    /// </summary>
+    private const int JoinerBasePort = 47002;
+
+    /// <summary>
+    /// Number of joiner clients to spin up. The host closes its session once all have connected.
+    /// </summary>
+    private const int JoinerCount = 2;
 
     private static async Task Main()
     {
         Console.WriteLine("=== SynapseBeacon Demo ===");
 
-        using CancellationTokenSource serverCts = new();
+        using CancellationTokenSource serverCancellationTokenSource = new();
 
         /* --- Start the beacon server --- */
-        using BeaconServer beaconServer = new(BeaconPort, log: text => Console.WriteLine(text));
+        /* The BeaconServer is a lightweight UDP rendezvous server. Hosts create sessions here
+         * and share the session ID out-of-band with joiners. Each joiner sends the session ID
+         * back to the server, which then responds to both sides with each other's external
+         * endpoint so NAT hole-punching can proceed directly between the two peers. */
+        using BeaconServer beaconServer = new(BeaconPort, BeaconServer.DefaultSessionTimeoutMilliseconds, BeaconServer.UnlimitedConcurrentSessions, text => Console.WriteLine(text));
+
         /* Hand the disposable through a helper method so the Task.Run closure does not capture a
          * `using` local in this scope (which would trip the "captured variable is disposed in
          * outer scope" analyser warning). */
-        Task beaconServerTask = StartBeaconServerAsync(beaconServer, serverCts.Token);
+        Task beaconServerTask = StartBeaconServerAsync(beaconServer, serverCancellationTokenSource.Token);
         Console.WriteLine($"[beacon] listening on loopback:{BeaconPort}");
 
-        IPEndPoint beaconEndPoint = new(IPAddress.Loopback, BeaconPort);
+        IPEndPoint beaconServerEndPoint = new(IPAddress.Loopback, BeaconPort);
 
-        /* --- Build host and joiner SynapseManager instances with FullCone NAT traversal --- */
-        SynapseConfig hostConfig = new()
+        /* --- Build the host SynapseManager --- */
+        /* FullCone NAT mode is required for hole-punching: the socket must accept packets from
+         * any remote endpoint, not only peers it has already sent to. */
+        SynapseConfig hostSynapseConfig = new()
         {
             BindEndPoints = [new(IPAddress.Loopback, HostPort)],
             NatTraversal = { Mode = NatTraversalMode.FullCone },
+            AllowUnknownPackets = true,
         };
 
-        SynapseConfig joinerConfig = new()
+        await using SynapseManager hostSynapseManager = new(hostSynapseConfig);
+
+        int acceptedPeerCount = 0;
+
+        /* RunContinuationsAsynchronously ensures the TrySetResult callback does not execute
+         * synchronously on the thread pool thread that increments the count, avoiding
+         * re-entrancy into the connection event handler. */
+        TaskCompletionSource allJoinersConnectedSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        hostSynapseManager.ConnectionEstablished += connectionEventArgs =>
         {
-            BindEndPoints = [new(IPAddress.Loopback, JoinerPort)],
-            NatTraversal = { Mode = NatTraversalMode.FullCone },
+            int newAcceptedPeerCount = Interlocked.Increment(ref acceptedPeerCount);
+            Console.WriteLine($"[host] peer #{newAcceptedPeerCount} connected: {connectionEventArgs.Connection.RemoteEndPoint}");
+
+            if (newAcceptedPeerCount >= JoinerCount)
+                allJoinersConnectedSource.TrySetResult();
         };
 
-        await using SynapseManager host = new(hostConfig);
-        await using SynapseManager joiner = new(joinerConfig);
-
-        TaskCompletionSource<SynapseConnection> hostAcceptedPeer = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        TaskCompletionSource<string> hostReceivedMessage = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        host.ConnectionEstablished += (connectionEventArgs) =>
+        hostSynapseManager.PacketReceived += packetReceivedEventArgs =>
         {
-            Console.WriteLine($"[host] peer connected: {connectionEventArgs.Connection.RemoteEndPoint}");
-            hostAcceptedPeer.TrySetResult(connectionEventArgs.Connection);
-        };
-        host.PacketReceived += (packetReceivedEventArgs) =>
-        {
-            string text = Encoding.UTF8.GetString(packetReceivedEventArgs.Payload);
-            Console.WriteLine($"[host] received: {text}");
-            hostReceivedMessage.TrySetResult(text);
+            string payloadText = Encoding.UTF8.GetString(packetReceivedEventArgs.Payload);
+            Console.WriteLine($"[host] received from {packetReceivedEventArgs.Connection.RemoteEndPoint}: {payloadText}");
         };
 
-        joiner.ConnectionEstablished += (connectionEventArgs) =>
-        {
-            Console.WriteLine($"[joiner] connected to host: {connectionEventArgs.Connection.RemoteEndPoint}");
-        };
+        await hostSynapseManager.StartAsync(CancellationToken.None).ConfigureAwait(false);
 
-        await host.StartAsync(CancellationToken.None).ConfigureAwait(false);
-        await joiner.StartAsync(CancellationToken.None).ConfigureAwait(false);
-
-        /* --- Create BeaconClients that piggyback on each SynapseManager's socket --- */
-        BeaconClientConfig hostBeaconConfig = new(beaconEndPoint) { HeartbeatIntervalMilliseconds = 5_000 };
-        BeaconClientConfig joinerBeaconConfig = new(beaconEndPoint) { HeartbeatIntervalMilliseconds = 5_000 };
-
-        using BeaconClient hostBeacon = new(host, hostBeaconConfig);
-        using BeaconClient joinerBeacon = new(joiner, joinerBeaconConfig);
+        /* --- Create the host beacon client --- */
+        /* The BeaconClient piggybacks on the host's SynapseManager UDP socket so the same NAT
+         * mapping that was opened toward the beacon server is reused for peer-to-peer traffic
+         * after hole-punching — no extra ports or firewall rules needed. */
+        BeaconClientConfig hostBeaconClientConfig = new(beaconServerEndPoint) { HeartbeatIntervalMilliseconds = 5_000 };
+        using BeaconClient hostBeaconClient = new(hostSynapseManager, hostBeaconClientConfig);
 
         /* --- Host requests a session --- */
-        using BeaconHostSession hostSession = await hostBeacon.HostAsync(CancellationToken.None).ConfigureAwait(false);
-        Console.WriteLine($"[host] session created: '{hostSession.SessionId}'");
+        /* HostAsync sends a RequestSession packet to the beacon server and awaits a SessionCreated
+         * response containing the server-assigned session ID. The host shares that ID out-of-band
+         * (here, inline) with each joiner. The PeerReady event fires whenever the server has
+         * matched an incoming joiner and endpoint exchange is complete. */
+        using BeaconHostSession hostBeaconSession = await hostBeaconClient.HostAsync(CancellationToken.None).ConfigureAwait(false);
+        Console.WriteLine($"[host] session created: '{hostBeaconSession.SessionId}' — accepting up to {JoinerCount} joiners");
 
-        TaskCompletionSource<IPEndPoint> hostGotPeerReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        hostSession.PeerReady += joinerEndPoint =>
-        {
+        hostBeaconSession.PeerReady += joinerEndPoint =>
             Console.WriteLine($"[host] beacon matched joiner at {joinerEndPoint}");
-            hostGotPeerReady.TrySetResult(joinerEndPoint);
-        };
 
-        /* --- Joiner registers with the shared session ID --- */
-        IPEndPoint hostEndPointFromBeacon = await joinerBeacon.JoinAsync(hostSession.SessionId, CancellationToken.None).ConfigureAwait(false);
-        Console.WriteLine($"[joiner] beacon matched host at {hostEndPointFromBeacon}");
-
-        /* Wait for the host side to observe the match too. Only the joiner actually initiates the
-         * outbound ConnectAsync, so the host's matched endpoint is discarded — the interesting
-         * assertion here is simply that the host received a PeerReady at all. */
-        _ = await hostGotPeerReady.Task.ConfigureAwait(false);
-
-        /* --- Joiner initiates a SynapseSocket connection to the host (FullCone will punch) --- */
-        SynapseConnection joinerConnection = await joiner.ConnectAsync(hostEndPointFromBeacon, CancellationToken.None).ConfigureAwait(false);
-        await Task.WhenAny(hostAcceptedPeer.Task, Task.Delay(2_000, CancellationToken.None))
-            .ConfigureAwait(false);
-
-        if (!hostAcceptedPeer.Task.IsCompletedSuccessfully)
-        {
-            Console.WriteLine("[error] host did not accept the joiner within 2 s — aborting demo.");
-            return;
-        }
-
-        /* --- Exchange a reliable message to prove the punched channel works --- */
-        byte[] payload = Encoding.UTF8.GetBytes("hello from joiner via beacon-assisted rendezvous");
-        await joiner.SendAsync(joinerConnection, payload, isReliable: true, CancellationToken.None).ConfigureAwait(false);
-
-        await Task.WhenAny(hostReceivedMessage.Task, Task.Delay(2_000)).ConfigureAwait(false);
-
-        if (hostReceivedMessage.Task.IsCompletedSuccessfully)
-            Console.WriteLine($"[demo] SUCCESS — host received: '{hostReceivedMessage.Task.Result}'");
-        else
-            Console.WriteLine("[demo] FAIL — host did not receive the joiner's message in time.");
-
-        /* --- Teardown --- */
-        await joiner.DisconnectAsync(joinerConnection, CancellationToken.None).ConfigureAwait(false);
-        await hostSession.CloseAsync().ConfigureAwait(false);
-        serverCts.Cancel();
+        /* --- Spin up joiners --- */
+        List<SynapseManager> joinerSynapseManagers = new(JoinerCount);
+        List<BeaconClient> joinerBeaconClients = new(JoinerCount);
+        List<SynapseConnection> joinerSynapseConnections = new(JoinerCount);
 
         try
         {
-            await beaconServerTask.ConfigureAwait(false);
+            for (int i = 0; i < JoinerCount; i++)
+            {
+                int joinerIndex = i + 1;
+                int joinerPort = JoinerBasePort + i;
+
+                SynapseConfig joinerSynapseConfig = new()
+                {
+                    BindEndPoints = [new(IPAddress.Loopback, joinerPort)],
+                    NatTraversal = { Mode = NatTraversalMode.FullCone },
+                    AllowUnknownPackets = true,
+                };
+
+                SynapseManager joinerSynapseManager = new(joinerSynapseConfig);
+                joinerSynapseManagers.Add(joinerSynapseManager);
+
+                joinerSynapseManager.ConnectionEstablished += connectionEventArgs =>
+                    Console.WriteLine($"[joiner {joinerIndex}] connected to host: {connectionEventArgs.Connection.RemoteEndPoint}");
+
+                await joinerSynapseManager.StartAsync(CancellationToken.None).ConfigureAwait(false);
+
+                /* Each joiner also piggybacks its BeaconClient on its own SynapseManager socket
+                 * for the same NAT-mapping reuse benefit described above for the host. */
+                BeaconClientConfig joinerBeaconClientConfig = new(beaconServerEndPoint) { HeartbeatIntervalMilliseconds = 5_000 };
+                BeaconClient joinerBeaconClient = new(joinerSynapseManager, joinerBeaconClientConfig);
+                joinerBeaconClients.Add(joinerBeaconClient);
+
+                /* JoinAsync sends the shared session ID to the beacon server and blocks until the
+                 * server responds with the host's external endpoint, at which point ConnectAsync
+                 * can initiate hole-punching directly to that endpoint. */
+                IPEndPoint hostEndPointFromBeacon = await joinerBeaconClient.JoinAsync(hostBeaconSession.SessionId, CancellationToken.None).ConfigureAwait(false);
+                Console.WriteLine($"[joiner {joinerIndex}] beacon matched host at {hostEndPointFromBeacon}");
+
+                SynapseConnection joinerSynapseConnection = await joinerSynapseManager.ConnectAsync(hostEndPointFromBeacon, CancellationToken.None).ConfigureAwait(false);
+                joinerSynapseConnections.Add(joinerSynapseConnection);
+
+                byte[] greetingPayload = Encoding.UTF8.GetBytes($"hello from joiner {joinerIndex}");
+                await joinerSynapseManager.SendAsync(joinerSynapseConnection, greetingPayload, isReliable: true, CancellationToken.None).ConfigureAwait(false);
+            }
+
+            /* --- Wait for the host to observe all JoinerCount peer connections --- */
+            Task completedTask = await Task.WhenAny(allJoinersConnectedSource.Task, Task.Delay(5_000)).ConfigureAwait(false);
+
+            if (completedTask != allJoinersConnectedSource.Task)
+            {
+                Console.WriteLine($"[error] host only accepted {Volatile.Read(ref acceptedPeerCount)}/{JoinerCount} joiners within 5s — aborting demo.");
+                return;
+            }
+
+            Console.WriteLine($"[host] reached joiner cap ({JoinerCount}) — closing session so no further joiners can match.");
+            await hostBeaconSession.CloseAsync(CancellationToken.None).ConfigureAwait(false);
+            Console.WriteLine($"[host] session '{hostBeaconSession.SessionId}' closed. Later JoinAsync calls with this ID will be silently dropped by the beacon server.");
+
+            /* Give any in-flight greeting messages a moment to land before teardown. */
+            await Task.Delay(250).ConfigureAwait(false);
+
+            Console.WriteLine("[demo] SUCCESS — all joiners connected and exchanged a message before session close.");
         }
-        catch (OperationCanceledException)
+        finally
         {
-            /* expected on shutdown */
+            /* --- Teardown joiners --- */
+            for (int i = 0; i < joinerSynapseConnections.Count; i++)
+                await joinerSynapseManagers[i].DisconnectAsync(joinerSynapseConnections[i], CancellationToken.None).ConfigureAwait(false);
+
+            foreach (BeaconClient joinerBeaconClient in joinerBeaconClients)
+                joinerBeaconClient.Dispose();
+
+            foreach (SynapseManager joinerSynapseManager in joinerSynapseManagers)
+                await joinerSynapseManager.DisposeAsync().ConfigureAwait(false);
+
+            serverCancellationTokenSource.Cancel();
+
+            try
+            {
+                await beaconServerTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                /* expected on shutdown */
+            }
         }
 
         Console.WriteLine("Demo finished.");
     }
 
     /// <summary>
-    /// Runs <paramref name="server"/>'s receive loop on the thread pool. Taking the server as a
-    /// parameter breaks the closure capture of the caller's <c>using</c> local, avoiding the
-    /// "captured variable is disposed in outer scope" warning.
+    /// Runs <paramref name="beaconServer"/>'s receive loop on the thread pool, returning the
+    /// background <see cref="Task"/> so the caller can await it during clean shutdown.
+    /// Taking the server as a parameter breaks the closure capture of the caller's <c>using</c>
+    /// local, avoiding the "captured variable is disposed in outer scope" analyser warning.
     /// </summary>
-    private static Task StartBeaconServerAsync(BeaconServer server, CancellationToken cancellationToken)
+    private static Task StartBeaconServerAsync(BeaconServer beaconServer, CancellationToken cancellationToken)
     {
-        return Task.Run(() => server.RunAsync(cancellationToken), cancellationToken);
+        return Task.Run(() => beaconServer.RunAsync(cancellationToken), cancellationToken);
     }
 }
