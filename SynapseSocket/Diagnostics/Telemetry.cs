@@ -96,7 +96,7 @@ public sealed class Telemetry
     /// <summary>
     /// Records an inbound packet that was dropped by the security filter.
     /// </summary>
-    internal void OnDroppedIn()
+    internal void OnSecurityDroppedReceived()
     {
         if (!IsEnabled) return;
         Interlocked.Increment(ref _packetsDroppedIn);
@@ -105,7 +105,7 @@ public sealed class Telemetry
     /// <summary>
     /// Records an outbound packet that was dropped by the latency simulator.
     /// </summary>
-    internal void OnDroppedOut()
+    internal void OnLatencyDroppedSent()
     {
         if (!IsEnabled) return;
         Interlocked.Increment(ref _packetsDroppedOut);

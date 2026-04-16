@@ -220,7 +220,7 @@ internal sealed partial class IngressEngine
                 }
                 else
                 {
-                    _telemetry.OnDroppedIn();
+                    _telemetry.OnSecurityDroppedReceived();
 
                     if (filterResult is FilterResult.Blacklisted)
                     {
@@ -279,7 +279,7 @@ internal sealed partial class IngressEngine
         {
             if (synapseConnection is null)
             {
-                _telemetry.OnDroppedIn();
+                _telemetry.OnSecurityDroppedReceived();
                 return;
             }
 
@@ -308,7 +308,7 @@ internal sealed partial class IngressEngine
         {
             if (!_config.AllowUnknownPackets)
             {
-                _telemetry.OnDroppedIn();
+                _telemetry.OnSecurityDroppedReceived();
                 ulong unknownSignature = synapseConnection?.Signature ?? _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
                 ViolationOccurred?.Invoke(fromEndPoint, unknownSignature, ViolationReason.UnknownPacket, length, null, ViolationAction.KickAndBlacklist);
                 return;
@@ -318,7 +318,7 @@ internal sealed partial class IngressEngine
 
             if (unknownFilterResult != FilterResult.Allowed)
             {
-                _telemetry.OnDroppedIn();
+                _telemetry.OnSecurityDroppedReceived();
                 ulong unknownSignature = synapseConnection?.Signature ?? _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
                 ViolationOccurred?.Invoke(fromEndPoint, unknownSignature, ViolationReason.UnknownPacket, length, unknownFilterResult.ToString(), ViolationAction.KickAndBlacklist);
             }
@@ -339,7 +339,7 @@ internal sealed partial class IngressEngine
         }
         catch
         {
-            _telemetry.OnDroppedIn();
+            _telemetry.OnSecurityDroppedReceived();
             ulong signature = _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
             ViolationOccurred?.Invoke(fromEndPoint, signature, ViolationReason.Malformed, length, "Header parse failure", ViolationAction.KickAndBlacklist);
             return;
@@ -363,7 +363,7 @@ internal sealed partial class IngressEngine
 
         if (synapseConnection is null)
         {
-            _telemetry.OnDroppedIn();
+            _telemetry.OnSecurityDroppedReceived();
             return;
         }
 
@@ -391,7 +391,7 @@ internal sealed partial class IngressEngine
 
         if (payloadLength < 0)
         {
-            _telemetry.OnDroppedIn();
+            _telemetry.OnSecurityDroppedReceived();
             ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Malformed, length, "Negative payload length", ViolationAction.KickAndBlacklist);
             return;
         }
@@ -400,7 +400,7 @@ internal sealed partial class IngressEngine
         {
             if (segmentCount * _config.MaximumTransmissionUnit > _config.MaximumReassembledPacketSize)
             {
-                _telemetry.OnDroppedIn();
+                _telemetry.OnSecurityDroppedReceived();
                 ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Oversized, length, ViolationSegmentAssemblyOversized, ViolationAction.KickAndBlacklist);
                 return;
             }
@@ -437,7 +437,7 @@ internal sealed partial class IngressEngine
                     }
                     else if (isProtocolViolation)
                     {
-                        _telemetry.OnDroppedIn();
+                        _telemetry.OnSecurityDroppedReceived();
                         ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Malformed, length, ViolationSegmentMismatch, ViolationAction.KickAndBlacklist);
                         ArrayPool<byte>.Shared.Return(payloadBuffer);
                         return;
@@ -463,7 +463,7 @@ internal sealed partial class IngressEngine
                     }
                     else if (isProtocolViolation)
                     {
-                        _telemetry.OnDroppedIn();
+                        _telemetry.OnSecurityDroppedReceived();
                         ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Malformed, length, ViolationSegmentMismatch, ViolationAction.KickAndBlacklist);
                         ArrayPool<byte>.Shared.Return(segmentPayloadBuffer);
                         return;
