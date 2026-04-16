@@ -252,4 +252,4 @@ No external runtime dependencies. CodeBoost is a development-time submodule (ana
 
 ## Status
 
-SynapseSocket is under active development and not yet recommended for production use.
+SynapseSocket is under active development and while considered stable is still undergoing hardening.
