@@ -747,4 +747,5 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             Security.AddToBlacklist(signature);
         }
     }
+
 }

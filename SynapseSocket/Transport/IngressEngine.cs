@@ -26,6 +26,35 @@ namespace SynapseSocket.Transport;
 internal sealed partial class IngressEngine
 {
     /// <summary>
+    /// Raised when a complete payload (unsegmented or fully reassembled) is ready for the application layer.
+    /// </summary>
+    internal event PayloadDeliveredDelegate? PayloadDelivered;
+    /// <summary>
+    /// Raised when a new connection is established via a successful handshake.
+    /// </summary>
+    internal event ConnectionDelegate? ConnectionEstablished;
+    /// <summary>
+    /// Raised when a remote peer sends a disconnect packet.
+    /// </summary>
+    internal event ConnectionDelegate? ConnectionClosed;
+    /// <summary>
+    /// Raised when a connection attempt is rejected before it can be established.
+    /// </summary>
+    internal event ConnectionFailedCallbackDelegate? ConnectionFailed;
+    /// <summary>
+    /// Raised when a protocol violation is detected on the ingress path.
+    /// </summary>
+    internal event ViolationCallbackDelegate? ViolationOccurred;
+    /// <summary>
+    /// Raised when an unexpected exception escapes the receive loop.
+    /// </summary>
+    internal event UnhandledExceptionDelegate? UnhandledException;
+    /// <summary>
+    /// Raised when the ingress path receives a datagram whose leading type byte is not a recognised
+    /// Synapse <see cref="PacketType"/>. Allows external protocols to piggyback on the UDP socket.
+    /// </summary>
+    internal event UnknownPacketReceivedDelegate? UnknownPacketReceived;
+    /// <summary>
     /// True when the ingress receive loop is running.
     /// </summary>
     internal bool IsRunning { get; private set; }
@@ -71,38 +100,13 @@ internal sealed partial class IngressEngine
     /// </summary>
     private long _lastHandshakeEvictionTicks;
     /// <summary>
+    /// True when to copy received payloads for dispatched events.
+    /// </summary>
+    private bool _copyReceivedPayloads;
+    /// <summary>
     /// Server secret used to sign NAT challenge tokens. Generated once at construction and never transmitted.
     /// </summary>
     private readonly byte[] _natChallengeSecret = new byte[32];
-    /// <summary>
-    /// Raised when a complete payload (unsegmented or fully reassembled) is ready for the application layer.
-    /// </summary>
-    internal event PayloadDeliveredDelegate? PayloadDelivered;
-    /// <summary>
-    /// Raised when a new connection is established via a successful handshake.
-    /// </summary>
-    internal event ConnectionDelegate? ConnectionEstablished;
-    /// <summary>
-    /// Raised when a remote peer sends a disconnect packet.
-    /// </summary>
-    internal event ConnectionDelegate? ConnectionClosed;
-    /// <summary>
-    /// Raised when a connection attempt is rejected before it can be established.
-    /// </summary>
-    internal event ConnectionFailedCallbackDelegate? ConnectionFailed;
-    /// <summary>
-    /// Raised when a protocol violation is detected on the ingress path.
-    /// </summary>
-    internal event ViolationCallbackDelegate? ViolationOccurred;
-    /// <summary>
-    /// Raised when an unexpected exception escapes the receive loop.
-    /// </summary>
-    internal event UnhandledExceptionDelegate? UnhandledException;
-    /// <summary>
-    /// Raised when the ingress path receives a datagram whose leading type byte is not a recognised
-    /// Synapse <see cref="PacketType"/>. Allows external protocols to piggyback on the UDP socket.
-    /// </summary>
-    internal event UnknownPacketReceivedDelegate? UnknownPacketReceived;
     /// <summary>
     /// True when Ack batching is enabled and the interval is not unset.
     /// </summary>
@@ -131,6 +135,7 @@ internal sealed partial class IngressEngine
 
         _isNatEnabled = _config.NatTraversal.Mode != NatTraversalMode.Disabled;
         _isAckBatchingEnabled = _config.Reliable.AckBatchingEnabled && _config.Reliable.AckBatchIntervalMilliseconds != SynapseManager.UnsetAckBatchingIntervalTicks;
+        _copyReceivedPayloads = _config.CopyReceivedPayloads;
 
         System.Security.Cryptography.RandomNumberGenerator.Fill(_natChallengeSecret);
     }
@@ -155,26 +160,23 @@ internal sealed partial class IngressEngine
     {
         EndPoint anyEndPoint = _socket.AddressFamily == AddressFamily.InterNetworkV6 ? new(IPAddress.IPv6Any, 0) : new IPEndPoint(IPAddress.Any, 0);
 
+        // Always receive into a max-UDP-sized buffer so that oversized datagrams are not silently truncated by the kernel — we want to see them so the security layer can raise an Oversized violation.
+        const int MaximumUdpDatagramSize = 65535;
+        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
 
         while (!cancellationToken.IsCancellationRequested)
         {
-            // Always receive into a max-UDP-sized buffer so that oversized datagrams are not silently truncated by the kernel — we want to see them so the security layer can raise an Oversized violation.
-            const int MaximumUdpDatagramSize = 65535;
-
-            byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
-            bool isPayloadCopied = true;
-
             try
             {
                 SocketReceiveFromResult socketReceiveResult;
                 try
                 {
-#if NET8_0_OR_GREATER
+                    #if NET8_0_OR_GREATER
                     // Memory<byte> overload returns ValueTask<SocketReceiveFromResult>; no per-call Task allocation on synchronous completions.
                     socketReceiveResult = await _socket.ReceiveFromAsync(rentedBuffer.AsMemory(0, MaximumUdpDatagramSize), SocketFlags.None, anyEndPoint, CancellationToken.None).ConfigureAwait(false);
-#else
+                    #else
                     socketReceiveResult = await _socket.ReceiveFromAsync(new(rentedBuffer, 0, MaximumUdpDatagramSize), SocketFlags.None, anyEndPoint).ConfigureAwait(false);
-#endif
+                    #endif
                 }
                 catch (ObjectDisposedException)
                 {
@@ -211,7 +213,12 @@ internal sealed partial class IngressEngine
                 else
                     filterResult = _security.InspectNew(fromEndPoint, receivedLength, out signature);
 
-                if (filterResult is not FilterResult.Allowed)
+                if (filterResult is FilterResult.Allowed)
+                {
+                     _telemetry.OnReceived(receivedLength);
+                    ProcessPacket(rentedBuffer, receivedLength, fromEndPoint, synapseConnection, nowTicks, cancellationToken);
+                }
+                else
                 {
                     _telemetry.OnDroppedIn();
 
@@ -229,12 +236,9 @@ internal sealed partial class IngressEngine
                         FilterResult.RateLimited => ViolationReason.RateLimitExceeded,
                         _ => ViolationReason.Malformed
                     };
+                    
                     ViolationOccurred?.Invoke(fromEndPoint, signature, violationReason, receivedLength, filterResult.ToString(), ViolationAction.KickAndBlacklist);
-                    continue;
                 }
-
-                _telemetry.OnReceived(receivedLength);
-                ProcessPacket(rentedBuffer, receivedLength, fromEndPoint, synapseConnection, nowTicks, cancellationToken, ref isPayloadCopied);
             }
             catch (OperationCanceledException)
             {
@@ -246,19 +250,16 @@ internal sealed partial class IngressEngine
                 // Unexpected bug in the processing path. Surface it and keep the loop alive so a single bad packet cannot silently kill the receive loop.
                 UnhandledException?.Invoke(unexpectedException);
             }
-            finally
-            {
-                // When CopyReceivedPayloads is false, ownership of rentedBuffer is transferred to the PayloadDelivered subscriber (via OnPayloadDelivered), which returns it to the pool.
-                if (isPayloadCopied)
-                    ArrayPool<byte>.Shared.Return(rentedBuffer, clearArray: false);
-            }
         }
+
+        ArrayPool<byte>.Shared.Return(rentedBuffer, clearArray: false);
+
 
         IsRunning = false;
     }
 
     /// <summary>
-    /// Parses a single received datagram and routes it to the appropriate handler (handshake, data, ack, disconnect, keep-alive, or NAT probe/server).
+    /// Parses a single received datagram and routes it to the appropriate handler (handshake, data, ack, discofnnect, keep-alive, or NAT probe/server).
     /// </summary>
     /// <param name="buffer">The raw receive buffer containing the datagram.</param>
     /// <param name="length">Number of valid bytes in <paramref name="buffer"/>.</param>
@@ -269,7 +270,7 @@ internal sealed partial class IngressEngine
     /// Set to false when ownership of <paramref name="buffer"/> is transferred to a <see cref="PayloadDelivered"/> subscriber so the receive loop does not return it to the pool.
     /// </param>
     /// <param name = "synapseConnection"></param>
-    private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, SynapseConnection? synapseConnection, long nowTicks, CancellationToken cancellationToken, ref bool isPayloadCopied)
+    private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, SynapseConnection? synapseConnection, long nowTicks, CancellationToken cancellationToken)
     {
         // Fast path: unreliable unsegmented payload — the dominant case.
         // PacketType.None = 0, header is exactly one byte. Filter guarantees length > 0.
@@ -285,9 +286,8 @@ internal sealed partial class IngressEngine
             synapseConnection.LastReceivedTicks = nowTicks;
             int fastPayloadLength = length - PacketHeader.TypeSize;
 
-            if (!_config.CopyReceivedPayloads)
+            if (!_copyReceivedPayloads)
             {
-                isPayloadCopied = false;
                 PayloadDelivered?.Invoke(synapseConnection, new(buffer, PacketHeader.TypeSize, fastPayloadLength), false);
             }
             else
@@ -474,7 +474,6 @@ internal sealed partial class IngressEngine
 
                 return;
             }
-
         }
     }
 

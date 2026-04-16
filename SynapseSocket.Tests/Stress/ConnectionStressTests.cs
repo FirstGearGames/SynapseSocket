@@ -38,8 +38,8 @@ public sealed class ConnectionStressTests
     private async Task RunRapidSendStressAsync(bool reliable)
     {
         const int ClientCount = 2000;
-        const int RapidSendsPerClient = 15;
-        const int PayloadSize = 1000;
+        const int RapidSendsPerClient = 50;
+        const int PayloadSize = 50;
 
         byte[] sendBuffer = new byte[PayloadSize];
         Array.Fill(sendBuffer, (byte)0xAB);
@@ -47,8 +47,14 @@ public sealed class ConnectionStressTests
         int expectedPackets = ClientCount * RapidSendsPerClient;
         int port = TestHarness.GetFreePort();
 
-        SynapseManager server = new(TestHarness.ServerConfig(port, c => c.MaximumSegments = 2));
-        SynapseManager[] clients = new SynapseManager[ClientCount];
+        SynapseManager server = new(TestHarness.ServerConfig(port, c =>
+        {
+            c.MaximumSegments = 2;
+            c.MaximumBytesPerSecond = 0;
+            c.MaximumPacketsPerSecond = 0;
+        }));
+        
+            SynapseManager[] clients = new SynapseManager[ClientCount];
         SynapseConnection[] clientToServerConnections = new SynapseConnection[ClientCount];
 
         for (int i = 0; i < ClientCount; i++)

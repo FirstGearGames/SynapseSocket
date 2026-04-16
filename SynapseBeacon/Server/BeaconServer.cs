@@ -36,11 +36,6 @@ public sealed class BeaconServer : IDisposable
     public const int UnlimitedConcurrentSessions = 0;
 
     /// <summary>
-    /// Maximum UDP datagram size the receive loop will allocate for.
-    /// </summary>
-    private const int MaximumUdpDatagramSize = 65535;
-
-    /// <summary>
     /// UDP socket bound to the configured port. Shared for all sends and receives.
     /// </summary>
     private readonly UdpClient _socket;
