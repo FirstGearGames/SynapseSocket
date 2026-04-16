@@ -112,6 +112,7 @@ public static class TestHarness
             {
                 Interlocked.Increment(ref _violations);
                 ViolationReasons.Add(violationEventArgs.Reason);
+                return violationEventArgs.Action;
             };
         }
     }

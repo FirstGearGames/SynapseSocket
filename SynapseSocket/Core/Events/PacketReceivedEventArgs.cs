@@ -1,7 +1,4 @@
 using System;
-using System.Buffers;
-using CodeBoost.CodeAnalysis;
-using CodeBoost.Performance;
 using SynapseSocket.Connections;
 
 namespace SynapseSocket.Core.Events;
