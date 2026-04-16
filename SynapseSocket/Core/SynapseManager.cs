@@ -62,7 +62,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// <summary>
     /// Raised when the ingress path receives a datagram whose leading type byte is not a recognised
     /// Synapse <see cref="SynapseSocket.Packets.PacketType"/> and
-    /// <see cref="SynapseSocket.Core.Configuration.SynapseConfig.AllowUnknownPackets"/> is true.
+    /// <see cref="SynapseSocket.Core.Configuration.SecurityConfig.AllowUnknownPackets"/> is true.
     /// Enables external protocols (e.g. a rendezvous/beacon client) to piggyback on the UDP socket
     /// so the NAT mapping opened by talking to the external service is the same mapping used for P2P traffic.
     /// <para>
@@ -157,8 +157,8 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         if (Config.SegmentAssemblyTimeoutMilliseconds is > 0 and > 300_000)
             throw new ArgumentOutOfRangeException(nameof(config), "SegmentAssemblyTimeoutMilliseconds must not exceed 300000 (5 minutes).");
 
-        ISignatureProvider signatureProvider = Config.SignatureProvider ?? new DefaultSignatureProvider();
-        Security = new(signatureProvider, Config.MaximumPacketsPerSecond, Config.MaximumBytesPerSecond, Config.MaximumPacketSize);
+        ISignatureProvider signatureProvider = Config.Security.SignatureProvider ?? new DefaultSignatureProvider();
+        Security = new(signatureProvider, Config.Security.MaximumPacketsPerSecond, Config.Security.MaximumBytesPerSecond, Config.MaximumPacketSize);
         Connections = new();
         Telemetry = new(Config.EnableTelemetry);
         _latencySimulator = new(Config.LatencySimulator);
@@ -179,8 +179,8 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
          * a timeout is unset. */
         uint segmentAssemblyTimeoutMilliseconds = config.SegmentAssemblyTimeoutMilliseconds;
         _segmentAssemblyTimeoutTicks = _isSegmentingEnabled && segmentAssemblyTimeoutMilliseconds != SynapseConfig.DisabledSegmentAssemblyTimeout ? TimeSpan.FromMilliseconds(segmentAssemblyTimeoutMilliseconds).Ticks : UnsetSegmentAssemblyTimeoutTicks;
-        _maximumPacketsPerSecond = Config.MaximumPacketsPerSecond;
-        _maximumBytesPerSecond = Config.MaximumBytesPerSecond;
+        _maximumPacketsPerSecond = Config.Security.MaximumPacketsPerSecond;
+        _maximumBytesPerSecond = Config.Security.MaximumBytesPerSecond;
     }
 
     /// <summary>

@@ -37,14 +37,14 @@ public sealed partial class SynapseManager
     private readonly long _segmentAssemblyTimeoutTicks;
     /// <summary>
     /// Maximum number of packets a single connection may receive per second before further packets are dropped.
-    /// Derived from <see cref="SynapseSocket.Core.Configuration.SynapseConfig.MaximumPacketsPerSecond"/>.
-    /// Set to <see cref="SynapseSocket.Core.Configuration.SynapseConfig.DisabledMaximumPacketsPerSecond"/> when the limit is disabled.
+    /// Derived from <see cref="SynapseSocket.Core.Configuration.SecurityConfig.MaximumPacketsPerSecond"/>.
+    /// Set to <see cref="SynapseSocket.Core.Configuration.SecurityConfig.DisabledMaximumPacketsPerSecond"/> when the limit is disabled.
     /// </summary>
     private readonly uint _maximumPacketsPerSecond;
     /// <summary>
     /// Maximum number of bytes a single connection may receive per second before further packets are dropped.
-    /// Derived from <see cref="SynapseSocket.Core.Configuration.SynapseConfig.MaximumBytesPerSecond"/>.
-    /// Set to <see cref="SynapseSocket.Core.Configuration.SynapseConfig.DisabledMaximumBytesPerSecond"/> when the limit is disabled.
+    /// Derived from <see cref="SynapseSocket.Core.Configuration.SecurityConfig.MaximumBytesPerSecond"/>.
+    /// Set to <see cref="SynapseSocket.Core.Configuration.SecurityConfig.DisabledMaximumBytesPerSecond"/> when the limit is disabled.
     /// </summary>
     private readonly uint _maximumBytesPerSecond;
     /// <summary>
@@ -262,13 +262,13 @@ public sealed partial class SynapseManager
     /// <summary>
     /// Resets the per-connection inbound packet and byte counters for <paramref name="synapseConnection"/>
     /// if the one-second window has elapsed. No-op when both
-    /// <see cref="SynapseSocket.Core.Configuration.SynapseConfig.MaximumPacketsPerSecond"/> and
-    /// <see cref="SynapseSocket.Core.Configuration.SynapseConfig.MaximumBytesPerSecond"/> are disabled.
+    /// <see cref="SynapseSocket.Core.Configuration.SecurityConfig.MaximumPacketsPerSecond"/> and
+    /// <see cref="SynapseSocket.Core.Configuration.SecurityConfig.MaximumBytesPerSecond"/> are disabled.
     /// </summary>
     private void ResetInboundRateCounters(long nowTicks, SynapseConnection synapseConnection)
     {
-        if (_maximumPacketsPerSecond == SynapseConfig.DisabledMaximumPacketsPerSecond
-            && _maximumBytesPerSecond == SynapseConfig.DisabledMaximumBytesPerSecond)
+        if (_maximumPacketsPerSecond == SecurityConfig.DisabledMaximumPacketsPerSecond
+            && _maximumBytesPerSecond == SecurityConfig.DisabledMaximumBytesPerSecond)
             return;
 
         synapseConnection.ResetInboundRateCounters(nowTicks);

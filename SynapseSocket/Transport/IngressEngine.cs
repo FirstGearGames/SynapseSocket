@@ -306,7 +306,7 @@ internal sealed partial class IngressEngine
 
         if (typeByte > (byte)PacketType.NatChallenge)
         {
-            if (!_config.AllowUnknownPackets)
+            if (!_config.Security.AllowUnknownPackets)
             {
                 _telemetry.OnSecurityDroppedReceived();
                 ulong unknownSignature = synapseConnection?.Signature ?? _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
@@ -396,9 +396,9 @@ internal sealed partial class IngressEngine
             return;
         }
 
-        if (type is PacketType.Segmented or PacketType.ReliableSegmented && _config.MaximumReassembledPacketSize > 0)
+        if (type is PacketType.Segmented or PacketType.ReliableSegmented && _config.Security.MaximumReassembledPacketSize > 0)
         {
-            if (segmentCount * _config.MaximumTransmissionUnit > _config.MaximumReassembledPacketSize)
+            if (segmentCount * _config.MaximumTransmissionUnit > _config.Security.MaximumReassembledPacketSize)
             {
                 _telemetry.OnSecurityDroppedReceived();
                 ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Oversized, length, ViolationSegmentAssemblyOversized, ViolationAction.KickAndBlacklist);
@@ -518,7 +518,9 @@ internal sealed partial class IngressEngine
             if (sequence == synapseConnection.NextExpectedSequence)
             {
                 synapseConnection.NextExpectedSequence++;
-                toDeliver = [payload];
+
+                toDeliver ??= ListPool<ArraySegment<byte>>.Rent();
+                toDeliver.Add(payload);
 
                 while (synapseConnection.ReorderBuffer.TryGetValue(synapseConnection.NextExpectedSequence, out ArraySegment<byte> nextPayload))
                 {
@@ -530,7 +532,7 @@ internal sealed partial class IngressEngine
             else
             {
                 // Out of order - buffer (only if not already received).
-                if (_config.MaximumOutOfOrderReliablePackets > 0 && synapseConnection.ReorderBuffer.Count >= _config.MaximumOutOfOrderReliablePackets)
+                if (_config.Security.MaximumOutOfOrderReliablePackets > 0 && synapseConnection.ReorderBuffer.Count >= _config.Security.MaximumOutOfOrderReliablePackets)
                 {
                     if (payload.Array is not null)
                         ArrayPool<byte>.Shared.Return(payload.Array);
@@ -586,7 +588,7 @@ internal sealed partial class IngressEngine
         long nowTicks = DateTime.UtcNow.Ticks;
         ulong replayKey = MixHandshakeNonce(signature, handshakePayload);
 
-        if (!_config.DisableHandshakeReplayProtection && !_seenHandshakes.TryAdd(replayKey, nowTicks))
+        if (!_config.Security.DisableHandshakeReplayProtection && !_seenHandshakes.TryAdd(replayKey, nowTicks))
         {
             // Exact same bytes received again - replay.
             ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.SignatureRejected, "Handshake replay detected");
@@ -602,7 +604,7 @@ internal sealed partial class IngressEngine
                 RemoveExpiredHandshakeEntries(nowTicks, _config.Connection.TimeoutMilliseconds * TimeSpan.TicksPerMillisecond * 2);
         }
 
-        if (_config.SignatureValidator is not null && !_config.SignatureValidator.Validate(fromEndPoint, signature, handshakePayload))
+        if (_config.Security.SignatureValidator is not null && !_config.Security.SignatureValidator.Validate(fromEndPoint, signature, handshakePayload))
         {
             ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.SignatureRejected, "Validator returned false");
             return;

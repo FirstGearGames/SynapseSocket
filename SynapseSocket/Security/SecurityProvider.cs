@@ -98,10 +98,10 @@ public sealed class SecurityProvider
         // counters that the maintenance loop resets once per second. They catch two
         // distinct abuse shapes: packet floods (many tiny packets) and bandwidth floods
         // (fewer but larger packets that stay under the pps cap).
-        if (_maximumPacketsPerSecond is not SynapseConfig.DisabledMaximumPacketsPerSecond && !synapseConnection.AllowReceivePacket(_maximumPacketsPerSecond))
+        if (_maximumPacketsPerSecond is not SecurityConfig.DisabledMaximumPacketsPerSecond && !synapseConnection.AllowReceivePacket(_maximumPacketsPerSecond))
             return FilterResult.RateLimited;
 
-        if (_maximumBytesPerSecond is not SynapseConfig.DisabledMaximumBytesPerSecond && !synapseConnection.AllowReceiveBytes(packetLength, _maximumBytesPerSecond))
+        if (_maximumBytesPerSecond is not SecurityConfig.DisabledMaximumBytesPerSecond && !synapseConnection.AllowReceiveBytes(packetLength, _maximumBytesPerSecond))
             return FilterResult.RateLimited;
 
         return FilterResult.Allowed;

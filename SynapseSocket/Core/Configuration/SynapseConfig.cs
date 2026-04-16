@@ -1,6 +1,5 @@
 ﻿using System.Collections.Generic;
 using System.Net;
-using SynapseSocket.Security;
 
 namespace SynapseSocket.Core.Configuration;
 
@@ -31,22 +30,6 @@ public sealed class SynapseConfig
     public uint MaximumTransmissionUnit = 1200;
 
     /// <summary>
-    /// Maximum packets per second allowed per signature.
-    /// Set to <see cref="DisabledMaximumPacketsPerSecond"/> (0) to disable packet rate limiting.
-    /// </summary>
-    public uint MaximumPacketsPerSecond = 500;
-
-    /// <summary>
-    /// Maximum received bytes per second allowed per signature.
-    /// Paired with <see cref="MaximumPacketsPerSecond"/>: the packet count alone cannot catch
-    /// a peer sending near the pps cap at maximum packet size, which would sustain
-    /// <c>MaximumPacketsPerSecond * MaximumPacketSize</c> bytes/sec — well above a realistic
-    /// realtime-game upstream. Defaults to 2 MiB/s, which allows comfortable legitimate headroom
-    /// while cutting off bandwidth floods.
-    /// Set to <see cref="DisabledMaximumBytesPerSecond"/> (0) to disable bytes rate limiting.
-    /// </summary>
-    public uint MaximumBytesPerSecond = 2 * 1024 * 1024;
-    /// <summary>
     /// Maximum number of segments a segmented payload may be split into.
     /// Set to <see cref="DisabledMaximumSegments"/> to disable this feature.
     /// </summary>
@@ -66,11 +49,6 @@ public sealed class SynapseConfig
     /// </summary>
     public uint MaximumConcurrentConnections = 0;
 
-    /// <summary>
-    /// Maximum number of out-of-order reliable packets buffered per connection before raising a violation.
-    /// Default is 64. Set to 0 to disable.
-    /// </summary>
-    public uint MaximumOutOfOrderReliablePackets = 64;
 
     /// <summary>
     /// Controls how the engine handles unreliable payloads that exceed the MTU.
@@ -84,13 +62,6 @@ public sealed class SynapseConfig
     /// </summary>
     public uint SegmentAssemblyTimeoutMilliseconds = 5000;
 
-    /// <summary>
-    /// Maximum reassembled payload size in bytes.
-    /// If a segment header declares a segment count such that <c>segmentCount * MaximumTransmissionUnit</c>
-    /// exceeds this value, the sender is immediately blacklisted.
-    /// Set to 0 to disable this check.
-    /// </summary>
-    public uint MaximumReassembledPacketSize = 0;
 
     /// <summary>
     /// Kernel-level UDP socket receive buffer size (SO_RCVBUF) in bytes, applied on bind.
@@ -128,35 +99,6 @@ public sealed class SynapseConfig
     public bool EnableTelemetry = false;
 
     /// <summary>
-    /// Optional custom signature provider.
-    /// Defaults to <see cref="DefaultSignatureProvider"/> when null.
-    /// </summary>
-    public ISignatureProvider? SignatureProvider;
-
-    /// <summary>
-    /// Optional signature validator applied during handshake.
-    /// When null, all valid signatures are accepted.
-    /// </summary>
-    public ISignatureValidator? SignatureValidator;
-
-    /// <summary>
-    /// When true, datagrams whose first byte does not match any known <see cref="SynapseSocket.Packets.PacketType"/>
-    /// are passed to the <see cref="SynapseManager.UnknownPacketReceived"/> delegate, which returns a
-    /// <see cref="SynapseSocket.Security.FilterResult"/> to indicate whether the packet is accepted.
-    /// A result other than <see cref="SynapseSocket.Security.FilterResult.Allowed"/> raises a violation.
-    /// When false (default), any such datagram immediately raises a violation without invoking the delegate.
-    /// Enable this only when an external protocol (e.g. a rendezvous/beacon client) intentionally
-    /// piggybacks on the Synapse UDP socket.
-    /// </summary>
-    public bool AllowUnknownPackets = false;
-
-    /// <summary>
-    /// When true, the handshake replay cache is bypassed and duplicate handshake packets are accepted.
-    /// Intended for testing reconnect scenarios only — never set this in production.
-    /// </summary>
-    public bool DisableHandshakeReplayProtection = false;
-
-    /// <summary>
     /// Connection lifecycle settings: keep-alive interval, timeout, and sweep window.
     /// </summary>
     public ConnectionConfig Connection = new();
@@ -180,19 +122,14 @@ public sealed class SynapseConfig
     public NatTraversalConfig NatTraversal = new();
 
     /// <summary>
+    /// Security settings: rate limiting, replay protection, signature validation, and packet filtering.
+    /// </summary>
+    public SecurityConfig Security = new();
+
+    /// <summary>
     /// Sentinel value: pass as <see cref="MaximumSegments"/> to disable segmentation.
     /// </summary>
     public const uint DisabledMaximumSegments = 0;
-
-    /// <summary>
-    /// Sentinel value: pass as <see cref="MaximumPacketsPerSecond"/> to disable packet rate limiting.
-    /// </summary>
-    public const uint DisabledMaximumPacketsPerSecond = 0;
-
-    /// <summary>
-    /// Sentinel value: pass as <see cref="MaximumBytesPerSecond"/> to disable bytes rate limiting.
-    /// </summary>
-    public const uint DisabledMaximumBytesPerSecond = 0;
 
     /// <summary>
     /// Sentinel value: pass as <see cref="SegmentAssemblyTimeoutMilliseconds"/> to disable assembly timeout.
