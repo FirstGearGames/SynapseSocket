@@ -266,9 +266,6 @@ internal sealed partial class IngressEngine
     /// <param name="fromEndPoint">The source endpoint of the datagram.</param>
     /// <param name = "nowTicks"></param>
     /// <param name="cancellationToken">Token forwarded to async send helpers.</param>
-    /// <param name="isPayloadCopied">
-    /// Set to false when ownership of <paramref name="buffer"/> is transferred to a <see cref="PayloadDelivered"/> subscriber so the receive loop does not return it to the pool.
-    /// </param>
     /// <param name = "synapseConnection"></param>
     private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, SynapseConnection? synapseConnection, long nowTicks, CancellationToken cancellationToken)
     {
