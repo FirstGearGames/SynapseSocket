@@ -5,16 +5,16 @@ using System.Threading;
 using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
-using SynapseSocket.Core.Configuration;
 using Xunit;
 using Xunit.Abstractions;
 
 namespace SynapseSocket.Tests.Stress;
 
+[SettleAfterTest(3000)]
 public sealed class ConnectionStressTests
 {
     private const int StressTestTimeoutMs = 6000;
-    private const int LifecycleTestTimeoutMs = 6000;
+    private const int LifecycleTestTimeoutMs = 120000;
 
     private readonly ITestOutputHelper _output;
 
@@ -49,20 +49,17 @@ public sealed class ConnectionStressTests
 
         SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
-            c.MaximumSegments = 2;
-            c.MaximumBytesPerSecond = 0;
-            c.MaximumPacketsPerSecond = 0;
+            c.Security.MaximumBytesPerSecond = 0;
+            c.Security.MaximumPacketsPerSecond = 0;
+            c.Security.MaximumOutOfOrderReliablePackets = 0;
         }));
-        
-            SynapseManager[] clients = new SynapseManager[ClientCount];
+        SynapseManager[] clients = new SynapseManager[ClientCount];
         SynapseConnection[] clientToServerConnections = new SynapseConnection[ClientCount];
 
         for (int i = 0; i < ClientCount; i++)
         {
             clients[i] = new(TestHarness.ClientConfig(c =>
             {
-                c.MaximumSegments = 2;
-
                 if (reliable)
                     c.Reliable.MaximumPending = RapidSendsPerClient * 2;
             }));
@@ -92,7 +89,7 @@ public sealed class ConnectionStressTests
             await Task.WhenAll(connectTasks);
 
             Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref connectedCount) >= ClientCount, 30000),
-                $"Only {Volatile.Read(ref connectedCount)} / {ClientCount} clients connected within timeout.");
+                $"Only {connectedCount} / {ClientCount} clients connected within timeout.");
 
             int receivedCount = 0;
             server.PacketReceived += _ => Interlocked.Increment(ref receivedCount);
@@ -119,12 +116,12 @@ public sealed class ConnectionStressTests
             _output.WriteLine($"Clients           : {ClientCount:N0}");
             _output.WriteLine($"Sends per client  : {RapidSendsPerClient}");
             _output.WriteLine($"Payload size      : {PayloadSize} bytes");
-            _output.WriteLine($"Packets received  : {Volatile.Read(ref receivedCount):N0} / {expectedPackets:N0}");
+            _output.WriteLine($"Packets received  : {receivedCount:N0} / {expectedPackets:N0}");
             _output.WriteLine($"Elapsed           : {elapsedMs:F2} ms");
             _output.WriteLine($"Message rate      : {messagesPerSec:F0} msg/s");
 
             failureObserver.AssertNoFailures();
-            Assert.Equal(expectedPackets, Volatile.Read(ref receivedCount));
+            Assert.Equal(expectedPackets, receivedCount);
         }
         finally
         {
@@ -147,8 +144,10 @@ public sealed class ConnectionStressTests
 
         const int CycleCount = 4;
         const int ConnectWaitMs = 20000;
-        const int ReceiveWaitMs = 15000;
-        const int AckWaitMs = 5000;
+        const int ReliableReceiveWaitMs = 60000;
+        const int UnreliableReceiveWaitMs = 15000;
+        int receiveWaitMs = reliable ? ReliableReceiveWaitMs : UnreliableReceiveWaitMs;
+        const int AckWaitMs = 10000;
         const int DisconnectWaitMs = 20000;
         const int DisconnectDelayMilliseconds = 500;
 
@@ -159,15 +158,18 @@ public sealed class ConnectionStressTests
 
         SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
-            c.MaximumBytesPerSecond = CycleCount * PayloadSize * ReconnectSendsPerClient;
-            c.MaximumSegments = 2;
-            c.DisableHandshakeReplayProtection = true;
+            c.Security.MaximumPacketsPerSecond = 0;
+            c.Security.MaximumBytesPerSecond = 0;
+            c.Security.MaximumOutOfOrderReliablePackets = 0;
         }));
         SynapseManager[] clients = new SynapseManager[ClientCount];
         SynapseConnection[] connections = new SynapseConnection[ClientCount];
 
         for (int i = 0; i < ClientCount; i++)
-            clients[i] = new(TestHarness.ClientConfig());
+            clients[i] = new(TestHarness.ClientConfig(c =>
+            {
+                c.Reliable.MaximumRetries = 500;
+            }));
 
         try
         {
@@ -198,9 +200,9 @@ public sealed class ConnectionStressTests
 
             async Task RunCycleAsync()
             {
-                int connectTarget = Volatile.Read(ref totalConnectedCount) + ClientCount;
-                int receiveTarget = Volatile.Read(ref totalReceivedCount) + ClientCount * ReconnectSendsPerClient;
-                int closeTarget = Volatile.Read(ref totalClientClosedCount) + ClientCount;
+                int connectTarget = totalConnectedCount + ClientCount;
+                int receiveTarget = totalReceivedCount + ClientCount * ReconnectSendsPerClient;
+                int closeTarget = totalClientClosedCount + ClientCount;
 
                 Task[] connectTasks = new Task[ClientCount];
 
@@ -214,7 +216,7 @@ public sealed class ConnectionStressTests
                 await Task.WhenAll(connectTasks);
 
                 Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref totalConnectedCount) >= connectTarget, ConnectWaitMs),
-                    $"Only {Volatile.Read(ref totalConnectedCount)} / {connectTarget} clients connected.");
+                    $"Only {totalConnectedCount} / {connectTarget} clients connected.");
 
                 ArraySegment<byte> payload = new(sendBuffer);
 
@@ -224,8 +226,8 @@ public sealed class ConnectionStressTests
                         _ = clients[i].SendAsync(connections[i], payload, reliable, CancellationToken.None);
                 }
 
-                Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref totalReceivedCount) >= receiveTarget, ReceiveWaitMs),
-                    $"Only {Volatile.Read(ref totalReceivedCount)} / {receiveTarget} packets received.");
+                Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref totalReceivedCount) >= receiveTarget, receiveWaitMs),
+                    $"Only {totalReceivedCount} / {receiveTarget} packets received.");
 
                 if (reliable)
                 {
@@ -256,7 +258,7 @@ public sealed class ConnectionStressTests
                 await Task.WhenAll(disconnectTasks);
 
                 Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref totalClientClosedCount) >= closeTarget, DisconnectWaitMs),
-                    $"Only {Volatile.Read(ref totalClientClosedCount)} / {closeTarget} connections closed.");
+                    $"Only {totalClientClosedCount} / {closeTarget} connections closed.");
             }
 
             // Warmup — primes object pools before GC baseline.

@@ -30,14 +30,14 @@ public class OutOfOrderTests
         {
             c.MaximumTransmissionUnit = 150;
             c.MaximumPacketSize = 4096 * 2;
-            c.MaximumSegments = 128;
+            c.Segment.MaximumSegments = 128;
         }));
 
         await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
             c.MaximumTransmissionUnit = 150;
             c.MaximumPacketSize = 4096 * 2;
-            c.MaximumSegments = 128;
+            c.Segment.MaximumSegments = 128;
 
             // Every packet gets a random extra delay up to 200 ms — with all
             // segments dispatched concurrently this guarantees mixed arrival order.
@@ -88,14 +88,14 @@ public class OutOfOrderTests
         {
             c.MaximumTransmissionUnit = 150;
             c.MaximumPacketSize = 4096 * 2;
-            c.MaximumSegments = 128;
+            c.Segment.MaximumSegments = 128;
         }));
 
         await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
             c.MaximumTransmissionUnit = 150;
             c.MaximumPacketSize = 4096 * 2;
-            c.MaximumSegments = 128;
+            c.Segment.MaximumSegments = 128;
 
             c.LatencySimulator.IsEnabled = true;
             c.LatencySimulator.BaseLatencyMilliseconds = 0;

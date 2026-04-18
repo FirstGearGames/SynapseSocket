@@ -1,8 +1,10 @@
 using System;
+using System.Buffers;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 using SynapseSocket.Core.Configuration;
+using SynapseSocket.Packets;
 
 namespace SynapseSocket.Diagnostics;
 
@@ -57,6 +59,16 @@ public sealed class LatencySimulator
     /// <returns>A task that completes when the packet has been passed to <paramref name="sender"/> or dropped.</returns>
     public Task ProcessAsync(ArraySegment<byte> segment, IPEndPoint target, Func<ArraySegment<byte>, IPEndPoint, Task> sender, CancellationToken cancellationToken)
     {
+        // Handshake and NAT setup packets bypass the sim — they represent connection
+        // establishment, not in-session traffic, so loss/delay here would prevent
+        // connection from ever succeeding rather than simulating realistic degradation.
+        if (segment.Count > 0 && segment.Array != null)
+        {
+            PacketType type = (PacketType)segment.Array[segment.Offset];
+            if (type is PacketType.Handshake or PacketType.NatProbe or PacketType.NatChallenge)
+                return sender(segment, target);
+        }
+
         Random random = ThreadRandom;
         double lossRoll = random.NextDouble();
         int jitter = _config.JitterMilliseconds > 0 ? random.Next(0, (int)_config.JitterMilliseconds) : 0;
@@ -72,7 +84,11 @@ public sealed class LatencySimulator
     }
 
     /// <summary>
-    /// Waits for the specified delay then invokes the sender function.
+    /// Copies <paramref name="segment"/> into a private rented buffer, waits for the
+    /// specified delay, then invokes the sender function and returns the buffer to the pool.
+    /// The copy is required because the caller's backing array may be returned to
+    /// <see cref="ArrayPool{T}.Shared"/> (e.g. on reliable-packet ACK) before the delay
+    /// elapses, which would corrupt the in-flight data.
     /// </summary>
     /// <param name="segment">The packet data to send, including offset and length.</param>
     /// <param name="target">The remote endpoint the packet is addressed to.</param>
@@ -82,9 +98,20 @@ public sealed class LatencySimulator
     /// <returns>A task that completes when the delayed send has finished.</returns>
     private static async Task DelayedSendAsync(ArraySegment<byte> segment, IPEndPoint target, Func<ArraySegment<byte>, IPEndPoint, Task> sender, int delayMilliseconds, CancellationToken cancellationToken)
     {
-        if (delayMilliseconds > 0)
-            await Task.Delay(delayMilliseconds, cancellationToken).ConfigureAwait(false);
+        byte[] owned = ArrayPool<byte>.Shared.Rent(segment.Count);
+        segment.AsSpan().CopyTo(owned);
+        ArraySegment<byte> ownedSegment = new(owned, 0, segment.Count);
 
-        await sender(segment, target).ConfigureAwait(false);
+        try
+        {
+            if (delayMilliseconds > 0)
+                await Task.Delay(delayMilliseconds, cancellationToken).ConfigureAwait(false);
+
+            await sender(ownedSegment, target).ConfigureAwait(false);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(owned);
+        }
     }
 }

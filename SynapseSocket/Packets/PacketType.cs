@@ -26,7 +26,7 @@ public enum PacketType : byte
     /// <summary>Acknowledgment for a reliable packet. Header includes the acknowledged sequence number.</summary>
     Ack = 2,
 
-    /// <summary>Handshake or handshake acknowledgment. Payload contains a 4-byte nonce.</summary>
+    /// <summary>Handshake or handshake acknowledgment. Payload contains an 8-byte nonce.</summary>
     Handshake = 3,
 
     /// <summary>Keep-alive heartbeat. No payload.</summary>

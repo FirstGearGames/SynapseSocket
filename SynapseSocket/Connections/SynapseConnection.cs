@@ -7,8 +7,6 @@ using System.Threading;
 using CodeBoost.CodeAnalysis;
 using CodeBoost.Extensions;
 using CodeBoost.Performance;
-using SynapseSocket.Core;
-using SynapseSocket.Core.Configuration;
 using SynapseSocket.Packets;
 using SynapseSocket.Security;
 using SynapseSocket.Transport;

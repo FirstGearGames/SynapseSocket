@@ -65,12 +65,6 @@ public sealed class SecurityConfig
     public bool AllowUnknownPackets = false;
 
     /// <summary>
-    /// When true, the handshake replay cache is bypassed and duplicate handshake packets are accepted.
-    /// Intended for testing reconnect scenarios only — never set this in production.
-    /// </summary>
-    public bool DisableHandshakeReplayProtection = false;
-
-    /// <summary>
     /// Sentinel value: pass as <see cref="MaximumPacketsPerSecond"/> to disable packet rate limiting.
     /// </summary>
     public const uint DisabledMaximumPacketsPerSecond = 0;

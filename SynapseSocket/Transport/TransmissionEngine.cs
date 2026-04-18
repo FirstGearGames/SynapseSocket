@@ -245,7 +245,7 @@ public sealed partial class TransmissionEngine
     }
 
     /// <summary>
-    /// Sends a handshake packet with a 4-byte cryptographic nonce in the payload.
+    /// Sends a handshake packet with an 8-byte cryptographic nonce in the payload.
     /// </summary>
     /// <param name="target">The remote endpoint to send the handshake to.</param>
     /// <param name="cancellationToken">Token to cancel the send operation.</param>
@@ -253,7 +253,7 @@ public sealed partial class TransmissionEngine
     public Task SendHandshakeAsync(IPEndPoint target, CancellationToken cancellationToken)
     {
         const PacketType Type = PacketType.Handshake;
-        const int NonceSize = 4;
+        const int NonceSize = 8;
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
         int totalSize = headerSize + NonceSize;
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(totalSize);

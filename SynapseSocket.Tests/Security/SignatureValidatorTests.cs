@@ -48,7 +48,7 @@ public class SignatureValidatorTests
 
         await using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
-            c.SignatureValidator = validator;
+            c.Security.SignatureValidator = validator;
         }));
         await using SynapseManager client = new(TestHarness.ClientConfig());
 
@@ -70,7 +70,7 @@ public class SignatureValidatorTests
 
         await using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
-            c.SignatureValidator = new RejectAllValidator();
+            c.Security.SignatureValidator = new RejectAllValidator();
         }));
         await using SynapseManager client = new(TestHarness.ClientConfig());
 
@@ -94,7 +94,7 @@ public class SignatureValidatorTests
 
         await using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
-            c.SignatureProvider = provider;
+            c.Security.SignatureProvider = provider;
         }));
         await using SynapseManager client = new(TestHarness.ClientConfig());
 

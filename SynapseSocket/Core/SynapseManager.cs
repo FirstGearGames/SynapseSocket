@@ -110,7 +110,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     private readonly LatencySimulator _latencySimulator;
     /// <summary>
-    /// True when <see cref="SynapseConfig.MaximumSegments"/> is not <see cref="SynapseConfig.DisabledMaximumSegments"/>; enables segmented send paths.
+    /// True when reliable or unreliable segmentation is enabled; controls the segmented send path.
     /// </summary>
     private readonly bool _isSegmentingEnabled;
     /// <summary>
@@ -154,15 +154,15 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         if (Config.BindEndPoints.Count == 0)
             throw new ArgumentException("At least one bind endpoint is required.", nameof(config));
 
-        if (Config.SegmentAssemblyTimeoutMilliseconds is > 0 and > 300_000)
-            throw new ArgumentOutOfRangeException(nameof(config), "SegmentAssemblyTimeoutMilliseconds must not exceed 300000 (5 minutes).");
+        if (Config.Segment.AssemblyTimeoutMilliseconds is > 0 and > 300_000)
+            throw new ArgumentOutOfRangeException(nameof(config), "Segment.AssemblyTimeoutMilliseconds must not exceed 300000 (5 minutes).");
 
         ISignatureProvider signatureProvider = Config.Security.SignatureProvider ?? new DefaultSignatureProvider();
         Security = new(signatureProvider, Config.Security.MaximumPacketsPerSecond, Config.Security.MaximumBytesPerSecond, Config.MaximumPacketSize);
         Connections = new();
         Telemetry = new(Config.EnableTelemetry);
         _latencySimulator = new(Config.LatencySimulator);
-        _isSegmentingEnabled = Config.MaximumSegments != SynapseConfig.DisabledMaximumSegments;
+        _isSegmentingEnabled = Config.Segment.ReliableEnabled || Config.Segment.UnreliableMode != UnreliableSegmentMode.Disabled;
         /* Unreliable requires a couple bytes less for segmenting when being sent out
          * of order, which would require different maximum payload sizes between reliable
          * and unreliable segmented. Rather than add additional complexity and branching
@@ -177,8 +177,8 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         _isAckBatchingEnabled = Config.Reliable.AckBatchingEnabled;
         /* Value is unset if segmenting is not enabled or if
          * a timeout is unset. */
-        uint segmentAssemblyTimeoutMilliseconds = config.SegmentAssemblyTimeoutMilliseconds;
-        _segmentAssemblyTimeoutTicks = _isSegmentingEnabled && segmentAssemblyTimeoutMilliseconds != SynapseConfig.DisabledSegmentAssemblyTimeout ? TimeSpan.FromMilliseconds(segmentAssemblyTimeoutMilliseconds).Ticks : UnsetSegmentAssemblyTimeoutTicks;
+        uint segmentAssemblyTimeoutMilliseconds = config.Segment.AssemblyTimeoutMilliseconds;
+        _segmentAssemblyTimeoutTicks = _isSegmentingEnabled && segmentAssemblyTimeoutMilliseconds != SegmentConfig.DisabledAssemblyTimeout ? TimeSpan.FromMilliseconds(segmentAssemblyTimeoutMilliseconds).Ticks : UnsetSegmentAssemblyTimeoutTicks;
         _maximumPacketsPerSecond = Config.Security.MaximumPacketsPerSecond;
         _maximumBytesPerSecond = Config.Security.MaximumBytesPerSecond;
     }
@@ -305,7 +305,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Sends an unreliable payload on the given connection.
-    /// When the payload exceeds the MTU, behaviour is controlled by <see cref="SynapseConfig.UnreliableSegmentMode"/>:
+    /// When the payload exceeds the MTU, behaviour is controlled by <see cref="SegmentConfig.UnreliableMode"/>:
     /// <list type="bullet">
     /// <item><see cref="UnreliableSegmentMode.Disabled"/> — throws.</item>
     /// <item><see cref="UnreliableSegmentMode.SegmentUnreliable"/> — splits into unreliable segments (default).</item>
@@ -332,15 +332,15 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
 
         // Segmenting is disabled entirely.
         if (!_isSegmentingEnabled)
-            throw new InvalidOperationException($"Payload ({payload.Count} bytes) exceeds the MTU-based limit ({_maximumUnsegmentedPayload} bytes). Set MaximumSegments to enable segmentation.");
+            throw new InvalidOperationException($"Payload ({payload.Count} bytes) exceeds the MTU-based limit ({_maximumUnsegmentedPayload} bytes). Enable segmentation via Segment.ReliableEnabled or Segment.UnreliableMode.");
 
         // An additional check on segmentation is required for unreliable sending.
         if (!isReliable)
         {
-            UnreliableSegmentMode unreliableSegmentMode = Config.UnreliableSegmentMode;
+            UnreliableSegmentMode unreliableSegmentMode = Config.Segment.UnreliableMode;
 
             if (unreliableSegmentMode is UnreliableSegmentMode.Disabled)
-                throw new InvalidOperationException($"Unreliable payload ({payload.Count} bytes) exceeds the MTU-based limit ({_maximumUnsegmentedPayload} bytes). Set UnreliableSegmentMode or reduce payload size.");
+                throw new InvalidOperationException($"Unreliable payload ({payload.Count} bytes) exceeds the MTU-based limit ({_maximumUnsegmentedPayload} bytes). Set Segment.UnreliableMode or reduce payload size.");
 
             // Make reliable if the unreliableSegmentMode permits.
             isReliable = unreliableSegmentMode is UnreliableSegmentMode.SegmentReliable;
@@ -592,7 +592,8 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             return synapseConnection.Splitter;
 
         PacketSplitter rented = ResettableObjectPool<PacketSplitter>.Rent();
-        rented.Initialize(Config.MaximumTransmissionUnit, Config.MaximumSegments);
+        uint effectiveMax = Config.Segment.MaximumSegments == 0 ? 255u : Config.Segment.MaximumSegments;
+        rented.Initialize(Config.MaximumTransmissionUnit, effectiveMax);
 
         PacketSplitter? existing = Interlocked.CompareExchange(ref synapseConnection.Splitter, rented, null);
 

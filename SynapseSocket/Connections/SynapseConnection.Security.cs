@@ -1,6 +1,5 @@
 using System;
 using CodeBoost.CodeAnalysis;
-using SynapseSocket.Core.Configuration;
 
 namespace SynapseSocket.Connections;
 

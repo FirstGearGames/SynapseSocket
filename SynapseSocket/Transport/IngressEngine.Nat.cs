@@ -3,8 +3,6 @@ using System.Net;
 using System.Security.Cryptography;
 using System.Threading;
 using SynapseSocket.Connections;
-using SynapseSocket.Packets;
-using SynapseSocket.Core.Configuration;
 
 namespace SynapseSocket.Transport;
 

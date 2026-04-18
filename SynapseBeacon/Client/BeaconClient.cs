@@ -71,12 +71,12 @@ public sealed class BeaconClient : IDisposable
     /// Creates a new client bound to <paramref name="synapseManager"/>'s UDP socket.
     /// </summary>
     /// <param name="synapseManager">
-    /// A running <see cref="SynapseManager"/> whose <see cref="SynapseSocket.Core.Configuration.SynapseConfig.AllowUnknownPackets"/>
+    /// A running <see cref="SynapseManager"/> whose <see cref="SynapseSocket.Core.Configuration.SecurityConfig.AllowUnknownPackets"/>
     /// is set to true. All beacon traffic is sent and received via this engine's socket.
     /// </param>
     /// <param name="config">Client configuration, including the rendezvous server endpoint.</param>
     /// <exception cref="InvalidOperationException">
-    /// Thrown when <see cref="SynapseSocket.Core.Configuration.SynapseConfig.AllowUnknownPackets"/> is false on <paramref name="synapseManager"/>.
+    /// Thrown when <see cref="SynapseSocket.Core.Configuration.SecurityConfig.AllowUnknownPackets"/> is false on <paramref name="synapseManager"/>.
     /// </exception>
     public BeaconClient(SynapseManager synapseManager, BeaconClientConfig config)
     {
@@ -84,8 +84,8 @@ public sealed class BeaconClient : IDisposable
         _config = config ?? throw new ArgumentNullException(nameof(config));
         _serverEndPoint = config.ServerEndPoint;
 
-        if (!synapseManager.Config.AllowUnknownPackets)
-            throw new InvalidOperationException($"{nameof(BeaconClient)} requires {nameof(SynapseSocket.Core.Configuration.SynapseConfig.AllowUnknownPackets)} = true on the {nameof(SynapseManager)}.");
+        if (!synapseManager.Config.Security.AllowUnknownPackets)
+            throw new InvalidOperationException($"{nameof(BeaconClient)} requires {nameof(SynapseSocket.Core.Configuration.SecurityConfig.AllowUnknownPackets)} = true on the {nameof(SynapseManager)}.");
 
         _synapse.UnknownPacketReceived += OnUnknownPacketReceived;
     }

@@ -1,7 +1,4 @@
-using System;
 using System.Net;
-using CodeBoost.CodeAnalysis;
-using CodeBoost.Performance;
 
 namespace SynapseSocket.Core.Events;
 

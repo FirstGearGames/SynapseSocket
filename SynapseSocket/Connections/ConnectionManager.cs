@@ -63,11 +63,11 @@ public sealed class ConnectionManager
             _connections.Add(synapseConnection);
         }
 
-        if (!_connectionsBySignature.TryAdd(signature, synapseConnection))
+        if (!_connectionsBySignature.TryAdd(signature, synapseConnection!))
         {
             // Two distinct endpoints produced the same 64-bit signature.
             // Overwrite so reverse lookup stays current, but surface the collision.
-            _connectionsBySignature[signature] = synapseConnection;
+            _connectionsBySignature[signature] = synapseConnection!;
             SignatureCollisionDetected?.Invoke(signature);
         }
 

@@ -30,37 +30,16 @@ public sealed class SynapseConfig
     public uint MaximumTransmissionUnit = 1200;
 
     /// <summary>
-    /// Maximum number of segments a segmented payload may be split into.
-    /// Set to <see cref="DisabledMaximumSegments"/> to disable this feature.
-    /// </summary>
-    public uint MaximumSegments = DisabledMaximumSegments;
-
-    /// <summary>
-    /// Maximum number of concurrent incomplete segment assemblies per connection.
-    /// Once reached, further segmented packets from that connection are treated as a protocol violation.
-    /// Default is 16.
-    /// </summary>
-    public uint MaximumConcurrentSegmentAssembliesPerConnection = 16;
-
-    /// <summary>
     /// Maximum number of simultaneous connections the engine will accept.
     /// Handshakes from new peers are rejected with <see cref="Core.Events.ConnectionRejectedReason.ServerFull"/>
     /// when the limit is reached. Set to 0 to disable.
     /// </summary>
     public uint MaximumConcurrentConnections = 0;
 
-
     /// <summary>
-    /// Controls how the engine handles unreliable payloads that exceed the MTU.
-    /// Defaults to <see cref="UnreliableSegmentMode.SegmentUnreliable"/>: oversized sends are split into unreliable segments.
+    /// Payload segmentation settings: enable/disable per channel, segment limits, and assembly timeouts.
     /// </summary>
-    public UnreliableSegmentMode UnreliableSegmentMode = UnreliableSegmentMode.SegmentUnreliable;
-
-    /// <summary>
-    /// How long (in milliseconds) an incomplete segment assembly is kept before being evicted.
-    /// Set to 0 to disable eviction.
-    /// </summary>
-    public uint SegmentAssemblyTimeoutMilliseconds = 5000;
+    public SegmentConfig Segment = new();
 
 
     /// <summary>
@@ -125,16 +104,6 @@ public sealed class SynapseConfig
     /// Security settings: rate limiting, replay protection, signature validation, and packet filtering.
     /// </summary>
     public SecurityConfig Security = new();
-
-    /// <summary>
-    /// Sentinel value: pass as <see cref="MaximumSegments"/> to disable segmentation.
-    /// </summary>
-    public const uint DisabledMaximumSegments = 0;
-
-    /// <summary>
-    /// Sentinel value: pass as <see cref="SegmentAssemblyTimeoutMilliseconds"/> to disable assembly timeout.
-    /// </summary>
-    public const uint DisabledSegmentAssemblyTimeout = 0;
 
     /// <summary>
     /// Sentinel value: pass as <see cref="SocketReceiveBufferBytes"/> or <see cref="SocketSendBufferBytes"/>

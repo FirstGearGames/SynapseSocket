@@ -39,7 +39,7 @@ public enum ViolationReason
 
     /// <summary>
     /// Received a datagram whose first byte is not a recognised <see cref="SynapseSocket.Packets.PacketType"/>
-    /// and <see cref="SynapseSocket.Core.Configuration.SynapseConfig.AllowUnknownPackets"/> is false,
+    /// and <see cref="SynapseSocket.Core.Configuration.SecurityConfig.AllowUnknownPackets"/> is false,
     /// or the <see cref="SynapseManager.UnknownPacketReceived"/> delegate explicitly rejected the packet.
     /// </summary>
     UnknownPacket

@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
 using Xunit;
+using SynapseSocket.Core.Configuration;
 using SynapseSocket.Core.Events;
 
 namespace SynapseSocket.Tests.Transport;
@@ -21,13 +22,13 @@ public class SegmentationTests
         {
             c.MaximumTransmissionUnit = 200;  // very small MTU to force many segments
             c.MaximumPacketSize = 400;
-            c.MaximumSegments = 128;
+            c.Segment.MaximumSegments = 128;
         }));
         await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
             c.MaximumTransmissionUnit = 200;
             c.MaximumPacketSize = 400;
-            c.MaximumSegments = 128;
+            c.Segment.MaximumSegments = 128;
         }));
 
         byte[]? receivedPayload = null;
@@ -57,6 +58,8 @@ public class SegmentationTests
         {
             c.MaximumTransmissionUnit = 256;
             c.MaximumPacketSize = 512;
+            c.Segment.ReliableEnabled = false;
+            c.Segment.UnreliableMode = UnreliableSegmentMode.Disabled;
         }));
 
         await server.StartAsync(CancellationToken.None);
@@ -77,9 +80,9 @@ public class SegmentationTests
         await using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
             c.MaximumTransmissionUnit = 200;
-            c.MaximumSegments = 64;
+            c.Segment.MaximumSegments = 64;
             // 5 * 200 = 1000 > 500, so a packet claiming segmentCount=5 is rejected
-            c.MaximumReassembledPacketSize = 500;
+            c.Security.MaximumReassembledPacketSize = 500;
         }));
 
         TestHarness.EventRecorder eventRecorder = new();

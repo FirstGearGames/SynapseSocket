@@ -1,6 +1,5 @@
 using System;
 using System.Net;
-using CodeBoost.CodeAnalysis;
 
 namespace SynapseSocket.Core.Events;
 

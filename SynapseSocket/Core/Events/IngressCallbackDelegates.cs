@@ -28,7 +28,7 @@ internal delegate void ViolationCallbackDelegate(IPEndPoint endPoint, ulong sign
 /// <summary>
 /// Raised when the ingress path receives a datagram whose first byte is not a recognised
 /// Synapse <see cref="SynapseSocket.Packets.PacketType"/> value, and
-/// <see cref="SynapseSocket.Core.Configuration.SynapseConfig.AllowUnknownPackets"/> is true.
+/// <see cref="SynapseSocket.Core.Configuration.SecurityConfig.AllowUnknownPackets"/> is true.
 /// Allows external protocols (e.g. a rendezvous/beacon client) to piggyback on the Synapse UDP
 /// socket so that the NAT mapping opened by talking to the external service is the same mapping
 /// used for P2P traffic.

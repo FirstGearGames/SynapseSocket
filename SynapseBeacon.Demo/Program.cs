@@ -75,7 +75,7 @@ internal static class Program
         {
             BindEndPoints = [new(IPAddress.Loopback, HostPort)],
             NatTraversal = { Mode = NatTraversalMode.FullCone },
-            AllowUnknownPackets = true,
+            Security = { AllowUnknownPackets = true },
         };
 
         await using SynapseManager hostSynapseManager = new(hostSynapseConfig);
@@ -138,7 +138,7 @@ internal static class Program
                 {
                     BindEndPoints = [new(IPAddress.Loopback, joinerPort)],
                     NatTraversal = { Mode = NatTraversalMode.FullCone },
-                    AllowUnknownPackets = true,
+                    Security = { AllowUnknownPackets = true },
                 };
 
                 SynapseManager joinerSynapseManager = new(joinerSynapseConfig);
@@ -173,7 +173,7 @@ internal static class Program
 
             if (completedTask != allJoinersConnectedSource.Task)
             {
-                Console.WriteLine($"[error] host only accepted {Volatile.Read(ref acceptedPeerCount)}/{JoinerCount} joiners within 5s — aborting demo.");
+                Console.WriteLine($"[error] host only accepted {acceptedPeerCount}/{JoinerCount} joiners within 5s — aborting demo.");
                 return;
             }
 

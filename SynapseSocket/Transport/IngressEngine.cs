@@ -420,7 +420,7 @@ internal sealed partial class IngressEngine
 
             case PacketType.ReliableSegmented:
             {
-                if (_config.MaximumSegments is not SynapseConfig.DisabledMaximumSegments)
+                if (_config.Segment.ReliableEnabled)
                 {
                     byte[] payloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
                     Buffer.BlockCopy(buffer, headerSize, payloadBuffer, 0, payloadLength);
@@ -448,7 +448,7 @@ internal sealed partial class IngressEngine
 
             case PacketType.Segmented:
             {
-                if (_config.MaximumSegments != SynapseConfig.DisabledMaximumSegments)
+                if (_config.Segment.UnreliableMode != UnreliableSegmentMode.Disabled)
                 {
                     byte[] segmentPayloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
                     Buffer.BlockCopy(buffer, headerSize, segmentPayloadBuffer, 0, payloadLength);
@@ -486,7 +486,8 @@ internal sealed partial class IngressEngine
             return synapseConnection.Reassembler;
 
         PacketReassembler rented = ResettableObjectPool<PacketReassembler>.Rent();
-        rented.Initialize(_config.MaximumTransmissionUnit, _config.MaximumSegments);
+        uint effectiveMax = _config.Segment.MaximumSegments == 0 ? 255u : _config.Segment.MaximumSegments;
+        rented.Initialize(_config.MaximumTransmissionUnit, effectiveMax, _config.Segment.MaximumConcurrentAssembliesPerConnection);
 
         PacketReassembler? existing = Interlocked.CompareExchange(ref synapseConnection.Reassembler, rented, null);
 
@@ -528,6 +529,15 @@ internal sealed partial class IngressEngine
             }
             else
             {
+                // Half-space comparison: if (sequence - NextExpectedSequence) wraps past the midpoint,
+                // the sequence is "behind" — a retransmit of an already-delivered packet. Discard it.
+                if (unchecked((ushort)(sequence - synapseConnection.NextExpectedSequence)) >= 32768)
+                {
+                    if (payload.Array is not null)
+                        ArrayPool<byte>.Shared.Return(payload.Array);
+                    return;
+                }
+
                 // Out of order - buffer (only if not already received).
                 if (_config.Security.MaximumOutOfOrderReliablePackets > 0 && synapseConnection.ReorderBuffer.Count >= _config.Security.MaximumOutOfOrderReliablePackets)
                 {
@@ -538,7 +548,8 @@ internal sealed partial class IngressEngine
                     return;
                 }
 
-                synapseConnection.ReorderBuffer.TryAdd(sequence, payload);
+                if (!synapseConnection.ReorderBuffer.TryAdd(sequence, payload) && payload.Array is not null)
+                    ArrayPool<byte>.Shared.Return(payload.Array);
             }
         }
 
@@ -547,6 +558,8 @@ internal sealed partial class IngressEngine
         {
             foreach (ArraySegment<byte> deliverPayload in toDeliver)
                 PayloadDelivered?.Invoke(synapseConnection, deliverPayload, isReliable);
+
+            ListPool<ArraySegment<byte>>.Return(toDeliver);
         }
     }
 
@@ -585,7 +598,7 @@ internal sealed partial class IngressEngine
         long nowTicks = DateTime.UtcNow.Ticks;
         ulong replayKey = MixHandshakeNonce(signature, handshakePayload);
 
-        if (!_config.Security.DisableHandshakeReplayProtection && !_seenHandshakes.TryAdd(replayKey, nowTicks))
+        if (!_seenHandshakes.TryAdd(replayKey, nowTicks))
         {
             // Exact same bytes received again - replay.
             ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.SignatureRejected, "Handshake replay detected");

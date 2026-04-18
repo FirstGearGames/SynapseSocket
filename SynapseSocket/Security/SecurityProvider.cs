@@ -111,7 +111,6 @@ public sealed class SecurityProvider
     /// Lowest-level filter for packets from an unknown or not-yet-established sender.
     /// Computes the signature (so violation reports carry the correct peer identity even for rejected packets), checks the blacklist, then delegates to <see cref="InspectEstablished"/> for size and rate-limit enforcement.
     /// </summary>
-    /// <param name="nowTicks">Current timestamp in <see cref="System.DateTime.Ticks"/>.</param>
     /// <param name="endPoint">The remote endpoint the packet arrived from.</param>
     /// <param name="packetLength">Length of the received packet in bytes.</param>
     /// <param name="signature">The computed peer signature, or <see cref="UnsetSignature"/> on failure.</param>

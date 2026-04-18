@@ -308,13 +308,29 @@ public sealed partial class SynapseManager
 
             Telemetry.OnReliableResend();
 
-            for (int i = 0; i < pendingReliable.Segments.Count; i++)
-                _ = _transmissionEngine.SendRawAsync(pendingReliable.Segments[i], synapseConnection.RemoteEndPoint, cancellationToken);
+            // Capture Segments to a local: the ingress ACK path can concurrently call
+            // ReleasePendingReliable → OnReturn → Segments = null or ListPool.Return(Segments) (Clear)
+            // while we hold a reference to the same list. Both races are handled:
+            //   null check  → Segments was nulled before we read it (post-return).
+            //   try/catch   → Segments was cleared (Count→0) between our Count read and index access.
+            List<ArraySegment<byte>>? segments = pendingReliable.Segments;
+            if (segments is null)
+                continue;
+
+            try
+            {
+                for (int i = 0; i < segments.Count; i++)
+                    _ = _transmissionEngine.SendRawAsync(segments[i], synapseConnection.RemoteEndPoint, cancellationToken);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                // Packet was concurrently ACKed; segments cleared mid-iteration. Skip — it is already delivered.
+            }
         }
     }
 
     /// <summary>
-    /// Evicts incomplete segment assemblies (reliable or unreliable) that have exceeded <see cref="SynapseSocket.Core.Configuration.SynapseConfig.SegmentAssemblyTimeoutMilliseconds"/> on each connection that has an active segmenter.
+    /// Evicts incomplete segment assemblies (reliable or unreliable) that have exceeded <see cref="SynapseSocket.Core.Configuration.SegmentConfig.AssemblyTimeoutMilliseconds"/> on each connection that has an active segmenter.
     /// </summary>
     private void TimeoutAssembledSegments(long nowTicks, SynapseConnection synapseConnection)
     {

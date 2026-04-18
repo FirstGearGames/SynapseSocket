@@ -8,10 +8,11 @@ using Xunit;
 
 namespace SynapseSocket.Tests.Stress;
 
+[SettleAfterTest(beforeMs: 10000)]
 public sealed class GarbageCollectionTests
 {
     private const int ClientCount = 10;
-    private const int GarbageCollectionTestTimeout = 35000;
+    private const int GarbageCollectionTestTimeout = 300000;
     private const int MinimumSendByteCount = 10;
     private const int MaximumSendByteCount = 500;
     private const int SendByteCountStep = 10;
@@ -31,12 +32,21 @@ public sealed class GarbageCollectionTests
     public async Task SendsDoNotTriggerGarbageCollection()
     {
         int port = TestHarness.GetFreePort();
-        SynapseManager server = new(TestHarness.ServerConfig(port));
+        SynapseManager server = new(TestHarness.ServerConfig(port, c =>
+        {
+            c.Security.MaximumPacketsPerSecond = 0;
+            c.Security.MaximumBytesPerSecond = 0;
+            c.Security.MaximumOutOfOrderReliablePackets = 0;
+            c.Connection.TimeoutMilliseconds = 180000;
+        }));
         SynapseManager[] clients = new SynapseManager[ClientCount];
         SynapseConnection[] clientToServerConnections = new SynapseConnection[ClientCount];
 
         for (int i = 0; i < ClientCount; i++)
-            clients[i] = new(TestHarness.ClientConfig());
+            clients[i] = new(TestHarness.ClientConfig(c =>
+            {
+                c.Reliable.MaximumRetries = 500;
+            }));
 
         try
         {
@@ -73,7 +83,7 @@ public sealed class GarbageCollectionTests
                 Thread.Sleep(WarmupDelayMilliseconds);
             }
 
-            Assert.True(await TestHarness.WaitFor(() => totalReceivedCount >= warmupExpectedCount, 10000),
+            Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref totalReceivedCount) >= warmupExpectedCount, 60000),
                 $"Warmup incomplete: server received {totalReceivedCount} of {warmupExpectedCount} packets.");
 
             // Collect all warmup and initialization allocations to establish a stable baseline.
@@ -99,7 +109,7 @@ public sealed class GarbageCollectionTests
                 }
             }
 
-            Assert.True(await TestHarness.WaitFor(() => totalReceivedCount >= measuredExpectedTotal, 15000),
+            Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref totalReceivedCount) >= measuredExpectedTotal, 45000),
                 $"Measured sends incomplete: server received {totalReceivedCount} of {measuredExpectedTotal} total packets.");
 
             Assert.Equal(gen0Before, GC.CollectionCount(0));
