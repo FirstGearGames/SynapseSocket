@@ -9,7 +9,7 @@ public sealed class LatencySimulatorConfig
     /// Enables the simulator.
     /// When false all other settings are ignored and packets are sent immediately.
     /// </summary>
-    public bool IsEnabled;
+    public bool Enabled;
 
     /// <summary>
     /// Base latency added to every outbound packet, in milliseconds.

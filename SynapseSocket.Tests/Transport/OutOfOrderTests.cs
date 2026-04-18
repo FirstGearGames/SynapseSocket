@@ -41,7 +41,7 @@ public class OutOfOrderTests
 
             // Every packet gets a random extra delay up to 200 ms — with all
             // segments dispatched concurrently this guarantees mixed arrival order.
-            c.LatencySimulator.IsEnabled = true;
+            c.LatencySimulator.Enabled = true;
             c.LatencySimulator.BaseLatencyMilliseconds = 0;
             c.LatencySimulator.ReorderChance = 1.0;
             c.LatencySimulator.OutOfOrderExtraDelayMilliseconds = 200;
@@ -97,7 +97,7 @@ public class OutOfOrderTests
             c.MaximumPacketSize = 4096 * 2;
             c.Segment.MaximumSegments = 128;
 
-            c.LatencySimulator.IsEnabled = true;
+            c.LatencySimulator.Enabled = true;
             c.LatencySimulator.BaseLatencyMilliseconds = 0;
             c.LatencySimulator.ReorderChance = 1.0;
             c.LatencySimulator.OutOfOrderExtraDelayMilliseconds = 200;
@@ -144,7 +144,7 @@ public class OutOfOrderTests
 
         await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
-            c.LatencySimulator.IsEnabled = true;
+            c.LatencySimulator.Enabled = true;
             c.LatencySimulator.BaseLatencyMilliseconds = 0;
             c.LatencySimulator.ReorderChance = 1.0;
             // Wide window: individual packets pick a random delay in [0, 250) ms,

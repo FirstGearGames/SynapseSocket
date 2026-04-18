@@ -44,7 +44,7 @@ public class TelemetryAndLatencyTests
         await using SynapseManager server = new(TestHarness.ServerConfig(port));
         await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
-            c.LatencySimulator.IsEnabled = true;
+            c.LatencySimulator.Enabled = true;
             c.LatencySimulator.PacketLossChance = 1.0;
         }));
 
@@ -72,7 +72,7 @@ public class TelemetryAndLatencyTests
         await using SynapseManager server = new(TestHarness.ServerConfig(port));
         await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
-            c.LatencySimulator.IsEnabled = true;
+            c.LatencySimulator.Enabled = true;
             c.LatencySimulator.BaseLatencyMilliseconds = 200;
         }));
 
@@ -112,7 +112,7 @@ public class TelemetryAndLatencyTests
         await using SynapseManager server = new(TestHarness.ServerConfig(port));
         await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
-            c.LatencySimulator.IsEnabled = true;
+            c.LatencySimulator.Enabled = true;
             c.LatencySimulator.BaseLatencyMilliseconds = BaseLatencyMs;
         }));
 
@@ -146,7 +146,7 @@ public class TelemetryAndLatencyTests
         await using SynapseManager server = new(TestHarness.ServerConfig(port));
         await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
-            c.LatencySimulator.IsEnabled = true;
+            c.LatencySimulator.Enabled = true;
             c.LatencySimulator.BaseLatencyMilliseconds = BaseLatencyMs;
             c.Connection.KeepAliveIntervalMilliseconds = 1000;
             c.Connection.TimeoutMilliseconds = 5000;
@@ -178,7 +178,7 @@ public class TelemetryAndLatencyTests
         await using SynapseManager server = new(TestHarness.ServerConfig(port));
         await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
-            c.LatencySimulator.IsEnabled = true;
+            c.LatencySimulator.Enabled = true;
             c.LatencySimulator.BaseLatencyMilliseconds = BaseLatencyMs;
             c.LatencySimulator.JitterMilliseconds = JitterMs;
         }));
@@ -213,7 +213,7 @@ public class TelemetryAndLatencyTests
         await using SynapseManager server = new(TestHarness.ServerConfig(port));
         await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
-            c.LatencySimulator.IsEnabled = true;
+            c.LatencySimulator.Enabled = true;
             c.LatencySimulator.BaseLatencyMilliseconds = 20;
             c.LatencySimulator.ReorderChance = 0.5;
             c.LatencySimulator.OutOfOrderExtraDelayMilliseconds = 200;
@@ -245,7 +245,7 @@ public class TelemetryAndLatencyTests
         int port = TestHarness.GetFreePort();
         await using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
-            c.LatencySimulator.IsEnabled = true;
+            c.LatencySimulator.Enabled = true;
             c.LatencySimulator.BaseLatencyMilliseconds = 300;
         }));
         await using SynapseManager client = new(TestHarness.ClientConfig());
@@ -273,7 +273,7 @@ public class TelemetryAndLatencyTests
         await using SynapseManager server = new(TestHarness.ServerConfig(port));
         await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
-            c.LatencySimulator.IsEnabled = false;
+            c.LatencySimulator.Enabled = false;
             c.LatencySimulator.BaseLatencyMilliseconds = 500;
             c.LatencySimulator.PacketLossChance = 1.0;
         }));
@@ -304,7 +304,7 @@ public class TelemetryAndLatencyTests
         await using SynapseManager server = new(TestHarness.ServerConfig(port));
         await using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
-            c.LatencySimulator.IsEnabled = true;
+            c.LatencySimulator.Enabled = true;
             c.LatencySimulator.PacketLossChance = LossChance;
         }));
 
@@ -337,7 +337,7 @@ public class TelemetryAndLatencyTests
         int port = TestHarness.GetFreePort();
         await using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
-            c.LatencySimulator.IsEnabled = true;
+            c.LatencySimulator.Enabled = true;
             c.LatencySimulator.PacketLossChance = LossChance;
         }));
         await using SynapseManager client = new(TestHarness.ClientConfig());

@@ -163,7 +163,7 @@ internal sealed partial class IngressEngine
         _copyReceivedPayloads = _config.CopyReceivedPayloads;
         _isNatEnabled = _config.NatTraversal.Mode != NatTraversalMode.Disabled;
         _isAckBatchingEnabled = _config.Reliable.AckBatchingEnabled && _config.Reliable.AckBatchIntervalMilliseconds != SynapseManager.UnsetAckBatchingIntervalTicks;
-        _isSecurityEnabled = config.Security.IsEnabled;
+        _isSecurityEnabled = config.Security.Enabled;
         _effectiveMaximumTransmissionUnit = config.MaximumTransmissionUnit;
         _effectiveMaximumOutOfOrderReliablePackets = config.Security.MaximumOutOfOrderReliablePackets == 0
             ? SynapseConfig.EffectiveUnlimitedValueUInt32

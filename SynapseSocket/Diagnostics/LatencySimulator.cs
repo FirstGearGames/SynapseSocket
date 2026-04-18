@@ -17,7 +17,7 @@ public sealed class LatencySimulator
     /// <summary>
     /// True if the simulator is enabled.
     /// </summary>
-    public bool IsEnabled => _config.IsEnabled;
+    public bool IsEnabled => _config.Enabled;
 
     /// <summary>
     /// Configuration driving all simulator behavior.

@@ -59,7 +59,7 @@ public sealed class SecurityConfig
     /// skipped. Pre-connection checks (blacklist, handshake replay, signature validation) remain
     /// active regardless. Defaults to true.
     /// </summary>
-    public bool IsEnabled = true;
+    public bool Enabled = true;
 
     /// <summary>
     /// When true, datagrams whose first byte does not match any known <see cref="SynapseSocket.Packets.PacketType"/>
