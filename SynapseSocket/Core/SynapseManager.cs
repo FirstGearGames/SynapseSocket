@@ -158,7 +158,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             throw new ArgumentOutOfRangeException(nameof(config), "Segment.AssemblyTimeoutMilliseconds must not exceed 300000 (5 minutes).");
 
         ISignatureProvider signatureProvider = Config.Security.SignatureProvider ?? new DefaultSignatureProvider();
-        Security = new(signatureProvider, Config.Security.MaximumPacketsPerSecond, Config.Security.MaximumBytesPerSecond, Config.MaximumPacketSize);
+        Security = new(signatureProvider, Config.Security.MaximumPacketsPerSecond, Config.Security.MaximumBytesPerSecond, Config.MaximumPacketSize, Config.Security.IsEnabled);
         Connections = new();
         Telemetry = new(Config.EnableTelemetry);
         _latencySimulator = new(Config.LatencySimulator);

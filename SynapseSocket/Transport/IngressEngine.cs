@@ -102,7 +102,7 @@ internal sealed partial class IngressEngine
     /// <summary>
     /// True when to copy received payloads for dispatched events.
     /// </summary>
-    private bool _copyReceivedPayloads;
+    private readonly bool _copyReceivedPayloads;
     /// <summary>
     /// Server secret used to sign NAT challenge tokens. Generated once at construction and never transmitted.
     /// </summary>
@@ -110,7 +110,34 @@ internal sealed partial class IngressEngine
     /// <summary>
     /// True when Ack batching is enabled and the interval is not unset.
     /// </summary>
-    private bool _isAckBatchingEnabled;
+    private readonly bool _isAckBatchingEnabled;
+    /// <summary>
+    /// True if SecurityConfig is enabled.
+    /// </summary>
+    private readonly bool _isSecurityEnabled;
+    /// <summary>
+    /// Effective reorder buffer cap: <see cref="SecurityConfig.MaximumOutOfOrderReliablePackets"/> converted from
+    /// 0 (disabled) to <see cref="SynapseConfig.EffectiveUnlimitedValueUInt32"/> so the hot-path check is a single
+    /// comparison with no zero guard.
+    /// </summary>
+    private readonly uint _effectiveMaximumOutOfOrderReliablePackets;
+    /// <summary>
+    /// Cached copy of <see cref="SynapseConfig.MaximumTransmissionUnit"/> to avoid repeated config dereferences on the receive path.
+    /// </summary>
+    private readonly uint _effectiveMaximumTransmissionUnit;
+    /// <summary>
+    /// Effective reassembled packet size cap: <see cref="SecurityConfig.MaximumReassembledPacketSize"/> converted from
+    /// 0 (disabled) to <see cref="SynapseConfig.EffectiveUnlimitedValueUInt32"/> so the hot-path check is a single
+    /// comparison with no zero guard.
+    /// </summary>
+    private readonly uint _effectiveMaximumReassembledPacketSize;
+    /// <summary>
+    /// Effective connection cap: <see cref="SynapseConfig.MaximumConcurrentConnections"/> converted from
+    /// 0 (disabled) to <see cref="SynapseConfig.EffectiveUnlimitedValueUInt32"/> so the handshake check is a single
+    /// comparison with no zero guard.
+    /// </summary>
+    private readonly uint _effectiveMaximumConcurrentConnections;
+
     private const string ViolationSegmentAssemblyOversized = "Declared segment assembly size exceeds MaximumReassembledPacketSize.";
     private const string ViolationSegmentMismatch = "Segment resent with mismatched segment count or reliability flag.";
     private const string ViolationReorderBufferExceeded = "Reorder buffer capacity exceeded.";
@@ -133,9 +160,20 @@ internal sealed partial class IngressEngine
         _sender = sender;
         _telemetry = telemetry;
 
+        _copyReceivedPayloads = _config.CopyReceivedPayloads;
         _isNatEnabled = _config.NatTraversal.Mode != NatTraversalMode.Disabled;
         _isAckBatchingEnabled = _config.Reliable.AckBatchingEnabled && _config.Reliable.AckBatchIntervalMilliseconds != SynapseManager.UnsetAckBatchingIntervalTicks;
-        _copyReceivedPayloads = _config.CopyReceivedPayloads;
+        _isSecurityEnabled = config.Security.IsEnabled;
+        _effectiveMaximumTransmissionUnit = config.MaximumTransmissionUnit;
+        _effectiveMaximumOutOfOrderReliablePackets = config.Security.MaximumOutOfOrderReliablePackets == 0
+            ? SynapseConfig.EffectiveUnlimitedValueUInt32
+            : config.Security.MaximumOutOfOrderReliablePackets;
+        _effectiveMaximumReassembledPacketSize = config.Security.MaximumReassembledPacketSize == 0
+            ? SynapseConfig.EffectiveUnlimitedValueUInt32
+            : config.Security.MaximumReassembledPacketSize;
+        _effectiveMaximumConcurrentConnections = config.MaximumConcurrentConnections == 0
+            ? SynapseConfig.EffectiveUnlimitedValueUInt32
+            : config.MaximumConcurrentConnections;
 
         System.Security.Cryptography.RandomNumberGenerator.Fill(_natChallengeSecret);
     }
@@ -303,6 +341,8 @@ internal sealed partial class IngressEngine
 
         if (typeByte > (byte)PacketType.NatChallenge)
         {
+            /* AllowUnknownPackets value is not cached
+             * because this condition is rare. */
             if (!_config.Security.AllowUnknownPackets)
             {
                 _telemetry.OnSecurityDroppedReceived();
@@ -393,9 +433,9 @@ internal sealed partial class IngressEngine
             return;
         }
 
-        if (type is PacketType.Segmented or PacketType.ReliableSegmented && _config.Security.MaximumReassembledPacketSize > 0)
+        if (type is PacketType.Segmented or PacketType.ReliableSegmented)
         {
-            if (segmentCount * _config.MaximumTransmissionUnit > _config.Security.MaximumReassembledPacketSize)
+            if (_isSecurityEnabled && segmentCount * _effectiveMaximumTransmissionUnit > _effectiveMaximumReassembledPacketSize)
             {
                 _telemetry.OnSecurityDroppedReceived();
                 ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Oversized, length, ViolationSegmentAssemblyOversized, ViolationAction.KickAndBlacklist);
@@ -487,7 +527,7 @@ internal sealed partial class IngressEngine
 
         PacketReassembler rented = ResettableObjectPool<PacketReassembler>.Rent();
         uint effectiveMax = _config.Segment.MaximumSegments == 0 ? 255u : _config.Segment.MaximumSegments;
-        rented.Initialize(_config.MaximumTransmissionUnit, effectiveMax, _config.Segment.MaximumConcurrentAssembliesPerConnection);
+        rented.Initialize(_effectiveMaximumTransmissionUnit, effectiveMax, _config.Segment.MaximumConcurrentAssembliesPerConnection);
 
         PacketReassembler? existing = Interlocked.CompareExchange(ref synapseConnection.Reassembler, rented, null);
 
@@ -539,7 +579,7 @@ internal sealed partial class IngressEngine
                 }
 
                 // Out of order - buffer (only if not already received).
-                if (_config.Security.MaximumOutOfOrderReliablePackets > 0 && synapseConnection.ReorderBuffer.Count >= _config.Security.MaximumOutOfOrderReliablePackets)
+                if (_isSecurityEnabled && synapseConnection.ReorderBuffer.Count >= _effectiveMaximumOutOfOrderReliablePackets)
                 {
                     if (payload.Array is not null)
                         ArrayPool<byte>.Shared.Return(payload.Array);
@@ -585,7 +625,7 @@ internal sealed partial class IngressEngine
         }
 
         // Connection cap: reject new peers when the engine is full.
-        if (_config.MaximumConcurrentConnections > 0 && _connections.Count >= _config.MaximumConcurrentConnections && !_connections.ConnectionsByEndPoint.TryGetValue(fromEndPoint, out _))
+        if (_connections.Count >= _effectiveMaximumConcurrentConnections && !_connections.ConnectionsByEndPoint.TryGetValue(fromEndPoint, out _))
         {
             ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.ServerFull, "Connection limit reached");
             return;

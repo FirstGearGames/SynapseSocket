@@ -20,14 +20,14 @@ public sealed class SegmentConfig
 
     /// <summary>
     /// Maximum number of segments a single message may be split into on the receive side.
-    /// Set to 0 for no limit (allows up to the protocol maximum of 255 segments).
+    /// Set to <see cref="DisabledMaximumSegments"/> (0) to disable the check (allows up to the protocol maximum of 255 segments).
     /// Payloads that declare more segments than this limit are treated as a protocol violation.
     /// </summary>
     public uint MaximumSegments = 0;
 
     /// <summary>
     /// Maximum number of simultaneous in-progress segment assemblies per connection.
-    /// Excess assemblies are treated as a protocol violation. Set to 0 to disable the limit.
+    /// Excess assemblies are treated as a protocol violation. Set to <see cref="DisabledMaximumConcurrentAssembliesPerConnection"/> (0) to disable the limit.
     /// Default is 16.
     /// </summary>
     public uint MaximumConcurrentAssembliesPerConnection = 16;
@@ -42,4 +42,14 @@ public sealed class SegmentConfig
     /// Sentinel value: pass as <see cref="AssemblyTimeoutMilliseconds"/> to disable assembly timeout eviction.
     /// </summary>
     public const uint DisabledAssemblyTimeout = 0;
+
+    /// <summary>
+    /// Sentinel value: pass as <see cref="MaximumSegments"/> to disable the segment count check, allowing up to the protocol maximum of 255 segments.
+    /// </summary>
+    public const uint DisabledMaximumSegments = 0;
+
+    /// <summary>
+    /// Sentinel value: pass as <see cref="MaximumConcurrentAssembliesPerConnection"/> to disable the concurrent assembly limit.
+    /// </summary>
+    public const uint DisabledMaximumConcurrentAssembliesPerConnection = 0;
 }

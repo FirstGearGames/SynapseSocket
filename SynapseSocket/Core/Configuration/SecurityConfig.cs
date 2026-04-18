@@ -29,7 +29,7 @@ public sealed class SecurityConfig
 
     /// <summary>
     /// Maximum number of out-of-order reliable packets buffered per connection before raising a violation.
-    /// Default is 64. Set to 0 to disable.
+    /// Default is 64. Set to <see cref="DisabledMaximumOutOfOrderReliablePackets"/> (0) to disable.
     /// </summary>
     public uint MaximumOutOfOrderReliablePackets = 64;
 
@@ -37,7 +37,7 @@ public sealed class SecurityConfig
     /// Maximum reassembled payload size in bytes.
     /// If a segment header declares a segment count such that <c>segmentCount * MaximumTransmissionUnit</c>
     /// exceeds this value, the sender is immediately blacklisted.
-    /// Set to 0 to disable this check.
+    /// Set to <see cref="DisabledMaximumReassembledPacketSize"/> (0) to disable this check.
     /// </summary>
     public uint MaximumReassembledPacketSize = 0;
 
@@ -52,6 +52,14 @@ public sealed class SecurityConfig
     /// When null, all valid signatures are accepted.
     /// </summary>
     public ISignatureValidator? SignatureValidator;
+
+    /// <summary>
+    /// When false, all established-connection security enforcement is disabled: rate limiting,
+    /// oversized packet checks, reorder buffer overflow, and segment assembly size checks are
+    /// skipped. Pre-connection checks (blacklist, handshake replay, signature validation) remain
+    /// active regardless. Defaults to true.
+    /// </summary>
+    public bool IsEnabled = true;
 
     /// <summary>
     /// When true, datagrams whose first byte does not match any known <see cref="SynapseSocket.Packets.PacketType"/>
@@ -73,4 +81,14 @@ public sealed class SecurityConfig
     /// Sentinel value: pass as <see cref="MaximumBytesPerSecond"/> to disable bytes rate limiting.
     /// </summary>
     public const uint DisabledMaximumBytesPerSecond = 0;
+
+    /// <summary>
+    /// Sentinel value: pass as <see cref="MaximumOutOfOrderReliablePackets"/> to disable the reorder buffer cap.
+    /// </summary>
+    public const uint DisabledMaximumOutOfOrderReliablePackets = 0;
+
+    /// <summary>
+    /// Sentinel value: pass as <see cref="MaximumReassembledPacketSize"/> to disable the reassembled packet size check.
+    /// </summary>
+    public const uint DisabledMaximumReassembledPacketSize = 0;
 }

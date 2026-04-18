@@ -32,7 +32,7 @@ public sealed class SynapseConfig
     /// <summary>
     /// Maximum number of simultaneous connections the engine will accept.
     /// Handshakes from new peers are rejected with <see cref="Core.Events.ConnectionRejectedReason.ServerFull"/>
-    /// when the limit is reached. Set to 0 to disable.
+    /// when the limit is reached. Set to <see cref="DisabledMaximumConcurrentConnections"/> (0) to disable.
     /// </summary>
     public uint MaximumConcurrentConnections = 0;
 
@@ -106,8 +106,23 @@ public sealed class SynapseConfig
     public SecurityConfig Security = new();
 
     /// <summary>
+    /// Sentinel value: pass as <see cref="MaximumConcurrentConnections"/> to remove the connection cap.
+    /// </summary>
+    public const uint DisabledMaximumConcurrentConnections = 0;
+
+    /// <summary>
     /// Sentinel value: pass as <see cref="SocketReceiveBufferBytes"/> or <see cref="SocketSendBufferBytes"/>
     /// to leave the OS default untouched.
     /// </summary>
     public const int DisabledSocketBufferOverride = 0;
+    /// <summary>
+    /// Sentinel used internally when a <c>uint</c> limit of 0 (disabled) is converted to an effective no-limit value.
+    /// Stored in place of 0 so hot-path checks can use a single comparison without a separate zero guard.
+    /// </summary>
+    internal const uint EffectiveUnlimitedValueUInt32 = uint.MaxValue;
+    /// <summary>
+    /// Sentinel used internally when an <c>int</c> limit of 0 (disabled) is converted to an effective no-limit value.
+    /// Stored in place of 0 so hot-path checks can use a single comparison without a separate zero guard.
+    /// </summary>
+    internal const uint EffectiveUnlimitedValueInt32 = int.MaxValue;
 }

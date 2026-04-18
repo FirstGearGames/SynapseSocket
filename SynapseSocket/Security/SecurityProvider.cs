@@ -21,17 +21,23 @@ public sealed class SecurityProvider
     /// </summary>
     private readonly ConcurrentDictionary<ulong, byte> _blacklist = [];
     /// <summary>
-    /// Maximum number of packets a single peer may send per second. Zero disables packet rate limiting.
+    /// Effective per-peer packet rate cap: <see cref="SecurityConfig.MaximumPacketsPerSecond"/> converted from
+    /// 0 (disabled) to <see cref="uint.MaxValue"/> so the hot-path check is a single comparison with no zero guard.
     /// </summary>
-    private readonly uint _maximumPacketsPerSecond;
+    private readonly uint _effectiveMaximumPacketsPerSecond;
     /// <summary>
-    /// Maximum number of bytes a single peer may send per second. Zero disables bytes rate limiting.
+    /// Effective per-peer byte rate cap: <see cref="SecurityConfig.MaximumBytesPerSecond"/> converted from
+    /// 0 (disabled) to <see cref="uint.MaxValue"/> so the hot-path check is a single comparison with no zero guard.
     /// </summary>
-    private readonly uint _maximumBytesPerSecond;
+    private readonly uint _effectiveMaximumBytesPerSecond;
     /// <summary>
     /// Maximum permitted size of a single incoming packet in bytes. Packets exceeding this are rejected.
     /// </summary>
     private readonly uint _maximumPacketSize;
+    /// <summary>
+    /// When false, all established-connection enforcement is bypassed in <see cref="InspectEstablished"/>.
+    /// </summary>
+    private readonly bool _isEnabled;
     /// <summary>
     /// The sentinel value returned when a signature cannot be computed.
     /// The engine never blacklists this value.
@@ -45,12 +51,14 @@ public sealed class SecurityProvider
     /// <param name="maximumPacketsPerSecond">Per-peer packet rate limit. Zero disables packet rate limiting.</param>
     /// <param name="maximumBytesPerSecond">Per-peer byte rate limit. Zero disables byte rate limiting.</param>
     /// <param name="maximumPacketSize">Maximum permitted packet size in bytes.</param>
-    public SecurityProvider(ISignatureProvider signatureProvider, uint maximumPacketsPerSecond, uint maximumBytesPerSecond, uint maximumPacketSize)
+    /// <param name="isEnabled">When false, <see cref="InspectEstablished"/> skips all enforcement and returns <see cref="FilterResult.Allowed"/>.</param>
+    public SecurityProvider(ISignatureProvider signatureProvider, uint maximumPacketsPerSecond, uint maximumBytesPerSecond, uint maximumPacketSize, bool isEnabled)
     {
         SignatureProvider = signatureProvider ?? throw new ArgumentNullException(nameof(signatureProvider));
-        _maximumPacketsPerSecond = maximumPacketsPerSecond;
-        _maximumBytesPerSecond = maximumBytesPerSecond;
+        _effectiveMaximumPacketsPerSecond = maximumPacketsPerSecond == 0 ? uint.MaxValue : maximumPacketsPerSecond;
+        _effectiveMaximumBytesPerSecond = maximumBytesPerSecond == 0 ? uint.MaxValue : maximumBytesPerSecond;
         _maximumPacketSize = maximumPacketSize;
+        _isEnabled = isEnabled;
     }
 
     /// <summary>
@@ -91,6 +99,9 @@ public sealed class SecurityProvider
 
     internal FilterResult InspectEstablished(SynapseConnection synapseConnection, int packetLength)
     {
+        if (!_isEnabled)
+            return FilterResult.Allowed;
+
         if (packetLength <= 0 || packetLength > _maximumPacketSize)
             return FilterResult.Oversized;
 
@@ -98,10 +109,10 @@ public sealed class SecurityProvider
         // counters that the maintenance loop resets once per second. They catch two
         // distinct abuse shapes: packet floods (many tiny packets) and bandwidth floods
         // (fewer but larger packets that stay under the pps cap).
-        if (_maximumPacketsPerSecond is not SecurityConfig.DisabledMaximumPacketsPerSecond && !synapseConnection.AllowReceivePacket(_maximumPacketsPerSecond))
+        if (!synapseConnection.AllowReceivePacket(_effectiveMaximumPacketsPerSecond))
             return FilterResult.RateLimited;
 
-        if (_maximumBytesPerSecond is not SecurityConfig.DisabledMaximumBytesPerSecond && !synapseConnection.AllowReceiveBytes(packetLength, _maximumBytesPerSecond))
+        if (!synapseConnection.AllowReceiveBytes(packetLength, _effectiveMaximumBytesPerSecond))
             return FilterResult.RateLimited;
 
         return FilterResult.Allowed;

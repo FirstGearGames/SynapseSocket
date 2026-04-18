@@ -15,8 +15,8 @@ namespace SynapseSocket.Packets;
 public sealed class PacketReassembler : PacketSegmenter
 {
     /// <summary>
-    /// Maximum number of concurrent assemblies permitted.
-    /// <see cref="UnsetMaximumConcurrentAssemblies"/> disables the limit.
+    /// Effective concurrent assembly cap: caller's 0 (disabled) is converted to <see cref="uint.MaxValue"/>
+    /// on <see cref="Initialize"/> so the check is a single comparison with no zero guard.
     /// </summary>
     private uint _maximumConcurrentAssemblies;
     /// <summary>
@@ -28,7 +28,8 @@ public sealed class PacketReassembler : PacketSegmenter
     /// </summary>
     private readonly object _lock = new();
     /// <summary>
-    /// Sentinel value for <see cref="_maximumConcurrentAssemblies"/> that disables the concurrent assembly limit.
+    /// Pass as <c>maximumConcurrentAssemblies</c> to <see cref="Initialize"/> to disable the concurrent assembly limit.
+    /// Stored internally as <see cref="uint.MaxValue"/> after conversion.
     /// </summary>
     public const uint UnsetMaximumConcurrentAssemblies = 0;
 
@@ -41,7 +42,7 @@ public sealed class PacketReassembler : PacketSegmenter
     public void Initialize(uint maximumTransmissionUnit, uint maximumSegments, uint maximumConcurrentAssemblies)
     {
         base.Initialize(maximumTransmissionUnit, maximumSegments);
-        _maximumConcurrentAssemblies = maximumConcurrentAssemblies;
+        _maximumConcurrentAssemblies = maximumConcurrentAssemblies == 0 ? uint.MaxValue : maximumConcurrentAssemblies;
     }
 
     /// <summary>
@@ -72,7 +73,7 @@ public sealed class PacketReassembler : PacketSegmenter
         {
             if (!_currentSegments.TryGetValue(segmentId, out SegmentAssembly? segmentAssembly))
             {
-                if (_maximumConcurrentAssemblies > 0 && _currentSegments.Count >= _maximumConcurrentAssemblies)
+                if (_currentSegments.Count >= _maximumConcurrentAssemblies)
                 {
                     isProtocolViolation = true;
                     return false;
