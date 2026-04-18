@@ -8,22 +8,22 @@ namespace SynapseSocket.Core.Events;
 /// <summary>
 /// Fired by the ingress path when a payload has been delivered to a connection.
 /// </summary>
-internal delegate void PayloadDeliveredDelegate(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable);
+internal delegate void PayloadDeliveredHandler(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable);
 
 /// <summary>
 /// Fired by the ingress path when a connection is established or closed.
 /// </summary>
-internal delegate void ConnectionDelegate(SynapseConnection synapseConnection);
+internal delegate void ConnectionHandler(SynapseConnection synapseConnection);
 
 /// <summary>
 /// Fired by the ingress path when a connection attempt is rejected before it could be established.
 /// </summary>
-internal delegate void ConnectionFailedCallbackDelegate(IPEndPoint? endPoint, ConnectionRejectedReason connectionRejectedReason, string? message);
+internal delegate void ConnectionFailedCallbackHandler(IPEndPoint? endPoint, ConnectionRejectedReason connectionRejectedReason, string? message);
 
 /// <summary>
 /// Fired by the ingress path when a violation is detected.
 /// </summary>
-internal delegate void ViolationCallbackDelegate(IPEndPoint endPoint, ulong signature, ViolationReason violationReason, int packetSize, string? details, ViolationAction initialViolationAction);
+internal delegate void ViolationCallbackHandler(IPEndPoint endPoint, ulong signature, ViolationReason violationReason, int packetSize, string? details, ViolationAction initialViolationAction);
 
 /// <summary>
 /// Raised when the ingress path receives a datagram whose first byte is not a recognised
@@ -49,4 +49,4 @@ internal delegate void ViolationCallbackDelegate(IPEndPoint endPoint, ulong sign
 /// <see cref="FilterResult.Allowed"/> to accept the packet; any other value to reject it and
 /// raise a violation.
 /// </returns>
-public delegate FilterResult UnknownPacketReceivedDelegate(IPEndPoint fromEndPoint, ArraySegment<byte> packet);
+public delegate FilterResult UnknownPacketReceivedHandler(IPEndPoint fromEndPoint, ArraySegment<byte> packet);

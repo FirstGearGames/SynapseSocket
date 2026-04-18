@@ -4,4 +4,4 @@ namespace SynapseSocket.Core.Events;
 /// Delegate for <see cref="SynapseManager.ConnectionEstablished"/>.
 /// </summary>
 /// <param name="connectionEventArgs">Details about the established connection.</param>
-public delegate void ConnectionEstablishedDelegate(ConnectionEventArgs connectionEventArgs);
+public delegate void ConnectionEstablishedHandler(ConnectionEventArgs connectionEventArgs);

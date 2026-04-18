@@ -25,23 +25,23 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// <summary>
     /// Raised when a payload is received from any connection.
     /// </summary>
-    public event PacketReceivedDelegate? PacketReceived;
+    public event PacketReceivedHandler? PacketReceived;
     /// <summary>
     /// Raised after a packet has been transmitted on the wire.
     /// </summary>
-    public event PacketSentDelegate? PacketSent;
+    public event PacketSentHandler? PacketSent;
     /// <summary>
     /// Raised when a new connection is established.
     /// </summary>
-    public event ConnectionEstablishedDelegate? ConnectionEstablished;
+    public event ConnectionEstablishedHandler? ConnectionEstablished;
     /// <summary>
     /// Raised when a connection terminates (timeout, peer-disconnect, etc.).
     /// </summary>
-    public event ConnectionClosedDelegate? ConnectionClosed;
+    public event ConnectionClosedHandler? ConnectionClosed;
     /// <summary>
     /// Raised on any binding, signature, or validation failure.
     /// </summary>
-    public event ConnectionFailedDelegate? ConnectionFailed;
+    public event ConnectionFailedHandler? ConnectionFailed;
     /// <summary>
     /// Raised when the engine detects a violation (oversized packet, rate limit breach, malformed data, or rejected signature).
     /// Handlers may override <see cref="ViolationEventArgs.Action"/> to customize how the engine responds.
@@ -51,14 +51,14 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// Setting the action to <see cref="ViolationAction.Ignore"/> suppresses every protective measure the engine would otherwise take. See <see cref="ViolationEventArgs.Action"/> for details.
     /// </para>
     /// </summary>
-    public event ViolationDelegate? ViolationDetected;
+    public event ViolationHandler? ViolationDetected;
     /// <summary>
     /// Raised when an unexpected exception escapes a background loop (ingress or maintenance).
     /// Subscribe to route engine errors into your logging system (e.g., Unity's Debug.LogException).
     /// The loop that raised the exception continues running after the handler returns.
     /// If no handler is subscribed the exception is silently discarded.
     /// </summary>
-    public event UnhandledExceptionDelegate? UnhandledException;
+    public event UnhandledExceptionHandler? UnhandledException;
     /// <summary>
     /// Raised when the ingress path receives a datagram whose leading type byte is not a recognised
     /// Synapse <see cref="SynapseSocket.Packets.PacketType"/> and
@@ -76,7 +76,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// of the callback. Copy anything the handler needs to retain.
     /// </para>
     /// </summary>
-    public event UnknownPacketReceivedDelegate? UnknownPacketReceived;
+    public event UnknownPacketReceivedHandler? UnknownPacketReceived;
     /// <summary>
     /// The configuration the engine was constructed with.
     /// </summary>

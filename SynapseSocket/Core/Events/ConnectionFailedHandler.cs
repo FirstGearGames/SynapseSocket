@@ -4,4 +4,4 @@ namespace SynapseSocket.Core.Events;
 /// Delegate for <see cref="SynapseManager.ConnectionFailed"/>.
 /// </summary>
 /// <param name="connectionFailedEventArgs">Details about the rejected connection attempt.</param>
-public delegate void ConnectionFailedDelegate(ConnectionFailedEventArgs connectionFailedEventArgs);
+public delegate void ConnectionFailedHandler(ConnectionFailedEventArgs connectionFailedEventArgs);

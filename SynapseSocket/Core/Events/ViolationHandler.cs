@@ -17,4 +17,4 @@ namespace SynapseSocket.Core.Events;
 /// The <see cref="ViolationAction"/> the engine should take. Return the value from
 /// <see cref="ViolationEventArgs.Action"/> to accept the engine default.
 /// </returns>
-public delegate ViolationAction ViolationDelegate(ViolationEventArgs violationEventArgs);
+public delegate ViolationAction ViolationHandler(ViolationEventArgs violationEventArgs);

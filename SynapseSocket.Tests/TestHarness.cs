@@ -154,8 +154,8 @@ public static class TestHarness
     public sealed class FailureObserver : IDisposable
     {
         private readonly ConcurrentBag<string> _failures = [];
-        private readonly ConcurrentBag<(SynapseManager Manager, UnhandledExceptionDelegate Handler)> _unhandledSubscriptions = [];
-        private readonly ConcurrentBag<(SynapseManager Manager, ConnectionFailedDelegate Handler)> _failedSubscriptions = [];
+        private readonly ConcurrentBag<(SynapseManager Manager, UnhandledExceptionHandler Handler)> _unhandledSubscriptions = [];
+        private readonly ConcurrentBag<(SynapseManager Manager, ConnectionFailedHandler Handler)> _failedSubscriptions = [];
 
         /// <summary>True if any failure has been recorded.</summary>
         public bool HasFailures => !_failures.IsEmpty;
@@ -170,8 +170,8 @@ public static class TestHarness
         /// </summary>
         public void Attach(SynapseManager manager)
         {
-            UnhandledExceptionDelegate unhandled = ex => _failures.Add($"UnhandledException: {ex}");
-            ConnectionFailedDelegate failed = args => _failures.Add($"ConnectionFailed: {args.Reason} (endpoint={args.EndPoint}) {args.Message}");
+            UnhandledExceptionHandler unhandled = ex => _failures.Add($"UnhandledException: {ex}");
+            ConnectionFailedHandler failed = args => _failures.Add($"ConnectionFailed: {args.Reason} (endpoint={args.EndPoint}) {args.Message}");
             manager.UnhandledException += unhandled;
             manager.ConnectionFailed += failed;
             _unhandledSubscriptions.Add((manager, unhandled));
@@ -219,10 +219,10 @@ public static class TestHarness
         /// </summary>
         public void Dispose()
         {
-            foreach ((SynapseManager manager, UnhandledExceptionDelegate handler) in _unhandledSubscriptions)
+            foreach ((SynapseManager manager, UnhandledExceptionHandler handler) in _unhandledSubscriptions)
                 manager.UnhandledException -= handler;
 
-            foreach ((SynapseManager manager, ConnectionFailedDelegate handler) in _failedSubscriptions)
+            foreach ((SynapseManager manager, ConnectionFailedHandler handler) in _failedSubscriptions)
                 manager.ConnectionFailed -= handler;
         }
     }

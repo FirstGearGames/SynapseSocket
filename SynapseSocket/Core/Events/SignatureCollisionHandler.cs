@@ -5,4 +5,4 @@ namespace SynapseSocket.Core.Events;
 /// The newer connection overwrites the reverse-lookup slot.
 /// </summary>
 /// <param name="signature">The 64-bit signature that two distinct endpoints produced.</param>
-public delegate void SignatureCollisionDelegate(ulong signature);
+public delegate void SignatureCollisionHandler(ulong signature);

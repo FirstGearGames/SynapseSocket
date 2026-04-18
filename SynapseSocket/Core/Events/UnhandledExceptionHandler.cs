@@ -6,4 +6,4 @@ namespace SynapseSocket.Core.Events;
 /// Delegate for <see cref="SynapseManager.UnhandledException"/>.
 /// </summary>
 /// <param name="exception">The exception that escaped the background loop.</param>
-public delegate void UnhandledExceptionDelegate(Exception exception);
+public delegate void UnhandledExceptionHandler(Exception exception);

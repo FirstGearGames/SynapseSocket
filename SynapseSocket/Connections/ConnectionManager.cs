@@ -22,7 +22,7 @@ public sealed class ConnectionManager
     /// Raised when two connections produce the same 64-bit signature (birthday-bound collision).
     /// The newer connection wins the reverse-lookup slot. Subscribe for telemetry; no corrective action is taken automatically.
     /// </summary>
-    public event SignatureCollisionDelegate? SignatureCollisionDetected;
+    public event SignatureCollisionHandler? SignatureCollisionDetected;
     /// <summary>
     /// Maps a connection's IPEndPoint to its <see cref="SynapseConnection"/>.
     /// </summary>

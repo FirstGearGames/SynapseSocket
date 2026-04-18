@@ -28,32 +28,32 @@ internal sealed partial class IngressEngine
     /// <summary>
     /// Raised when a complete payload (unsegmented or fully reassembled) is ready for the application layer.
     /// </summary>
-    internal event PayloadDeliveredDelegate? PayloadDelivered;
+    internal event PayloadDeliveredHandler? PayloadDelivered;
     /// <summary>
     /// Raised when a new connection is established via a successful handshake.
     /// </summary>
-    internal event ConnectionDelegate? ConnectionEstablished;
+    internal event ConnectionHandler? ConnectionEstablished;
     /// <summary>
     /// Raised when a remote peer sends a disconnect packet.
     /// </summary>
-    internal event ConnectionDelegate? ConnectionClosed;
+    internal event ConnectionHandler? ConnectionClosed;
     /// <summary>
     /// Raised when a connection attempt is rejected before it can be established.
     /// </summary>
-    internal event ConnectionFailedCallbackDelegate? ConnectionFailed;
+    internal event ConnectionFailedCallbackHandler? ConnectionFailed;
     /// <summary>
     /// Raised when a protocol violation is detected on the ingress path.
     /// </summary>
-    internal event ViolationCallbackDelegate? ViolationOccurred;
+    internal event ViolationCallbackHandler? ViolationOccurred;
     /// <summary>
     /// Raised when an unexpected exception escapes the receive loop.
     /// </summary>
-    internal event UnhandledExceptionDelegate? UnhandledException;
+    internal event UnhandledExceptionHandler? UnhandledException;
     /// <summary>
     /// Raised when the ingress path receives a datagram whose leading type byte is not a recognised
     /// Synapse <see cref="PacketType"/>. Allows external protocols to piggyback on the UDP socket.
     /// </summary>
-    internal event UnknownPacketReceivedDelegate? UnknownPacketReceived;
+    internal event UnknownPacketReceivedHandler? UnknownPacketReceived;
     /// <summary>
     /// True when the ingress receive loop is running.
     /// </summary>

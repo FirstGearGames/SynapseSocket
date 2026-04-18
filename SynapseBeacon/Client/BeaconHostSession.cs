@@ -9,7 +9,7 @@ namespace SynapseBeacon.Client;
 /// Invoked when the rendezvous server matches a joiner with a hosted session.
 /// </summary>
 /// <param name="peerEndPoint">The matched joiner's external endpoint.</param>
-public delegate void PeerReadyDelegate(IPEndPoint peerEndPoint);
+public delegate void PeerReadyHandler(IPEndPoint peerEndPoint);
 
 /// <summary>
 /// Represents an active hosted session on a <see cref="Server.BeaconServer"/>.
@@ -26,7 +26,7 @@ public sealed class BeaconHostSession : IAsyncDisposable, IDisposable
     /// <summary>
     /// Raised whenever the rendezvous server matches a joiner with this host.
     /// </summary>
-    public event PeerReadyDelegate? PeerReady;
+    public event PeerReadyHandler? PeerReady;
 
     /// <summary>
     /// Server-assigned session ID. Share this out-of-band with joiners.
