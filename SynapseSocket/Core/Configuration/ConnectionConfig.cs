@@ -18,5 +18,5 @@ public sealed class ConnectionConfig
     /// <summary>
     /// Width of the maintenance sweep window in milliseconds.
     /// </summary>
-    public uint SweepWindowMilliseconds = 1000;
+    public uint SweepWindowMilliseconds = 50;
 }

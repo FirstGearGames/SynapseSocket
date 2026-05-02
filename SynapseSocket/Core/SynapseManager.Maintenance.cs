@@ -73,18 +73,18 @@ public sealed partial class SynapseManager
     /// </summary>
     private async Task MaintenanceLoopAsync(CancellationToken cancellationToken)
     {
-        const int MaintenanceLoopTargetMilliseconds = 50;
+        int maintenanceLoopTargetMilliseconds = (int)Math.Min(int.MaxValue, Config.Connection.SweepWindowMilliseconds);
 
         while (!cancellationToken.IsCancellationRequested)
         {
             if (!DoConnectionsExist())
             {
-                await Task.Delay(MaintenanceLoopTargetMilliseconds, cancellationToken).ConfigureAwait(false);
+                await Task.Delay(maintenanceLoopTargetMilliseconds, cancellationToken).ConfigureAwait(false);
                 continue;
             }
 
             int connectionsCount = Connections.Connections.Count;
-            int connectionsPerTick = Math.Max(1, connectionsCount / MaintenanceLoopTargetMilliseconds);
+            int connectionsPerTick = Math.Max(1, connectionsCount / maintenanceLoopTargetMilliseconds);
 
             try
             {
@@ -113,7 +113,7 @@ public sealed partial class SynapseManager
 
             try
             {
-                await WaitDelayForLoop(MaintenanceLoopTargetMilliseconds, connectionsCount, cancellationToken);
+                await WaitDelayForLoop(maintenanceLoopTargetMilliseconds, connectionsCount, cancellationToken);
             }
             catch (OperationCanceledException)
             {
@@ -267,13 +267,12 @@ public sealed partial class SynapseManager
     /// </summary>
     private void ResetInboundRateCounters(long nowTicks, SynapseConnection synapseConnection)
     {
-        if (_maximumPacketsPerSecond == SecurityConfig.DisabledMaximumPacketsPerSecond
-            && _maximumBytesPerSecond == SecurityConfig.DisabledMaximumBytesPerSecond)
+        if (_maximumPacketsPerSecond == SecurityConfig.DisabledMaximumPacketsPerSecond && _maximumBytesPerSecond == SecurityConfig.DisabledMaximumBytesPerSecond)
             return;
 
         synapseConnection.ResetInboundRateCounters(nowTicks);
     }
-    
+
     /// <summary>
     /// Reliable retransmission sweep: any pending reliable packet whose resend timer has expired is re-sent.
     /// Packets exceeding the retry cap are treated as a <see cref="ViolationReason.ReliableExhausted"/> violation.
