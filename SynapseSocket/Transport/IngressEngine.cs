@@ -419,8 +419,10 @@ internal sealed partial class IngressEngine
                 return;
 
             case PacketType.Ack:
+                // Remove immediately (stops retransmission and frees backpressure), but defer the buffer return to
+                // the maintenance thread: an in-flight retransmit on that thread may still be reading this buffer.
                 if (synapseConnection.PendingReliableQueue.TryRemove(sequence, out SynapseConnection.PendingReliable? acked))
-                    SynapseConnection.ReleasePendingReliable(acked);
+                    _connections.DeferReliableRelease(acked);
                 return;
         }
 

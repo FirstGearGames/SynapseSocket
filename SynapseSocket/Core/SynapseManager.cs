@@ -524,6 +524,10 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
 
         if (pendingTasks.Count > 0)
             await Task.WhenAny(Task.WhenAll(pendingTasks), Task.Delay(5000)).ConfigureAwait(false);
+
+        // The maintenance loop has stopped, so no resend is in flight; reclaim any reliable buffers that were
+        // deferred for release but not yet drained, so they are returned to the pool rather than leaked.
+        Connections.DrainReliableReleases();
     }
 
     /// <summary>

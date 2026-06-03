@@ -105,6 +105,11 @@ public sealed partial class SynapseConnection : IPoolResettable
     [PoolResettableMember]
     internal TransmissionEngine? TransmissionEngine;
     /// <summary>
+    /// The owning <see cref="ConnectionManager"/>. Used to defer reliable-buffer release to the maintenance thread
+    /// so a buffer is never returned to the pool while an in-flight retransmit is still reading it.
+    /// </summary>
+    internal ConnectionManager? Manager;
+    /// <summary>
     /// Value used when ConnectionsIndex is not set.
     /// </summary>
     public const int UnsetConnectionsIndex = -1;
@@ -118,11 +123,13 @@ public sealed partial class SynapseConnection : IPoolResettable
     /// <param name="remoteEndPoint">The peer's remote endpoint.</param>
     /// <param name="signature">The 64-bit signature that uniquely identifies this peer.</param>
     /// <param name = "connectionsIndex"></param>
-    public void Initialize(IPEndPoint remoteEndPoint, ulong signature, int connectionsIndex)
+    /// <param name="manager">The owning connection manager, used for deferred reliable-buffer release.</param>
+    public void Initialize(IPEndPoint remoteEndPoint, ulong signature, int connectionsIndex, ConnectionManager manager)
     {
         RemoteEndPoint = remoteEndPoint ?? throw new ArgumentNullException(nameof(remoteEndPoint));
         Signature = signature;
         ConnectionsIndex = connectionsIndex;
+        Manager = manager;
         State = ConnectionState.Pending;
         LastReceivedTicks = DateTime.UtcNow.Ticks;
     }
@@ -219,14 +226,19 @@ public sealed partial class SynapseConnection : IPoolResettable
     }
 
     /// <summary>
-    /// Drains the pending reliable queue of <paramref name="synapseConnection"/>, releasing every entry's
-    /// pooled buffers and returning each <see cref="PendingReliable"/> to its pool.
-    /// Call on connection teardown to avoid leaking rented buffers.
+    /// Drains the pending reliable queue of <paramref name="synapseConnection"/>, deferring every entry's pooled
+    /// buffers to the maintenance thread for release. Call on connection teardown to avoid leaking rented buffers.
     /// </summary>
     internal static void DrainPendingReliableQueue(SynapseConnection synapseConnection)
     {
+        // Claim each entry with TryRemove before deferring so a concurrent ingress ACK or retransmit sweep cannot
+        // release the same PendingReliable. The actual buffer return is deferred to the maintenance thread so it
+        // never happens while an in-flight retransmit is still reading the buffer.
         foreach (KeyValuePair<ushort, PendingReliable> entry in synapseConnection.PendingReliableQueue)
-            ReleasePendingReliable(entry.Value);
+        {
+            if (synapseConnection.PendingReliableQueue.TryRemove(entry.Key, out PendingReliable? claimed))
+                synapseConnection.Manager?.DeferReliableRelease(claimed);
+        }
 
         synapseConnection.PendingReliableQueue.Clear();
     }
@@ -282,8 +294,14 @@ public sealed partial class SynapseConnection : IPoolResettable
         NextExpectedSequence = 0;
         PendingAcks.Clear();
         
-        foreach (PendingReliable? value in PendingReliableQueue.Values)
-            ResettableObjectPool<PendingReliable>.Return(value);
+        // Claim each entry with TryRemove before deferring so a concurrent ingress ACK or retransmit sweep cannot
+        // release the same PendingReliable. The buffer return is deferred to the maintenance thread so it never
+        // races an in-flight retransmit.
+        foreach (KeyValuePair<ushort, PendingReliable> entry in PendingReliableQueue)
+        {
+            if (PendingReliableQueue.TryRemove(entry.Key, out PendingReliable? claimed))
+                Manager?.DeferReliableRelease(claimed);
+        }
 
         PendingReliableQueue.Clear();
 

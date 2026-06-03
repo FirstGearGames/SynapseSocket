@@ -71,7 +71,7 @@ public class EngineLifecycleTests
         SynapseManager engine = new(TestHarness.ServerConfig(TestHarness.GetFreePort()));
         // Not calling StartAsync.
         SynapseConnection fakeConnection = new();
-        fakeConnection.Initialize(new(IPAddress.Loopback, port: 1), signature:1, connectionsIndex: SynapseConnection.UnsetConnectionsIndex);
+        fakeConnection.Initialize(new(IPAddress.Loopback, port: 1), signature:1, connectionsIndex: SynapseConnection.UnsetConnectionsIndex, engine.Connections);
 
         await Assert.ThrowsAsync<InvalidOperationException>(async () =>
             await engine.SendAsync(fakeConnection, new byte[] { 1, 2, 3 }, isReliable: true, CancellationToken.None));

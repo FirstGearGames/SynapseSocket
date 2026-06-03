@@ -77,6 +77,11 @@ public sealed partial class SynapseManager
 
         while (!cancellationToken.IsCancellationRequested)
         {
+            // Return acknowledged/evicted reliable buffers to the pool here, at the top of the sweep, where no
+            // retransmit send is in flight (the previous sweep's resends were awaited). This is the only place
+            // reliable buffers are freed, so freeing can never race a zero-copy retransmit still reading one.
+            Connections.DrainReliableReleases();
+
             if (!DoConnectionsExist())
             {
                 await Task.Delay(maintenanceLoopTargetMilliseconds, cancellationToken).ConfigureAwait(false);
@@ -96,7 +101,7 @@ public sealed partial class SynapseManager
 
                     if (PerformKeepAlive(nowTicks, connection, cancellationToken))
                     {
-                        RetransmitReliable(nowTicks, connection, cancellationToken);
+                        await RetransmitReliable(nowTicks, connection, cancellationToken);
                         TimeoutAssembledSegments(nowTicks, connection);
                         ResetInboundRateCounters(nowTicks, connection);
                     }
@@ -277,7 +282,7 @@ public sealed partial class SynapseManager
     /// Reliable retransmission sweep: any pending reliable packet whose resend timer has expired is re-sent.
     /// Packets exceeding the retry cap are treated as a <see cref="ViolationReason.ReliableExhausted"/> violation.
     /// </summary>
-    private void RetransmitReliable(long nowTicks, SynapseConnection synapseConnection, CancellationToken cancellationToken)
+    private async Task RetransmitReliable(long nowTicks, SynapseConnection synapseConnection, CancellationToken cancellationToken)
     {
         if (_transmissionEngine is null)
             return;
@@ -294,8 +299,11 @@ public sealed partial class SynapseManager
 
             if (pendingReliable.Retries >= _maximumReliableRetries)
             {
-                synapseConnection.PendingReliableQueue.TryRemove(keyValuePair.Key, out _);
-                SynapseConnection.ReleasePendingReliable(pendingReliable);
+                // Defer only if this sweep wins the removal. The ingress ACK path may have already removed this
+                // entry; deferring it twice would return BackingArray to the pool a second time. The buffer is
+                // reclaimed by DrainReliableReleases on the next sweep, never while a resend is in flight.
+                if (synapseConnection.PendingReliableQueue.TryRemove(keyValuePair.Key, out SynapseConnection.PendingReliable? exhausted))
+                    Connections.DeferReliableRelease(exhausted);
                 Telemetry.OnLost();
                 HandleViolation(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.ReliableExhausted, 0, ViolationReliableExhausted, ViolationAction.Kick);
 
@@ -307,11 +315,9 @@ public sealed partial class SynapseManager
 
             Telemetry.OnReliableResend();
 
-            // Capture Segments to a local: the ingress ACK path can concurrently call
-            // ReleasePendingReliable → OnReturn → Segments = null or ListPool.Return(Segments) (Clear)
-            // while we hold a reference to the same list. Both races are handled:
-            //   null check  → Segments was nulled before we read it (post-return).
-            //   try/catch   → Segments was cleared (Count→0) between our Count read and index access.
+            // Await each resend so the buffer read finishes before the sweep moves on. The buffer is only returned
+            // to the pool by DrainReliableReleases at the top of a sweep, when no resend is in flight — so nothing
+            // can free this buffer while the loop below is still reading it.
             List<ArraySegment<byte>>? segments = pendingReliable.Segments;
             if (segments is null)
                 continue;
@@ -319,11 +325,16 @@ public sealed partial class SynapseManager
             try
             {
                 for (int i = 0; i < segments.Count; i++)
-                    _ = _transmissionEngine.SendRawAsync(segments[i], synapseConnection.RemoteEndPoint, cancellationToken);
+                    await _transmissionEngine.SendRawAsync(segments[i], synapseConnection.RemoteEndPoint, cancellationToken).ConfigureAwait(false);
             }
-            catch (ArgumentOutOfRangeException)
+            catch (OperationCanceledException)
             {
-                // Packet was concurrently ACKed; segments cleared mid-iteration. Skip — it is already delivered.
+                throw;
+            }
+            catch (Exception)
+            {
+                // Best-effort resend: a transient send failure must not abort the sweep. The packet stays pending
+                // and is retried on a later sweep.
             }
         }
     }
