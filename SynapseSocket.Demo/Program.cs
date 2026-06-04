@@ -2,7 +2,6 @@ using System;
 using System.Net;
 using System.Text;
 using System.Threading;
-using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
 using SynapseSocket.Core.Configuration;
@@ -13,12 +12,15 @@ namespace SynapseSocket.Demo;
 /// Minimal end-to-end demo of the Synapse UDP transport engine.
 /// Spins up a server on localhost:45000 and a client that connects,
 /// exchanges a reliable and an unreliable message, then disconnects.
+/// <para>
+/// The engine is poll-driven: the demo pumps both engines with <see cref="Pump"/> from this single thread.
+/// </para>
 /// </summary>
 internal static class Program
 {
     private const int Port = 45000;
 
-    private static async Task Main()
+    private static void Main()
     {
         Console.WriteLine("=== Synapse Demo ===");
 
@@ -30,9 +32,9 @@ internal static class Program
             Segment = { MaximumSegments = 128, UnreliableMode = UnreliableSegmentMode.SegmentUnreliable },
         };
 
-        await using SynapseManager server = new(serverConfig);
+        using SynapseManager server = new(serverConfig);
         WireServerEvents(server);
-        await server.StartAsync(CancellationToken.None).ConfigureAwait(false);
+        server.Start();
         Console.WriteLine($"[server] bound on port {Port}");
 
         // --- Build client config ---
@@ -43,56 +45,72 @@ internal static class Program
             Segment = { MaximumSegments = 128, UnreliableMode = UnreliableSegmentMode.SegmentUnreliable },
         };
 
-        await using SynapseManager client = new(clientConfig);
-        TaskCompletionSource<bool> clientConnected = new();
-        TaskCompletionSource<string> clientReply = new();
+        using SynapseManager client = new(clientConfig);
+        bool clientConnected = false;
+        bool clientReplyReceived = false;
 
         client.ConnectionEstablished += (connectionEventArgs) =>
         {
             Console.WriteLine($"[client] connected to {connectionEventArgs.Connection.RemoteEndPoint} (sig=0x{connectionEventArgs.Connection.Signature:X})");
-            clientConnected.TrySetResult(true);
+            clientConnected = true;
         };
         client.PacketReceived += (packetReceivedEventArgs) =>
         {
             string decodedText = Encoding.UTF8.GetString(packetReceivedEventArgs.Payload);
             Console.WriteLine($"[client] received ({(packetReceivedEventArgs.IsReliable ? "reliable" : "unreliable")}): {decodedText}");
-            clientReply.TrySetResult(decodedText);
+            clientReplyReceived = true;
         };
         client.ConnectionClosed += (connectionEventArgs) => Console.WriteLine($"[client] connection closed: {connectionEventArgs.Connection.RemoteEndPoint}");
         client.ConnectionFailed += (connectionFailedEventArgs) => Console.WriteLine($"[client] failure: {connectionFailedEventArgs.Reason} {connectionFailedEventArgs.Message}");
 
-        await client.StartAsync(CancellationToken.None).ConfigureAwait(false);
+        client.Start();
         Console.WriteLine("[client] started");
 
         IPEndPoint serverEndPoint = new(IPAddress.Loopback, Port);
-        SynapseConnection synapseConnection = await client.ConnectAsync(serverEndPoint, CancellationToken.None).ConfigureAwait(false);
+        SynapseConnection synapseConnection = client.Connect(serverEndPoint);
 
-        // Wait for handshake to complete (server handshake-ack arrives back).
-        await Task.WhenAny(clientConnected.Task, Task.Delay(2000)).ConfigureAwait(false);
+        // Pump until the handshake completes (server handshake-ack arrives back).
+        Pump(server, client, () => clientConnected, 2000);
 
         // Send a reliable hello.
         byte[] helloPayload = Encoding.UTF8.GetBytes("Hello from client (reliable)");
-        await client.SendAsync(synapseConnection, helloPayload, isReliable: true, CancellationToken.None).ConfigureAwait(false);
+        client.Send(synapseConnection, helloPayload, isReliable: true);
 
         byte[] fragmentedPayload = new byte[2500];
-        await client.SendAsync(synapseConnection, fragmentedPayload, isReliable: false, CancellationToken.None).ConfigureAwait(false);
+        client.Send(synapseConnection, fragmentedPayload, isReliable: false);
 
         // Send an unreliable ping.
         byte[] pingPayload = Encoding.UTF8.GetBytes("Ping from client (unreliable)");
-        await client.SendAsync(synapseConnection, pingPayload, isReliable: false, CancellationToken.None).ConfigureAwait(false);
+        client.Send(synapseConnection, pingPayload, isReliable: false);
 
-        // Wait for an echo.
-        await Task.WhenAny(clientReply.Task, Task.Delay(2000)).ConfigureAwait(false);
+        // Pump until an echo arrives.
+        Pump(server, client, () => clientReplyReceived, 2000);
 
-        await Task.Delay(300).ConfigureAwait(false);
-        await client.DisconnectAsync(synapseConnection, CancellationToken.None).ConfigureAwait(false);
-        await Task.Delay(200).ConfigureAwait(false);
+        Pump(server, client, () => false, 300);
+        client.Disconnect(synapseConnection);
+        Pump(server, client, () => false, 200);
 
         Console.WriteLine();
         Console.WriteLine("=== Telemetry ===");
         Console.WriteLine($"[server] in={server.Telemetry.BytesIn}B/{server.Telemetry.PacketsIn}pkts  out={server.Telemetry.BytesOut}B/{server.Telemetry.PacketsOut}pkts  dropped_in={server.Telemetry.PacketsDroppedIn}");
         Console.WriteLine($"[client] in={client.Telemetry.BytesIn}B/{client.Telemetry.PacketsIn}pkts  out={client.Telemetry.BytesOut}B/{client.Telemetry.PacketsOut}pkts  dropped_in={client.Telemetry.PacketsDroppedIn}");
         Console.WriteLine("Demo finished.");
+    }
+
+    /// <summary>
+    /// Pumps both engines until <paramref name="until"/> is true or <paramref name="timeoutMs"/> elapses.
+    /// </summary>
+    private static void Pump(SynapseManager server, SynapseManager client, Func<bool> until, int timeoutMs)
+    {
+        long deadline = Environment.TickCount64 + timeoutMs;
+        while (Environment.TickCount64 < deadline)
+        {
+            server.Poll();
+            client.Poll();
+            if (until())
+                return;
+            Thread.Sleep(1);
+        }
     }
 
     private static void WireServerEvents(SynapseManager server)
@@ -103,16 +121,16 @@ internal static class Program
 
         server.ConnectionFailed += (connectionFailedEventArgs) => Console.WriteLine($"[server] failure: {connectionFailedEventArgs.Reason} ({connectionFailedEventArgs.EndPoint}) {connectionFailedEventArgs.Message}");
 
-        server.PacketReceived += async (packetReceivedEventArgs) =>
+        server.PacketReceived += (packetReceivedEventArgs) =>
         {
             string decodedText = Encoding.UTF8.GetString(packetReceivedEventArgs.Payload);
             Console.WriteLine($"[server] received ({(packetReceivedEventArgs.IsReliable ? "reliable" : "unreliable")}) from {packetReceivedEventArgs.Connection.RemoteEndPoint}: {decodedText}");
 
-            // Echo back on the same channel.
+            // Echo back on the same channel (re-entrant send from the receive callback is safe — single-threaded).
             byte[] replyPayload = Encoding.UTF8.GetBytes($"echo: {decodedText}");
             try
             {
-                await server.SendAsync(packetReceivedEventArgs.Connection, replyPayload, packetReceivedEventArgs.IsReliable, CancellationToken.None).ConfigureAwait(false);
+                server.Send(packetReceivedEventArgs.Connection, replyPayload, packetReceivedEventArgs.IsReliable);
             }
             catch (Exception ex)
             {
