@@ -1,7 +1,6 @@
 using System;
 using System.Net;
 using System.Threading;
-using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
 using Xunit;
@@ -28,8 +27,8 @@ public sealed class GarbageCollectionTests
         Array.Fill(SendBuffer, (byte)0xAB);
     }
 
-    [Fact(Timeout = GarbageCollectionTestTimeout)]
-    public async Task SendsDoNotTriggerGarbageCollection()
+    [Fact]
+    public void SendsDoNotTriggerGarbageCollection()
     {
         int port = TestHarness.GetFreePort();
         SynapseManager server = new(TestHarness.ServerConfig(port, c =>
@@ -48,20 +47,26 @@ public sealed class GarbageCollectionTests
                 c.Reliable.MaximumRetries = 500;
             }));
 
+        // One reusable array of every engine so the pump never allocates a params array during the measured phase.
+        SynapseManager[] allEngines = new SynapseManager[ClientCount + 1];
+        allEngines[0] = server;
+        for (int i = 0; i < ClientCount; i++)
+            allEngines[i + 1] = clients[i];
+
         try
         {
-            await server.StartAsync(CancellationToken.None);
+            server.Start();
 
             int connectedClientCount = 0;
             server.ConnectionEstablished += _ => Interlocked.Increment(ref connectedClientCount);
 
             for (int i = 0; i < ClientCount; i++)
             {
-                await clients[i].StartAsync(CancellationToken.None);
-                clientToServerConnections[i] = await clients[i].ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
+                clients[i].Start();
+                clientToServerConnections[i] = clients[i].Connect(new(IPAddress.Loopback, port));
             }
 
-            Assert.True(await TestHarness.WaitFor(() => connectedClientCount >= ClientCount, 5000),
+            Assert.True(TestHarness.PumpUntil(() => connectedClientCount >= ClientCount, 5000, allEngines),
                 "Not all clients established a connection to the server.");
 
             // Single rolling counter used for both warmup and measured phases.
@@ -78,12 +83,12 @@ public sealed class GarbageCollectionTests
                 ArraySegment<byte> segment = new(SendBuffer, 0, byteCount);
 
                 for (int i = 0; i < ClientCount; i++)
-                    _ = clients[i].SendAsync(clientToServerConnections[i], segment, isReliable: true, CancellationToken.None);
+                    clients[i].Send(clientToServerConnections[i], segment, isReliable: true);
 
-                Thread.Sleep(WarmupDelayMilliseconds);
+                TestHarness.PumpFor(WarmupDelayMilliseconds, allEngines);
             }
 
-            Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref totalReceivedCount) >= warmupExpectedCount, 60000),
+            Assert.True(TestHarness.PumpUntil(() => Volatile.Read(ref totalReceivedCount) >= warmupExpectedCount, 60000, allEngines),
                 $"Warmup incomplete: server received {totalReceivedCount} of {warmupExpectedCount} packets.");
 
             // Collect all warmup and initialization allocations to establish a stable baseline.
@@ -103,13 +108,13 @@ public sealed class GarbageCollectionTests
                     ArraySegment<byte> segment = new(SendBuffer, 0, byteCount);
 
                     for (int i = 0; i < ClientCount; i++)
-                        _ = clients[i].SendAsync(clientToServerConnections[i], segment, isReliable: true, CancellationToken.None);
+                        clients[i].Send(clientToServerConnections[i], segment, isReliable: true);
 
-                    Thread.Sleep(SendDelayMilliseconds);
+                    TestHarness.PumpFor(SendDelayMilliseconds, allEngines);
                 }
             }
 
-            Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref totalReceivedCount) >= measuredExpectedTotal, 45000),
+            Assert.True(TestHarness.PumpUntil(() => Volatile.Read(ref totalReceivedCount) >= measuredExpectedTotal, 45000, allEngines),
                 $"Measured sends incomplete: server received {totalReceivedCount} of {measuredExpectedTotal} total packets.");
 
             Assert.Equal(gen0Before, GC.CollectionCount(0));
@@ -118,10 +123,10 @@ public sealed class GarbageCollectionTests
         }
         finally
         {
-            await server.DisposeAsync();
+            server.Dispose();
 
             foreach (SynapseManager client in clients)
-                await client.DisposeAsync();
+                client.Dispose();
         }
     }
 }

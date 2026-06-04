@@ -1,8 +1,6 @@
 using System;
 using System.Net;
 using System.Net.Sockets;
-using System.Threading;
-using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
 using Xunit;
@@ -14,26 +12,26 @@ namespace SynapseSocket.Tests.Lifecycle;
 public class EngineLifecycleTests
 {
     [Fact]
-    public async Task Engine_Starts_And_Binds_Successfully()
+    public void Engine_Starts_And_Binds_Successfully()
     {
         int port = TestHarness.GetFreePort();
         SynapseConfig synapseConfig = TestHarness.ServerConfig(port);
-        await using SynapseManager engine = new(synapseConfig);
+        using SynapseManager engine = new(synapseConfig);
 
-        await engine.StartAsync(CancellationToken.None);
+        engine.Start();
 
         Assert.True(engine.IsRunning);
     }
 
     [Fact]
-    public async Task Engine_Throws_When_Started_Twice()
+    public void Engine_Throws_When_Started_Twice()
     {
         int port = TestHarness.GetFreePort();
-        await using SynapseManager engine = new(TestHarness.ServerConfig(port));
+        using SynapseManager engine = new(TestHarness.ServerConfig(port));
 
-        await engine.StartAsync(CancellationToken.None);
+        engine.Start();
 
-        await Assert.ThrowsAsync<InvalidOperationException>(async () => await engine.StartAsync(CancellationToken.None));
+        Assert.Throws<InvalidOperationException>(() => engine.Start());
     }
 
     [Fact]
@@ -50,11 +48,11 @@ public class EngineLifecycleTests
     }
 
     [Fact]
-    public async Task Dispose_Releases_Sockets_And_Stops_Running()
+    public void Dispose_Releases_Sockets_And_Stops_Running()
     {
         int port = TestHarness.GetFreePort();
         SynapseManager engine = new(TestHarness.ServerConfig(port));
-        await engine.StartAsync(CancellationToken.None);
+        engine.Start();
         Assert.True(engine.IsRunning);
 
         engine.Dispose();
@@ -66,33 +64,33 @@ public class EngineLifecycleTests
     }
 
     [Fact]
-    public async Task SendReliable_Before_Start_Throws()
+    public void SendReliable_Before_Start_Throws()
     {
         SynapseManager engine = new(TestHarness.ServerConfig(TestHarness.GetFreePort()));
-        // Not calling StartAsync.
+        // Not calling Start.
         SynapseConnection fakeConnection = new();
-        fakeConnection.Initialize(new(IPAddress.Loopback, port: 1), signature:1, connectionsIndex: SynapseConnection.UnsetConnectionsIndex, engine.Connections);
+        fakeConnection.Initialize(new(IPAddress.Loopback, port: 1), signature: 1, connectionsIndex: SynapseConnection.UnsetConnectionsIndex);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await engine.SendAsync(fakeConnection, new byte[] { 1, 2, 3 }, isReliable: true, CancellationToken.None));
+        Assert.Throws<InvalidOperationException>(() =>
+            engine.Send(fakeConnection, new byte[] { 1, 2, 3 }, isReliable: true));
 
         engine.Dispose();
     }
 
     [Fact]
-    public async Task Bind_Failure_Fires_ConnectionFailed_Event()
+    public void Bind_Failure_Fires_ConnectionFailed_Event()
     {
         int port = TestHarness.GetFreePort();
         using Socket blockerSocket = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
         blockerSocket.Bind(new IPEndPoint(IPAddress.Loopback, port));
 
         SynapseConfig synapseConfig = TestHarness.ServerConfig(port);
-        await using SynapseManager engine = new(synapseConfig);
+        using SynapseManager engine = new(synapseConfig);
 
         ConnectionRejectedReason? connectionRejectedReason = null;
         engine.ConnectionFailed += (connectionFailedEventArgs) => connectionRejectedReason = connectionFailedEventArgs.Reason;
 
-        await Assert.ThrowsAsync<InvalidOperationException>(async () => await engine.StartAsync(CancellationToken.None));
+        Assert.Throws<InvalidOperationException>(() => engine.Start());
         Assert.Equal(ConnectionRejectedReason.BindFailed, connectionRejectedReason);
     }
 }

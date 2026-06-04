@@ -14,11 +14,15 @@ using Xunit.Abstractions;
 namespace SynapseSocket.Tests.Stress;
 
 /// <summary>
-/// Attempts to reproduce, purely at the SynapseSocket level (no Nucleus, no transport wrapper), the
-/// received-payload corruption seen in Nucleus's full test suite: a buffer handed to two owners so a
-/// receiver reads bytes that were overwritten by an unrelated rental. Each message carries a verifiable
-/// pattern; the receiver checks content exactly. Canary buffers rented from the shared pool are held
-/// across engine activity and re-verified to catch cross-component double-returns into <see cref="ArrayPool{T}.Shared"/>.
+/// Attempts to reproduce, purely at the SynapseSocket level, received-payload corruption: a buffer handed to two
+/// owners so a receiver reads bytes overwritten by an unrelated rental. Each message carries a verifiable pattern;
+/// the receiver checks content exactly. Canary buffers rented from the shared pool are held across engine activity
+/// and re-verified to catch cross-component double-returns into <see cref="ArrayPool{T}.Shared"/>.
+/// <para>
+/// In the synchronous/poll-driven engine, all engine work runs on the test thread (via the pump), so the
+/// teardown-vs-receive races that previously poisoned the pool cannot occur by construction. These tests stand as
+/// regression guards.
+/// </para>
 /// </summary>
 public class PayloadIntegrityStressTests
 {
@@ -31,8 +35,7 @@ public class PayloadIntegrityStressTests
 
     /// <summary>
     /// Fills a buffer with a pattern derived from <paramref name="seed"/>: bytes 0..3 hold the seed,
-    /// every later byte is (seed + index) truncated to a byte. Lets the receiver detect any aliasing
-    /// overwrite, a wrong length, or a swapped payload.
+    /// every later byte is (seed + index) truncated to a byte.
     /// </summary>
     private static byte[] MakePatternedPayload(uint seed, int length)
     {
@@ -67,7 +70,7 @@ public class PayloadIntegrityStressTests
     }
 
     [Fact]
-    public async Task ReliablePayloads_StayIntact_AcrossManyCyclesAndSizes()
+    public void ReliablePayloads_StayIntact_AcrossManyCyclesAndSizes()
     {
         const int Cycles = 120;
         const int MessagesPerCycle = 24;
@@ -84,17 +87,16 @@ public class PayloadIntegrityStressTests
             void Tweak(SynapseConfig config)
             {
                 config.CopyReceivedPayloads = true;
-                // Disable established-connection rate/oversize enforcement so an aggressive stress burst is not
-                // kicked+blacklisted by the rate limiter; we are exercising buffer integrity, not flood defense.
                 config.Security.Enabled = false;
+                config.Reliable.MaximumPending = 1000;
             }
 
-            SynapseManager server = new(TestHarness.ServerConfig(port, Tweak));
-            SynapseManager client = new(TestHarness.ClientConfig(Tweak));
+            using SynapseManager server = new(TestHarness.ServerConfig(port, Tweak));
+            using SynapseManager client = new(TestHarness.ClientConfig(Tweak));
 
             using TestHarness.FailureObserver observer = TestHarness.ObserveFailures(server, client);
 
-            // Validate on the ingress thread, the instant the payload is delivered, then record the seed as received.
+            // Validate on the pump thread, the instant the payload is delivered, then record the seed as received.
             ConcurrentDictionary<uint, byte> receivedSeeds = new();
             server.PacketReceived += args =>
             {
@@ -106,14 +108,14 @@ public class PayloadIntegrityStressTests
                     receivedSeeds[(uint)(copy[0] | (copy[1] << 8) | (copy[2] << 16) | (copy[3] << 24))] = 1;
             };
 
-            await server.StartAsync(CancellationToken.None);
-            await client.StartAsync(CancellationToken.None);
+            server.Start();
+            client.Start();
 
-            SynapseConnection connection = await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
-            await TestHarness.WaitFor(() => connection.State == ConnectionState.Connected);
+            SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+            TestHarness.PumpUntil(() => connection.State == ConnectionState.Connected, 2000, server, client);
 
-            // Hold a batch of shared-pool canaries across this cycle's traffic. If the engine returns one of
-            // its own buffers twice, a later rental can collide with a canary and overwrite its pattern.
+            // Hold a batch of shared-pool canaries across this cycle's traffic. If the engine returns one of its
+            // own buffers twice, a later rental can collide with a canary and overwrite its pattern.
             List<(byte[] buffer, int length, uint seed)> canaries = RentCanaries(cycle);
 
             List<uint> sentSeeds = [];
@@ -125,11 +127,11 @@ public class PayloadIntegrityStressTests
                 byte[] payload = MakePatternedPayload(seed, length);
                 sentSeeds.Add(seed);
 
-                observer.ObserveSend(client.SendAsync(connection, payload, isReliable: true, CancellationToken.None));
+                client.Send(connection, payload, isReliable: true);
                 Interlocked.Increment(ref totalSent);
             }
 
-            bool all = await TestHarness.WaitFor(() => receivedSeeds.Count >= sentSeeds.Count, 6_000);
+            bool all = TestHarness.PumpUntil(() => receivedSeeds.Count >= sentSeeds.Count, 6_000, server, client);
 
             VerifyCanaries(canaries, cycle, corruptions);
             ReturnCanaries(canaries);
@@ -147,9 +149,7 @@ public class PayloadIntegrityStressTests
 
             observer.AssertNoFailures();
 
-            await client.DisconnectAsync(connection, CancellationToken.None);
-            await server.DisposeAsync();
-            await client.DisposeAsync();
+            client.Disconnect(connection);
         }
 
         _output.WriteLine($"sent={totalSent} received={totalReceived} lost={totalLost} corruptions={corruptions.Count}");
@@ -157,28 +157,32 @@ public class PayloadIntegrityStressTests
     }
 
     [Fact]
-    public async Task DeferredReadConsumer_ReliablePayloads_StayIntact()
+    public void DeferredReadConsumer_ReliablePayloads_StayIntact()
     {
-        // Mirrors how Nucleus's transport consumes payloads: copy each delivered payload into a shared-pool
-        // rental on the ingress thread, then read it LATER. Every copy is HELD for the whole cycle (alongside a
-        // batch of canaries) and validated only at the end, so any buffer the engine hands to a second owner
-        // mid-cycle is caught as a broken pattern. Each copy is also validated immediately on arrival to tell a
-        // corrupt-on-the-wire datagram (ARRIVED-CORRUPT) apart from receive-side pool poisoning (HELD-ALIASED).
-        // Bidirectional reliable traffic with mixed unsegmented/segmented sizes churns both receive paths.
+        // Mirrors how a transport consumes payloads: copy each delivered payload into a shared-pool rental on the
+        // delivery callback, then read it LATER. Every copy is HELD for the whole cycle (alongside a batch of
+        // canaries) and validated only at the end, so any buffer the engine hands to a second owner is caught as a
+        // broken pattern. Each copy is also validated immediately on arrival to tell a corrupt-on-the-wire datagram
+        // (ARRIVED-CORRUPT) apart from receive-side pool poisoning (DEFERRED-ALIASED). A separate drain thread
+        // returns the held copies to the pool while the engine pump is running, widening the aliasing window.
         const int Cycles = 120;
         const int Bursts = 2;
         const int MessagesPerBurst = 16;
 
         ConcurrentBag<string> corruptions = [];
 
-        void Tweak(SynapseConfig config) => config.CopyReceivedPayloads = true;
+        void Tweak(SynapseConfig config)
+        {
+            config.CopyReceivedPayloads = true;
+            config.Reliable.MaximumPending = 1000;
+        }
 
         for (int cycle = 0; cycle < Cycles && corruptions.IsEmpty; cycle++)
         {
             int port = TestHarness.GetFreePort();
 
-            SynapseManager server = new(TestHarness.ServerConfig(port, Tweak));
-            SynapseManager client = new(TestHarness.ClientConfig(Tweak));
+            using SynapseManager server = new(TestHarness.ServerConfig(port, Tweak));
+            using SynapseManager client = new(TestHarness.ClientConfig(Tweak));
 
             using TestHarness.FailureObserver observer = TestHarness.ObserveFailures(server, client);
 
@@ -205,16 +209,16 @@ public class PayloadIntegrityStressTests
             server.PacketReceived += DeferredConsumer;
             client.PacketReceived += DeferredConsumer;
 
-            await server.StartAsync(CancellationToken.None);
-            await client.StartAsync(CancellationToken.None);
+            server.Start();
+            client.Start();
 
-            SynapseConnection toServer = await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
-            await TestHarness.WaitFor(() => toServer.State == ConnectionState.Connected && toClient is not null);
+            SynapseConnection toServer = client.Connect(new(IPAddress.Loopback, port));
+            TestHarness.PumpUntil(() => toServer.State == ConnectionState.Connected && toClient is not null, 2000, server, client);
 
             List<(byte[] buffer, int length, uint seed)> canaries = RentCanaries(cycle);
 
-            // Concurrent drain: a third thread reads each deferred copy and returns it to the pool while sends and
-            // receives are still in flight, widening the window in which an aliased buffer is overwritten.
+            // Concurrent drain: a third thread reads each deferred copy and returns it to the pool while the engine
+            // pump is running, widening the window in which an aliased buffer would be overwritten.
             using CancellationTokenSource drainCancellation = new();
             Task drainTask = Task.Run(() =>
             {
@@ -240,16 +244,19 @@ public class PayloadIntegrityStressTests
                     uint serverSeed = clientSeed + 500;
                     int length = PayloadSizes[message % PayloadSizes.Length];
 
-                    observer.ObserveSend(client.SendAsync(toServer, MakePatternedPayload(clientSeed, length), isReliable: true, CancellationToken.None));
-                    observer.ObserveSend(server.SendAsync(toClient!, MakePatternedPayload(serverSeed, length), isReliable: true, CancellationToken.None));
+                    client.Send(toServer, MakePatternedPayload(clientSeed, length), isReliable: true);
+                    server.Send(toClient!, MakePatternedPayload(serverSeed, length), isReliable: true);
                     expected += 2;
+
+                    server.Poll();
+                    client.Poll();
                 }
             }
 
-            bool all = await TestHarness.WaitFor(() => Volatile.Read(ref receivedCount) >= expected, 8_000);
-            await TestHarness.WaitFor(() => deferred.IsEmpty, 2_000);
+            bool all = TestHarness.PumpUntil(() => Volatile.Read(ref receivedCount) >= expected, 8_000, server, client);
+            TestHarness.PumpUntil(() => deferred.IsEmpty, 2_000, server, client);
             drainCancellation.Cancel();
-            await drainTask;
+            drainTask.Wait();
 
             VerifyCanaries(canaries, cycle, corruptions);
             ReturnCanaries(canaries);
@@ -259,19 +266,18 @@ public class PayloadIntegrityStressTests
 
             observer.AssertNoFailures();
 
-            await client.DisconnectAsync(toServer, CancellationToken.None);
-            await server.DisposeAsync();
-            await client.DisposeAsync();
+            client.Disconnect(toServer);
         }
 
         Assert.True(corruptions.IsEmpty, FormatCorruptions(corruptions));
     }
 
     [Fact]
-    public async Task TeardownWithPendingReliables_DoesNotPoisonSharedPool()
+    public void TeardownWithPendingReliables_DoesNotPoisonSharedPool()
     {
-        // Disconnect immediately after a reliable burst so the per-connection teardown drain races the
-        // still-running ingress ACK thread and the maintenance retransmit sweep over the same pending entries.
+        // Disconnect immediately after a reliable burst so teardown runs with reliables still pending. In the
+        // single-threaded model teardown frees buffers inline (no in-flight retransmit on another thread), so this
+        // is now a straightforward regression guard against any double-return.
         const int Cycles = 400;
         const int MessagesPerCycle = 12;
 
@@ -284,13 +290,12 @@ public class PayloadIntegrityStressTests
             void Tweak(SynapseConfig config)
             {
                 config.CopyReceivedPayloads = true;
-                // Disable established-connection rate/oversize enforcement so an aggressive stress burst is not
-                // kicked+blacklisted by the rate limiter; we are exercising buffer integrity, not flood defense.
                 config.Security.Enabled = false;
+                config.Reliable.MaximumPending = 1000;
             }
 
-            SynapseManager server = new(TestHarness.ServerConfig(port, Tweak));
-            SynapseManager client = new(TestHarness.ClientConfig(Tweak));
+            using SynapseManager server = new(TestHarness.ServerConfig(port, Tweak));
+            using SynapseManager client = new(TestHarness.ClientConfig(Tweak));
 
             using TestHarness.FailureObserver observer = TestHarness.ObserveFailures(server, client);
 
@@ -302,11 +307,11 @@ public class PayloadIntegrityStressTests
                     corruptions.Add($"cycle {cycle}: content {violation}");
             };
 
-            await server.StartAsync(CancellationToken.None);
-            await client.StartAsync(CancellationToken.None);
+            server.Start();
+            client.Start();
 
-            SynapseConnection connection = await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
-            await TestHarness.WaitFor(() => connection.State == ConnectionState.Connected, 2_000);
+            SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+            TestHarness.PumpUntil(() => connection.State == ConnectionState.Connected, 2_000, server, client);
 
             List<(byte[] buffer, int length, uint seed)> canaries = RentCanaries(cycle);
 
@@ -315,13 +320,11 @@ public class PayloadIntegrityStressTests
                 uint seed = (uint)(cycle * 10_000 + message + 1);
                 int length = PayloadSizes[message % PayloadSizes.Length];
                 byte[] payload = MakePatternedPayload(seed, length);
-                observer.ObserveSend(client.SendAsync(connection, payload, isReliable: true, CancellationToken.None));
+                client.Send(connection, payload, isReliable: true);
             }
 
-            // No wait: tear down with reliables still pending and ACKs still in flight.
-            await client.DisconnectAsync(connection, CancellationToken.None);
-            await server.DisposeAsync();
-            await client.DisposeAsync();
+            // No wait: tear down with reliables still pending.
+            client.Disconnect(connection);
 
             VerifyCanaries(canaries, cycle, corruptions);
             ReturnCanaries(canaries);

@@ -1,9 +1,7 @@
-using System.Linq;
 using System;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
-using System.Threading;
-using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
 using Xunit;
@@ -15,16 +13,16 @@ namespace SynapseSocket.Tests.Transport;
 public class SegmentationTests
 {
     [Fact]
-    public async Task Large_Unreliable_Payload_Is_Segmented_And_Reassembled()
+    public void Large_Unreliable_Payload_Is_Segmented_And_Reassembled()
     {
         int port = TestHarness.GetFreePort();
-        await using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
+        using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
             c.MaximumTransmissionUnit = 200;  // very small MTU to force many segments
             c.MaximumPacketSize = 400;
             c.Segment.MaximumSegments = 128;
         }));
-        await using SynapseManager client = new(TestHarness.ClientConfig(c =>
+        using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
             c.MaximumTransmissionUnit = 200;
             c.MaximumPacketSize = 400;
@@ -34,27 +32,27 @@ public class SegmentationTests
         byte[]? receivedPayload = null;
         server.PacketReceived += (packetReceivedEventArgs) => receivedPayload = packetReceivedEventArgs.Payload.ToArray();
 
-        await server.StartAsync(CancellationToken.None);
-        await client.StartAsync(CancellationToken.None);
+        server.Start();
+        client.Start();
 
-        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
-        await TestHarness.WaitFor(() => synapseConnection.State == ConnectionState.Connected);
+        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 2000, server, client);
 
         byte[] payload = new byte[4096];
         new Random(42).NextBytes(payload);
 
-        await client.SendAsync(synapseConnection, payload, isReliable: false, CancellationToken.None);
-        Assert.True(await TestHarness.WaitFor(() => receivedPayload != null, 5000),
+        client.Send(synapseConnection, payload, isReliable: false);
+        Assert.True(TestHarness.PumpUntil(() => receivedPayload != null, 5000, server, client),
             "server never reassembled the segmented payload");
         Assert.Equal(payload, receivedPayload);
     }
 
     [Fact]
-    public async Task Reliable_Oversized_Payload_Throws_Clearly()
+    public void Reliable_Oversized_Payload_Throws_Clearly()
     {
         int port = TestHarness.GetFreePort();
-        await using SynapseManager server = new(TestHarness.ServerConfig(port));
-        await using SynapseManager client = new(TestHarness.ClientConfig(c =>
+        using SynapseManager server = new(TestHarness.ServerConfig(port));
+        using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
             c.MaximumTransmissionUnit = 256;
             c.MaximumPacketSize = 512;
@@ -62,22 +60,22 @@ public class SegmentationTests
             c.Segment.UnreliableMode = UnreliableSegmentMode.Disabled;
         }));
 
-        await server.StartAsync(CancellationToken.None);
-        await client.StartAsync(CancellationToken.None);
+        server.Start();
+        client.Start();
 
-        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
-        await TestHarness.WaitFor(() => synapseConnection.State == ConnectionState.Connected);
+        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 2000, server, client);
 
         byte[] oversizedPayload = new byte[1024];
-        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await client.SendAsync(synapseConnection, oversizedPayload, isReliable: true, CancellationToken.None));
+        Assert.Throws<InvalidOperationException>(() =>
+            client.Send(synapseConnection, oversizedPayload, isReliable: true));
     }
 
     [Fact]
-    public async Task Declared_Segment_Assembly_Exceeding_MaximumReassembledPacketSize_Is_Rejected()
+    public void Declared_Segment_Assembly_Exceeding_MaximumReassembledPacketSize_Is_Rejected()
     {
         int port = TestHarness.GetFreePort();
-        await using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
+        using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
             c.MaximumTransmissionUnit = 200;
             c.Segment.MaximumSegments = 64;
@@ -87,13 +85,13 @@ public class SegmentationTests
 
         TestHarness.EventRecorder eventRecorder = new();
         eventRecorder.Attach(server);
-        await server.StartAsync(CancellationToken.None);
+        server.Start();
 
         // Establish a connection first so the server has a known peer.
         using Socket socket = TestHarness.CreateRawSocket();
         IPEndPoint serverEndPoint = new(IPAddress.Loopback, port);
         socket.SendTo(new byte[] { 0x03 }, serverEndPoint); // PacketType.Handshake
-        Assert.True(await TestHarness.WaitFor(() => eventRecorder.ConnectionsEstablished >= 1),
+        Assert.True(TestHarness.PumpUntil(() => eventRecorder.ConnectionsEstablished >= 1, 2000, server),
             "connection should have been established");
 
         // Craft a raw segmented packet:
@@ -103,8 +101,8 @@ public class SegmentationTests
         byte[] segmentedPacket = [0x06, 0x01, 0x00, 0x00, 0x05, 0xAA, 0xBB, 0xCC];
         socket.SendTo(segmentedPacket, serverEndPoint);
 
-        Assert.True(await TestHarness.WaitFor(
-                () => eventRecorder.ViolationReasons.Contains(ViolationReason.Oversized), 3000),
+        Assert.True(TestHarness.PumpUntil(
+                () => eventRecorder.ViolationReasons.Contains(ViolationReason.Oversized), 3000, server),
             "expected an Oversized violation for a segment assembly exceeding MaximumReassembledPacketSize");
     }
 }

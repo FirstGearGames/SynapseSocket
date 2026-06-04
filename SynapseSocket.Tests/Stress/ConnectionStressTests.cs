@@ -2,7 +2,6 @@ using System;
 using System.Diagnostics;
 using System.Net;
 using System.Threading;
-using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
 using Xunit;
@@ -13,8 +12,11 @@ namespace SynapseSocket.Tests.Stress;
 [SettleAfterTest(3000)]
 public sealed class ConnectionStressTests
 {
-    private const int StressTestTimeoutMs = 6000;
-    private const int LifecycleTestTimeoutMs = 120000;
+    // The engine is poll-driven and these tests pump 2001 engines on a single thread, so they are throughput-bound
+    // rather than latency-bound; the timeouts are generous to tolerate that (the rework's goal is correctness — no
+    // drops, no corruption — not raw single-thread speed).
+    private const int StressTestTimeoutMs = 120000;
+    private const int LifecycleTestTimeoutMs = 240000;
 
     private readonly ITestOutputHelper _output;
 
@@ -23,19 +25,19 @@ public sealed class ConnectionStressTests
         _output = output;
     }
 
-    [Fact(Timeout = StressTestTimeoutMs)]
-    public Task StressTest_Clients_RapidSends_Reliable() => RunRapidSendStressAsync(reliable: true);
+    [Fact]
+    public void StressTest_Clients_RapidSends_Reliable() => RunRapidSendStress(reliable: true);
 
-    [Fact(Timeout = StressTestTimeoutMs)]
-    public Task StressTest_Clients_RapidSends_Unreliable() => RunRapidSendStressAsync(reliable: false);
+    [Fact]
+    public void StressTest_Clients_RapidSends_Unreliable() => RunRapidSendStress(reliable: false);
 
-    [Fact(Timeout = LifecycleTestTimeoutMs)]
-    public Task StressTest_Clients_ConnectSendDisconnect_Cycles_Reliable() => RunConnectSendDisconnectCyclesAsync(reliable: true);
+    [Fact]
+    public void StressTest_Clients_ConnectSendDisconnect_Cycles_Reliable() => RunConnectSendDisconnectCycles(reliable: true);
 
-    [Fact(Timeout = LifecycleTestTimeoutMs)]
-    public Task StressTest_Clients_ConnectSendDisconnect_Cycles_Unreliable() => RunConnectSendDisconnectCyclesAsync(reliable: false);
+    [Fact]
+    public void StressTest_Clients_ConnectSendDisconnect_Cycles_Unreliable() => RunConnectSendDisconnectCycles(reliable: false);
 
-    private async Task RunRapidSendStressAsync(bool reliable)
+    private void RunRapidSendStress(bool reliable)
     {
         const int ClientCount = 2000;
         const int RapidSendsPerClient = 50;
@@ -65,30 +67,24 @@ public sealed class ConnectionStressTests
             }));
         }
 
-        using TestHarness.FailureObserver failureObserver = TestHarness.ObserveFailures([server, .. clients]);
+        SynapseManager[] allEngines = BuildEngineArray(server, clients);
+
+        using TestHarness.FailureObserver failureObserver = TestHarness.ObserveFailures(allEngines);
 
         try
         {
-            await server.StartAsync(CancellationToken.None);
+            server.Start();
 
             int connectedCount = 0;
             server.ConnectionEstablished += _ => Interlocked.Increment(ref connectedCount);
 
-            Task[] connectTasks = new Task[ClientCount];
-
             for (int i = 0; i < ClientCount; i++)
             {
-                int idx = i;
-                connectTasks[idx] = Task.Run(async () =>
-                {
-                    await clients[idx].StartAsync(CancellationToken.None);
-                    clientToServerConnections[idx] = await clients[idx].ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
-                });
+                clients[i].Start();
+                clientToServerConnections[i] = clients[i].Connect(new(IPAddress.Loopback, port));
             }
 
-            await Task.WhenAll(connectTasks);
-
-            Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref connectedCount) >= ClientCount, 30000),
+            Assert.True(TestHarness.PumpUntil(() => Volatile.Read(ref connectedCount) >= ClientCount, 60000, allEngines),
                 $"Only {connectedCount} / {ClientCount} clients connected within timeout.");
 
             int receivedCount = 0;
@@ -97,20 +93,30 @@ public sealed class ConnectionStressTests
             ArraySegment<byte> payload = new(sendBuffer);
             Stopwatch stopwatch = Stopwatch.StartNew();
 
-            for (int i = 0; i < ClientCount; i++)
+            // Interleave sends with a poll each round so the server's kernel receive buffer never overflows
+            // (single-threaded: the server can only drain when this thread polls it).
+            for (int s = 0; s < RapidSendsPerClient; s++)
             {
-                for (int s = 0; s < RapidSendsPerClient; s++)
-                    failureObserver.ObserveSend(clients[i].SendAsync(clientToServerConnections[i], payload, reliable, CancellationToken.None));
+                for (int i = 0; i < ClientCount; i++)
+                {
+                    clients[i].Send(clientToServerConnections[i], payload, reliable);
+
+                    // Drain the server incrementally so a large burst can't overflow its kernel receive buffer
+                    // before this single thread gets a chance to poll it (unreliable loss would be unrecoverable).
+                    if ((i & 255) == 255)
+                        server.Poll();
+                }
+
+                for (int e = 0; e < allEngines.Length; e++)
+                    allEngines[e].Poll();
             }
 
-            while (Volatile.Read(ref receivedCount) < expectedPackets && !failureObserver.HasFailures)
-                await Task.Delay(1).ConfigureAwait(false);
+            TestHarness.PumpUntil(() => Volatile.Read(ref receivedCount) >= expectedPackets || failureObserver.HasFailures, 90000, allEngines);
 
             stopwatch.Stop();
 
             double elapsedMs = stopwatch.Elapsed.TotalMilliseconds;
-            double elapsedSec = stopwatch.Elapsed.TotalSeconds;
-            double messagesPerSec = expectedPackets / elapsedSec;
+            double messagesPerSec = expectedPackets / stopwatch.Elapsed.TotalSeconds;
 
             _output.WriteLine($"Channel           : {(reliable ? "Reliable" : "Unreliable")}");
             _output.WriteLine($"Clients           : {ClientCount:N0}");
@@ -125,30 +131,24 @@ public sealed class ConnectionStressTests
         }
         finally
         {
-            await server.DisposeAsync();
-
-            Task[] disposeTasks = new Task[ClientCount];
+            server.Dispose();
 
             for (int i = 0; i < ClientCount; i++)
-                disposeTasks[i] = clients[i].DisposeAsync().AsTask();
-
-            await Task.WhenAll(disposeTasks);
+                clients[i].Dispose();
         }
     }
 
-    private async Task RunConnectSendDisconnectCyclesAsync(bool reliable)
+    private void RunConnectSendDisconnectCycles(bool reliable)
     {
         const int ClientCount = 2000;
         const int ReconnectSendsPerClient = 4;
         const int PayloadSize = 1000;
 
         const int CycleCount = 4;
-        const int ConnectWaitMs = 20000;
-        const int ReliableReceiveWaitMs = 60000;
-        const int UnreliableReceiveWaitMs = 15000;
-        int receiveWaitMs = reliable ? ReliableReceiveWaitMs : UnreliableReceiveWaitMs;
-        const int AckWaitMs = 10000;
-        const int DisconnectWaitMs = 20000;
+        const int ConnectWaitMs = 60000;
+        const int ReceiveWaitMs = 90000;
+        const int AckWaitMs = 60000;
+        const int DisconnectWaitMs = 60000;
         const int DisconnectDelayMilliseconds = 500;
 
         byte[] sendBuffer = new byte[PayloadSize];
@@ -171,20 +171,14 @@ public sealed class ConnectionStressTests
                 c.Reliable.MaximumRetries = 500;
             }));
 
+        SynapseManager[] allEngines = BuildEngineArray(server, clients);
+
         try
         {
-            await server.StartAsync(CancellationToken.None);
-
-            // Start all clients once; they reconnect each cycle.
-            Task[] startTasks = new Task[ClientCount];
+            server.Start();
 
             for (int i = 0; i < ClientCount; i++)
-            {
-                int idx = i;
-                startTasks[idx] = clients[idx].StartAsync(CancellationToken.None);
-            }
-
-            await Task.WhenAll(startTasks);
+                clients[i].Start();
 
             int totalConnectedCount = 0;
             int totalReceivedCount = 0;
@@ -193,86 +187,77 @@ public sealed class ConnectionStressTests
             server.ConnectionEstablished += _ => Interlocked.Increment(ref totalConnectedCount);
             server.PacketReceived += _ => Interlocked.Increment(ref totalReceivedCount);
 
-            // Client-side close is guaranteed: DisconnectAsync fires ConnectionClosed synchronously
+            // Client-side close is guaranteed: Disconnect fires ConnectionClosed synchronously
             // after removing the connection, regardless of whether the server received the packet.
             for (int i = 0; i < ClientCount; i++)
                 clients[i].ConnectionClosed += _ => Interlocked.Increment(ref totalClientClosedCount);
 
-            async Task RunCycleAsync()
+            void RunCycle()
             {
                 int connectTarget = totalConnectedCount + ClientCount;
                 int receiveTarget = totalReceivedCount + ClientCount * ReconnectSendsPerClient;
                 int closeTarget = totalClientClosedCount + ClientCount;
 
-                Task[] connectTasks = new Task[ClientCount];
-
                 for (int i = 0; i < ClientCount; i++)
-                {
-                    int idx = i;
-                    connectTasks[idx] = Task.Run(async () =>
-                        connections[idx] = await clients[idx].ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None));
-                }
+                    connections[i] = clients[i].Connect(new(IPAddress.Loopback, port));
 
-                await Task.WhenAll(connectTasks);
-
-                Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref totalConnectedCount) >= connectTarget, ConnectWaitMs),
+                Assert.True(TestHarness.PumpUntil(() => Volatile.Read(ref totalConnectedCount) >= connectTarget, ConnectWaitMs, allEngines),
                     $"Only {totalConnectedCount} / {connectTarget} clients connected.");
 
                 ArraySegment<byte> payload = new(sendBuffer);
 
-                for (int i = 0; i < ClientCount; i++)
+                for (int s = 0; s < ReconnectSendsPerClient; s++)
                 {
-                    for (int s = 0; s < ReconnectSendsPerClient; s++)
-                        _ = clients[i].SendAsync(connections[i], payload, reliable, CancellationToken.None);
+                    for (int i = 0; i < ClientCount; i++)
+                    {
+                        clients[i].Send(connections[i], payload, reliable);
+
+                        // Drain the server incrementally so a large burst (2000 × 1 KB) can't overflow its kernel
+                        // receive buffer before this single thread polls it — unreliable loss would be unrecoverable.
+                        if ((i & 255) == 255)
+                            server.Poll();
+                    }
+
+                    for (int e = 0; e < allEngines.Length; e++)
+                        allEngines[e].Poll();
                 }
 
-                Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref totalReceivedCount) >= receiveTarget, receiveWaitMs),
+                Assert.True(TestHarness.PumpUntil(() => Volatile.Read(ref totalReceivedCount) >= receiveTarget, ReceiveWaitMs, allEngines),
                     $"Only {totalReceivedCount} / {receiveTarget} packets received.");
 
                 if (reliable)
                 {
-                    Assert.True(await TestHarness.WaitFor(() =>
+                    Assert.True(TestHarness.PumpUntil(() =>
                     {
                         for (int i = 0; i < ClientCount; i++)
                         {
-                            if (!connections[i].PendingReliableQueue.IsEmpty)
+                            if (connections[i].PendingReliableQueue.Count != 0)
                                 return false;
                         }
 
                         return true;
-                    }, AckWaitMs), "Not all reliable sends were acknowledged within the ACK wait window.");
+                    }, AckWaitMs, allEngines), "Not all reliable sends were acknowledged within the ACK wait window.");
                 }
                 else
                 {
-                    await Task.Delay(DisconnectDelayMilliseconds);
+                    TestHarness.PumpFor(DisconnectDelayMilliseconds, allEngines);
                 }
-
-                Task[] disconnectTasks = new Task[ClientCount];
 
                 for (int i = 0; i < ClientCount; i++)
-                {
-                    int idx = i;
-                    disconnectTasks[idx] = clients[idx].DisconnectAsync(connections[idx], CancellationToken.None);
-                }
+                    clients[i].Disconnect(connections[i]);
 
-                await Task.WhenAll(disconnectTasks);
-
-                Assert.True(await TestHarness.WaitFor(() => Volatile.Read(ref totalClientClosedCount) >= closeTarget, DisconnectWaitMs),
+                Assert.True(TestHarness.PumpUntil(() => Volatile.Read(ref totalClientClosedCount) >= closeTarget, DisconnectWaitMs, allEngines),
                     $"Only {totalClientClosedCount} / {closeTarget} connections closed.");
             }
 
             // Warmup — primes object pools before GC baseline.
-            await RunCycleAsync();
+            RunCycle();
 
             GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: true);
             GC.WaitForPendingFinalizers();
             GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: true);
 
-            int gen0Before = GC.CollectionCount(0);
-            int gen1Before = GC.CollectionCount(1);
             int gen2Before = GC.CollectionCount(2);
-            int gen3Before = GC.CollectionCount(3);
-            int gen4Before = GC.CollectionCount(4);
 
             double[] cycleTimes = new double[CycleCount];
             Stopwatch totalStopwatch = Stopwatch.StartNew();
@@ -280,47 +265,41 @@ public sealed class ConnectionStressTests
             for (int cycle = 0; cycle < CycleCount; cycle++)
             {
                 Stopwatch cycleStopwatch = Stopwatch.StartNew();
-                await RunCycleAsync();
+                RunCycle();
                 cycleStopwatch.Stop();
                 cycleTimes[cycle] = cycleStopwatch.Elapsed.TotalMilliseconds;
             }
 
             totalStopwatch.Stop();
 
-            int gen0After = GC.CollectionCount(0);
-            int gen1After = GC.CollectionCount(1);
             int gen2After = GC.CollectionCount(2);
-            int gen3After = GC.CollectionCount(3);
-            int gen4After = GC.CollectionCount(4);
 
             _output.WriteLine($"Channel           : {(reliable ? "Reliable" : "Unreliable")}");
             _output.WriteLine($"Clients           : {ClientCount:N0}");
             _output.WriteLine($"Cycles            : {CycleCount}");
-            _output.WriteLine($"Sends per client  : {ReconnectSendsPerClient}");
-            _output.WriteLine($"Payload size      : {PayloadSize} bytes");
 
             for (int i = 0; i < CycleCount; i++)
                 _output.WriteLine($"Cycle {i + 1}           : {cycleTimes[i]:F2} ms");
 
             _output.WriteLine($"Total elapsed     : {totalStopwatch.Elapsed.TotalMilliseconds:F2} ms");
-            _output.WriteLine($"GC Gen0           : {gen0After - gen0Before}");
-            _output.WriteLine($"GC Gen1           : {gen1After - gen1Before}");
             _output.WriteLine($"GC Gen2           : {gen2After - gen2Before}");
-            _output.WriteLine($"GC Gen3           : {gen3After - gen3Before}");
-            _output.WriteLine($"GC Gen4           : {gen4After - gen4Before}");
 
             Assert.Equal(0, gen2After - gen2Before);
         }
         finally
         {
-            await server.DisposeAsync();
-
-            Task[] disposeTasks = new Task[ClientCount];
+            server.Dispose();
 
             for (int i = 0; i < ClientCount; i++)
-                disposeTasks[i] = clients[i].DisposeAsync().AsTask();
-
-            await Task.WhenAll(disposeTasks);
+                clients[i].Dispose();
         }
+    }
+
+    private static SynapseManager[] BuildEngineArray(SynapseManager server, SynapseManager[] clients)
+    {
+        SynapseManager[] allEngines = new SynapseManager[clients.Length + 1];
+        allEngines[0] = server;
+        Array.Copy(clients, 0, allEngines, 1, clients.Length);
+        return allEngines;
     }
 }

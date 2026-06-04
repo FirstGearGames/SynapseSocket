@@ -1,8 +1,6 @@
 using System;
 using System.Net;
 using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
 using Xunit;
@@ -12,8 +10,8 @@ namespace SynapseSocket.Tests.Lifecycle;
 
 public class HandshakeAndChannelTests
 {
-    private static async Task<(SynapseManager server, SynapseManager client, SynapseConnection synapseConnection,
-        TestHarness.EventRecorder serverEventRecorder, TestHarness.EventRecorder clientEventRecorder)> StartPair(Action<SynapseConfig>? tweak = null)
+    private static (SynapseManager server, SynapseManager client, SynapseConnection synapseConnection,
+        TestHarness.EventRecorder serverEventRecorder, TestHarness.EventRecorder clientEventRecorder) StartPair(Action<SynapseConfig>? tweak = null)
     {
         int port = TestHarness.GetFreePort();
         SynapseManager server = new(TestHarness.ServerConfig(port, tweak));
@@ -24,21 +22,21 @@ public class HandshakeAndChannelTests
         serverEventRecorder.Attach(server);
         clientEventRecorder.Attach(client);
 
-        await server.StartAsync(CancellationToken.None);
-        await client.StartAsync(CancellationToken.None);
+        server.Start();
+        client.Start();
 
-        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
-        await TestHarness.WaitFor(() => serverEventRecorder.ConnectionsEstablished >= 1 && clientEventRecorder.ConnectionsEstablished >= 1);
+        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        TestHarness.PumpUntil(() => serverEventRecorder.ConnectionsEstablished >= 1 && clientEventRecorder.ConnectionsEstablished >= 1, 2000, server, client);
 
         return (server, client, synapseConnection, serverEventRecorder, clientEventRecorder);
     }
 
     [Fact]
-    public async Task Handshake_Fires_ConnectionEstablished_On_Both_Sides()
+    public void Handshake_Fires_ConnectionEstablished_On_Both_Sides()
     {
-        (SynapseManager server, SynapseManager client, _, TestHarness.EventRecorder serverEventRecorder, TestHarness.EventRecorder clientEventRecorder) = await StartPair();
-        await using (server)
-        await using (client)
+        (SynapseManager server, SynapseManager client, _, TestHarness.EventRecorder serverEventRecorder, TestHarness.EventRecorder clientEventRecorder) = StartPair();
+        using (server)
+        using (client)
         {
             Assert.Equal(1, serverEventRecorder.ConnectionsEstablished);
             Assert.Equal(1, clientEventRecorder.ConnectionsEstablished);
@@ -46,14 +44,14 @@ public class HandshakeAndChannelTests
     }
 
     [Fact]
-    public async Task Unreliable_Payload_Is_Delivered()
+    public void Unreliable_Payload_Is_Delivered()
     {
-        (SynapseManager server, SynapseManager client, SynapseConnection synapseConnection, TestHarness.EventRecorder serverEventRecorder, _) = await StartPair();
-        await using (server)
-        await using (client)
+        (SynapseManager server, SynapseManager client, SynapseConnection synapseConnection, TestHarness.EventRecorder serverEventRecorder, _) = StartPair();
+        using (server)
+        using (client)
         {
-            await client.SendAsync(synapseConnection, Encoding.UTF8.GetBytes("hello"), isReliable: false, CancellationToken.None);
-            Assert.True(await TestHarness.WaitFor(() => serverEventRecorder.PacketsReceived >= 1),
+            client.Send(synapseConnection, Encoding.UTF8.GetBytes("hello"), isReliable: false);
+            Assert.True(TestHarness.PumpUntil(() => serverEventRecorder.PacketsReceived >= 1, 2000, server, client),
                 "server never received an unreliable packet");
 
             serverEventRecorder.Payloads.TryPeek(out byte[]? receivedPayload);
@@ -63,31 +61,31 @@ public class HandshakeAndChannelTests
     }
 
     [Fact]
-    public async Task Reliable_Payload_Is_Delivered_And_Acked()
+    public void Reliable_Payload_Is_Delivered_And_Acked()
     {
-        (SynapseManager server, SynapseManager client, SynapseConnection synapseConnection, TestHarness.EventRecorder serverEventRecorder, _) = await StartPair();
-        await using (server)
-        await using (client)
+        (SynapseManager server, SynapseManager client, SynapseConnection synapseConnection, TestHarness.EventRecorder serverEventRecorder, _) = StartPair();
+        using (server)
+        using (client)
         {
-            await client.SendAsync(synapseConnection, Encoding.UTF8.GetBytes("rel"), isReliable: true, CancellationToken.None);
-            Assert.True(await TestHarness.WaitFor(() => serverEventRecorder.PacketsReceived >= 1));
+            client.Send(synapseConnection, Encoding.UTF8.GetBytes("rel"), isReliable: true);
+            Assert.True(TestHarness.PumpUntil(() => serverEventRecorder.PacketsReceived >= 1, 2000, server, client));
         }
     }
 
     [Fact]
-    public async Task Reliable_Messages_Are_Delivered_In_Order()
+    public void Reliable_Messages_Are_Delivered_In_Order()
     {
-        (SynapseManager server, SynapseManager client, SynapseConnection synapseConnection, TestHarness.EventRecorder serverEventRecorder, _) = await StartPair();
-        await using (server)
-        await using (client)
+        (SynapseManager server, SynapseManager client, SynapseConnection synapseConnection, TestHarness.EventRecorder serverEventRecorder, _) = StartPair();
+        using (server)
+        using (client)
         {
             const int Count = 20;
             for (int i = 0; i < Count; i++)
             {
-                await client.SendAsync(synapseConnection, BitConverter.GetBytes(i), isReliable: true, CancellationToken.None);
+                client.Send(synapseConnection, BitConverter.GetBytes(i), isReliable: true);
             }
 
-            Assert.True(await TestHarness.WaitFor(() => serverEventRecorder.PacketsReceived >= Count, 4000));
+            Assert.True(TestHarness.PumpUntil(() => serverEventRecorder.PacketsReceived >= Count, 4000, server, client));
 
             int expectedIndex = 0;
             byte[][] receivedPayloads = [.. serverEventRecorder.Payloads];
@@ -100,42 +98,43 @@ public class HandshakeAndChannelTests
     }
 
     [Fact]
-    public async Task Server_Can_Echo_Reliably_From_Callback_Without_Deadlock()
+    public void Server_Can_Echo_Reliably_From_Callback()
     {
         int port = TestHarness.GetFreePort();
-        await using SynapseManager server = new(TestHarness.ServerConfig(port));
-        await using SynapseManager client = new(TestHarness.ClientConfig());
+        using SynapseManager server = new(TestHarness.ServerConfig(port));
+        using SynapseManager client = new(TestHarness.ClientConfig());
 
         SynapseManager serverRef = server;
-        server.PacketReceived += async (packetReceivedEventArgs) =>
+        server.PacketReceived += (packetReceivedEventArgs) =>
         {
-            await serverRef.SendAsync(packetReceivedEventArgs.Connection, Encoding.UTF8.GetBytes("pong"), isReliable: true, CancellationToken.None);
+            // Re-entrant reliable send from inside the receive callback — safe because the engine is single-threaded.
+            serverRef.Send(packetReceivedEventArgs.Connection, Encoding.UTF8.GetBytes("pong"), isReliable: true);
         };
 
         byte[]? clientReceivedPayload = null;
         client.PacketReceived += (packetReceivedEventArgs) => clientReceivedPayload = packetReceivedEventArgs.Payload.ToArray();
 
-        await server.StartAsync(CancellationToken.None);
-        await client.StartAsync(CancellationToken.None);
+        server.Start();
+        client.Start();
 
-        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
-        await TestHarness.WaitFor(() => synapseConnection.State == ConnectionState.Connected);
-        await client.SendAsync(synapseConnection, Encoding.UTF8.GetBytes("ping"), isReliable: true, CancellationToken.None);
+        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 2000, server, client);
+        client.Send(synapseConnection, Encoding.UTF8.GetBytes("ping"), isReliable: true);
 
-        Assert.True(await TestHarness.WaitFor(() => clientReceivedPayload != null, 3000));
+        Assert.True(TestHarness.PumpUntil(() => clientReceivedPayload != null, 3000, server, client));
         Assert.Equal("pong", Encoding.UTF8.GetString(clientReceivedPayload!));
     }
 
     [Fact]
-    public async Task Graceful_Disconnect_Fires_Events_On_Both_Sides()
+    public void Graceful_Disconnect_Fires_Events_On_Both_Sides()
     {
-        (SynapseManager server, SynapseManager client, SynapseConnection synapseConnection, TestHarness.EventRecorder serverEventRecorder, TestHarness.EventRecorder clientEventRecorder) = await StartPair();
-        await using (server)
-        await using (client)
+        (SynapseManager server, SynapseManager client, SynapseConnection synapseConnection, TestHarness.EventRecorder serverEventRecorder, TestHarness.EventRecorder clientEventRecorder) = StartPair();
+        using (server)
+        using (client)
         {
-            await client.DisconnectAsync(synapseConnection, CancellationToken.None);
-            Assert.True(await TestHarness.WaitFor(() => serverEventRecorder.ConnectionsClosed >= 1
-                && clientEventRecorder.ConnectionsClosed >= 1, 3000),
+            client.Disconnect(synapseConnection);
+            Assert.True(TestHarness.PumpUntil(() => serverEventRecorder.ConnectionsClosed >= 1
+                && clientEventRecorder.ConnectionsClosed >= 1, 3000, server, client),
                 "disconnect did not fire on both sides");
         }
     }

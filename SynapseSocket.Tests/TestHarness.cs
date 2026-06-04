@@ -3,7 +3,6 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
-using System.Threading.Tasks;
 using SynapseSocket.Core;
 using SynapseSocket.Core.Configuration;
 using SynapseSocket.Core.Events;
@@ -14,6 +13,11 @@ namespace SynapseSocket.Tests;
 /// Shared helpers for spinning up real loopback Synapse engines quickly
 /// inside tests. Everything is loopback-only and uses OS-assigned free
 /// ports so parallel test runs don't collide.
+/// <para>
+/// The engine is poll-driven: nothing is received and no maintenance runs unless the engine is polled. Tests
+/// therefore drive their engines with <see cref="PumpUntil"/> / <see cref="PumpFor"/> from the test thread,
+/// which keeps each engine single-threaded (the one valid usage model).
+/// </para>
 /// </summary>
 public static class TestHarness
 {
@@ -56,18 +60,45 @@ public static class TestHarness
     }
 
     /// <summary>
-    /// Polls <paramref name="condition"/> every 20 ms up to <paramref name="timeoutMs"/>.
-    /// Returns true if the condition ever became true; false on timeout.
+    /// Polls the given engines repeatedly until <paramref name="condition"/> is true or <paramref name="timeoutMs"/>
+    /// elapses. Returns true if the condition became true. This is how tests advance a poll-driven engine while
+    /// waiting for an asynchronous outcome (handshake, delivery, ACK, timeout, …).
     /// </summary>
-    public static async Task<bool> WaitFor(Func<bool> condition, int timeoutMs = 2000)
+    public static bool PumpUntil(Func<bool> condition, int timeoutMs, params SynapseManager[] engines)
     {
-        DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
-        while (DateTime.UtcNow < deadline)
+        long deadline = Environment.TickCount64 + timeoutMs;
+
+        while (Environment.TickCount64 < deadline)
         {
-            if (condition()) return true;
-            await Task.Delay(20).ConfigureAwait(false);
+            for (int i = 0; i < engines.Length; i++)
+                engines[i].Poll();
+
+            if (condition())
+                return true;
+
+            Thread.Sleep(1);
         }
+
+        for (int i = 0; i < engines.Length; i++)
+            engines[i].Poll();
+
         return condition();
+    }
+
+    /// <summary>
+    /// Polls the given engines for a fixed duration. Use where a test previously slept to let background work run.
+    /// </summary>
+    public static void PumpFor(int durationMs, params SynapseManager[] engines)
+    {
+        long deadline = Environment.TickCount64 + durationMs;
+
+        while (Environment.TickCount64 < deadline)
+        {
+            for (int i = 0; i < engines.Length; i++)
+                engines[i].Poll();
+
+            Thread.Sleep(1);
+        }
     }
 
     /// <summary>
@@ -145,11 +176,10 @@ public static class TestHarness
     }
 
     /// <summary>
-    /// Captures background-loop exceptions (via <c>SynapseManager.UnhandledException</c>),
-    /// connection-rejection failures (via <c>ConnectionFailed</c>), and any faulted
-    /// <c>SendAsync</c> Tasks handed to <see cref="ObserveSend"/>. Exists specifically because
-    /// tests commonly use <c>_ = SendAsync(...)</c> fire-and-forget, which otherwise swallows
-    /// both synchronous and asynchronous failures and hides real bugs behind the xUnit timeout.
+    /// Captures background-loop exceptions (via <c>SynapseManager.UnhandledException</c>) and
+    /// connection-rejection failures (via <c>ConnectionFailed</c>), plus any exception thrown by a send routed
+    /// through <see cref="RunSend"/>. Sends are synchronous now, so a failed send throws at the call site;
+    /// <see cref="RunSend"/> records it instead of aborting the test mid-loop.
     /// </summary>
     public sealed class FailureObserver : IDisposable
     {
@@ -179,23 +209,20 @@ public static class TestHarness
         }
 
         /// <summary>
-        /// Attach a fault-only continuation to <paramref name="sendTask"/> so that a faulted
-        /// <c>SendAsync</c> (synchronous or asynchronous) is recorded instead of vanishing.
-        /// Use in place of <c>_ = clients[i].SendAsync(...)</c>:
-        /// <c>observer.ObserveSend(clients[i].SendAsync(...));</c>
+        /// Runs a synchronous send, recording any exception it throws instead of letting it abort the caller.
+        /// Use in place of <c>client.Send(...)</c> when a transient send failure should be recorded, not thrown:
+        /// <c>observer.RunSend(() =&gt; client.Send(...));</c>
         /// </summary>
-        public void ObserveSend(Task sendTask)
+        public void RunSend(Action send)
         {
-            _ = sendTask.ContinueWith(static (completed, state) =>
+            try
             {
-                FailureObserver self = (FailureObserver)state!;
-
-                if (completed.Exception is AggregateException aggregateException)
-                {
-                    foreach (Exception inner in aggregateException.Flatten().InnerExceptions)
-                        self._failures.Add($"SendAsync faulted: {inner}");
-                }
-            }, this, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                send();
+            }
+            catch (Exception sendException)
+            {
+                _failures.Add($"Send faulted: {sendException}");
+            }
         }
 
         /// <summary>

@@ -1,8 +1,6 @@
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
-using System.Threading;
-using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
 using Xunit;
@@ -13,10 +11,10 @@ namespace SynapseSocket.Tests.Lifecycle;
 public class KeepAliveAndTimeoutTests
 {
     [Fact]
-    public async Task Idle_Connection_Times_Out_And_Fires_Timeout_Failure()
+    public void Idle_Connection_Times_Out_And_Fires_Timeout_Failure()
     {
         int port = TestHarness.GetFreePort();
-        await using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
+        using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
             c.Connection.KeepAliveIntervalMilliseconds = 10_000; // effectively never
             c.Connection.TimeoutMilliseconds = 300;
@@ -24,7 +22,7 @@ public class KeepAliveAndTimeoutTests
 
         TestHarness.EventRecorder eventRecorder = new();
         eventRecorder.Attach(server);
-        await server.StartAsync(CancellationToken.None);
+        server.Start();
 
         // Stand up a raw socket that pretends to handshake once and then
         // goes silent so the server times it out.
@@ -32,22 +30,22 @@ public class KeepAliveAndTimeoutTests
         byte[] handshakePacket = [0x03]; // PacketType.Handshake
         socket.SendTo(handshakePacket, new IPEndPoint(IPAddress.Loopback, port));
 
-        Assert.True(await TestHarness.WaitFor(() => eventRecorder.ConnectionsEstablished >= 1));
-        Assert.True(await TestHarness.WaitFor(
-                () => eventRecorder.ViolationReasons.Contains(ViolationReason.Timeout), 3000),
+        Assert.True(TestHarness.PumpUntil(() => eventRecorder.ConnectionsEstablished >= 1, 2000, server));
+        Assert.True(TestHarness.PumpUntil(
+                () => eventRecorder.ViolationReasons.Contains(ViolationReason.Timeout), 3000, server),
             "expected Timeout violation reason to be raised");
     }
 
     [Fact]
-    public async Task KeepAlive_Prevents_Timeout()
+    public void KeepAlive_Prevents_Timeout()
     {
         int port = TestHarness.GetFreePort();
-        await using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
+        using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
         {
             c.Connection.KeepAliveIntervalMilliseconds = 50;
             c.Connection.TimeoutMilliseconds = 500;
         }));
-        await using SynapseManager client = new(TestHarness.ClientConfig(c =>
+        using SynapseManager client = new(TestHarness.ClientConfig(c =>
         {
             c.Connection.KeepAliveIntervalMilliseconds = 50;
             c.Connection.TimeoutMilliseconds = 500;
@@ -56,14 +54,14 @@ public class KeepAliveAndTimeoutTests
         TestHarness.EventRecorder eventRecorder = new();
         eventRecorder.Attach(server);
 
-        await server.StartAsync(CancellationToken.None);
-        await client.StartAsync(CancellationToken.None);
+        server.Start();
+        client.Start();
 
-        SynapseConnection synapseConnection = await client.ConnectAsync(new(IPAddress.Loopback, port), CancellationToken.None);
-        await TestHarness.WaitFor(() => synapseConnection.State == ConnectionState.Connected);
+        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 2000, server, client);
 
-        // Wait longer than ConnectionTimeoutMilliseconds; keep-alive should keep both sides alive.
-        await Task.Delay(1500);
+        // Pump for longer than ConnectionTimeoutMilliseconds; keep-alive should keep both sides alive.
+        TestHarness.PumpFor(1500, server, client);
 
         Assert.DoesNotContain(ViolationReason.Timeout, eventRecorder.ViolationReasons);
         Assert.Equal(0, eventRecorder.ConnectionsClosed);
