@@ -1,7 +1,37 @@
 # SynapseSocket synchronous / poll-driven rework — design + plan
 
-**Status: IN PROGRESS — branch `poll-driven-rework` (off `main` @ a6d7492). `main` is intentionally
-left stable so the Nucleus project can keep consuming the current engine.**
+**Status: COMPLETE — branch `poll-driven-rework` (off `main` @ a6d7492), full solution builds (both
+TFMs) and the entire test suite passes (53/53). `main` is intentionally left stable so the Nucleus
+project can keep consuming the current engine until it adopts this branch.**
+
+## Outcome (validation)
+
+The rework is implemented and validated. The whole engine is now synchronous and poll-driven; each
+socket's lifecycle (receive, reassembly, reliable send/retransmit, teardown) is owned by the one
+thread that calls `Poll()`, so the concurrency that caused both problems is gone.
+
+- **Full test suite: 53/53 pass** (~1m17s), including the two failure modes that motivated the rework:
+  - `Stress/PayloadIntegrityStressTests` — **zero corruption** (the threadpool attempt reproducibly
+    poisoned `ArrayPool.Shared`; clean `main` was only flaky). Runs in ~1s now.
+  - `Stress/ConnectionStressTests` (2000 clients) — **zero loss, no starvation timeouts.**
+  - `Stress/GarbageCollectionTests` — steady-state send/receive triggers **no GC collections.**
+- **Implemented on this branch (commits):** sync send layer + deferred-queue latency sim; `IngressEngine.Drain()`;
+  sync maintenance/ACK; `SynapseManager.Start/Poll/Stop/Dispose` + sync `Send/SendRaw/Connect/Disconnect`;
+  tick-driven NAT punch; de-concurrency (plain `Dictionary`/`Queue`, no locks, no deferred-release);
+  `SynapseBeacon` + both demos + the full test suite migrated to the poll model.
+- **Public API is clean-sync** (no `*Async`, no `IAsyncDisposable`). Consumers drive engines with a
+  `Poll()` loop. **Nucleus must adopt `Poll()` + the renamed sync methods when it moves to this branch.**
+
+### One concession found during validation
+
+Single-threaded means sends and receives can't overlap, so a host must drain often enough that a
+large outbound burst doesn't overflow the peer's kernel receive buffer (`SO_RCVBUF`, default 1 MiB).
+The 2000-client stress tests interleave a server `Poll()` mid-burst to demonstrate this; document the
+"poll regularly / shard for scale" guidance for consumers.
+
+---
+
+## Original design + plan (as written before implementation)
 
 ## Why this rework
 
