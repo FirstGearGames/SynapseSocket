@@ -1,8 +1,6 @@
 using System;
 using System.Buffers;
 using System.Net;
-using System.Threading;
-using System.Threading.Tasks;
 using SynapseSocket.Packets;
 
 namespace SynapseSocket.Transport;
@@ -10,14 +8,14 @@ namespace SynapseSocket.Transport;
 /// <summary>
 /// Transmission Engine (Sender).
 /// Manages outgoing packet flow for both the unreliable and reliable channels.
-/// Immediate processing (no batching) per the spec's no-batching policy.
+/// Sends are synchronous and immediate per the engine's single-threaded poll model.
 /// </summary>
 public sealed partial class TransmissionEngine
 {
     /// <summary>
     /// Sends a minimal NAT probe (no payload) to open a NAT mapping on the remote side.
     /// </summary>
-    public Task SendNatProbeAsync(IPEndPoint target, CancellationToken cancellationToken)
+    public void SendNatProbe(IPEndPoint target)
     {
         const PacketType Type = PacketType.NatProbe;
 
@@ -25,14 +23,14 @@ public sealed partial class TransmissionEngine
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
 
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
-        return SendAndPoolBufferAsync(new(rentedBuffer, 0, headerSize), target, cancellationToken);
+        SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), target);
     }
 
     /// <summary>
     /// Sends a NAT challenge or challenge echo containing the provided token.
     /// Used both when issuing a challenge (server → initiator) and when echoing one (initiator → server).
     /// </summary>
-    public Task SendNatChallengeAsync(IPEndPoint target, ReadOnlySpan<byte> token, CancellationToken cancellationToken)
+    public void SendNatChallenge(IPEndPoint target, ReadOnlySpan<byte> token)
     {
         const PacketType Type = PacketType.NatChallenge;
 
@@ -43,6 +41,6 @@ public sealed partial class TransmissionEngine
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
         token.CopyTo(rentedBuffer.AsSpan(headerSize));
 
-        return SendAndPoolBufferAsync(new(rentedBuffer, 0, totalSize), target, cancellationToken);
+        SendAndPoolBuffer(new(rentedBuffer, 0, totalSize), target);
     }
 }

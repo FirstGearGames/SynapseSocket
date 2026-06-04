@@ -4,8 +4,6 @@ using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
-using System.Threading;
-using System.Threading.Tasks;
 using CodeBoost.Performance;
 using SynapseSocket.Connections;
 using SynapseSocket.Diagnostics;
@@ -17,7 +15,8 @@ namespace SynapseSocket.Transport;
 /// <summary>
 /// Transmission Engine (Sender).
 /// Manages outgoing packet flow for both the unreliable and reliable channels.
-/// Immediate processing (no batching) per the spec's no-batching policy.
+/// Sends are synchronous and immediate (blocking <see cref="Socket.SendTo(byte[], int, int, SocketFlags, EndPoint)"/>)
+/// — the engine is single-threaded and driven by the host's poll, so there are no async continuations.
 /// </summary>
 public sealed partial class TransmissionEngine
 {
@@ -45,6 +44,10 @@ public sealed partial class TransmissionEngine
     /// True if the LatencySimulator is enabled.
     /// </summary>
     private readonly bool _isLatencySimulatorEnabled;
+    /// <summary>
+    /// Cached delegate for <see cref="SendDirect"/>, handed to the latency simulator to avoid a per-call allocation.
+    /// </summary>
+    private readonly Action<ArraySegment<byte>, IPEndPoint> _sendDirect;
 
     /// <summary>
     /// Creates a new transmission engine bound to the given sockets.
@@ -63,20 +66,43 @@ public sealed partial class TransmissionEngine
 
         _latencySimulator = latency;
         _isLatencySimulatorEnabled = _latencySimulator.IsEnabled;
+        _sendDirect = SendDirect;
     }
 
     /// <summary>
-    /// Sends raw bytes to the target endpoint, routing through the latency simulator.
+    /// Sends raw bytes to the target endpoint, routing through the latency simulator when enabled.
     /// </summary>
     /// <param name="segment">The wire-ready bytes to send.</param>
     /// <param name="target">The remote endpoint to send to.</param>
-    /// <param name="cancellationToken">Token to cancel the operation.</param>
-    public Task SendRawAsync(ArraySegment<byte> segment, IPEndPoint target, CancellationToken cancellationToken)
+    public void SendRaw(ArraySegment<byte> segment, IPEndPoint target)
     {
         if (!_isLatencySimulatorEnabled)
-            return SendDirectAsync(segment, target);
+        {
+            SendDirect(segment, target);
+            return;
+        }
 
-        return _latencySimulator.ProcessAsync(segment, target, SendDirectAsync, cancellationToken);
+        _latencySimulator.Process(segment, target, DateTime.UtcNow.Ticks, _sendDirect);
+    }
+
+    /// <summary>
+    /// Releases any latency-simulator-delayed packets whose due time has elapsed. Called once per engine poll.
+    /// No-op when the simulator is disabled.
+    /// </summary>
+    /// <param name="nowTicks">Current time in <see cref="DateTime.Ticks"/>.</param>
+    public void FlushDeferredSends(long nowTicks)
+    {
+        if (_isLatencySimulatorEnabled)
+            _latencySimulator.Flush(nowTicks, _sendDirect);
+    }
+
+    /// <summary>
+    /// Returns any still-parked latency-simulator buffers to the pool. Called on engine shutdown.
+    /// </summary>
+    public void ClearDeferredSends()
+    {
+        if (_isLatencySimulatorEnabled)
+            _latencySimulator.Clear();
     }
 
     /// <summary>
@@ -85,8 +111,7 @@ public sealed partial class TransmissionEngine
     /// </summary>
     /// <param name="synapseConnection">The target connection.</param>
     /// <param name="payload">The application payload to send.</param>
-    /// <param name="cancellationToken">Token to cancel the send operation.</param>
-    internal async Task SendUnreliableUnsegmentedAsync(SynapseConnection synapseConnection, ArraySegment<byte> payload, CancellationToken cancellationToken)
+    internal void SendUnreliableUnsegmented(SynapseConnection synapseConnection, ArraySegment<byte> payload)
     {
         const PacketType Type = PacketType.None;
         int totalLength = PacketHeader.ComputeHeaderSize(Type) + payload.Count;
@@ -94,7 +119,7 @@ public sealed partial class TransmissionEngine
         try
         {
             int written = PacketHeader.BuildPacket(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0, payload.AsSpan());
-            await SendRawAsync(new(rentedBuffer, 0, written), synapseConnection.RemoteEndPoint, cancellationToken).ConfigureAwait(false);
+            SendRaw(new(rentedBuffer, 0, written), synapseConnection.RemoteEndPoint);
         }
         finally
         {
@@ -109,16 +134,12 @@ public sealed partial class TransmissionEngine
     /// </summary>
     /// <param name="synapseConnection">The target connection.</param>
     /// <param name="payload">The application payload to send reliably.</param>
-    /// <param name="cancellationToken">Token to cancel the send operation.</param>
-    internal async Task SendReliableUnsegmentedAsync(SynapseConnection synapseConnection, ArraySegment<byte> payload, CancellationToken cancellationToken)
+    internal void SendReliableUnsegmented(SynapseConnection synapseConnection, ArraySegment<byte> payload)
     {
         if (synapseConnection.PendingReliableQueue.Count >= _config.Reliable.MaximumPending)
             throw new InvalidOperationException("Reliable backpressure limit reached.");
 
-        ushort sequence;
-
-        lock (synapseConnection.ReliableLock)
-            sequence = synapseConnection.NextOutgoingSequence++;
+        ushort sequence = synapseConnection.NextOutgoingSequence++;
 
         const PacketType Type = PacketType.Reliable;
         int totalLength = PacketHeader.ComputeHeaderSize(Type) + payload.Count;
@@ -134,21 +155,20 @@ public sealed partial class TransmissionEngine
 
         synapseConnection.PendingReliableQueue[sequence] = pendingReliable;
 
-        await SendRawAsync(segments[0], synapseConnection.RemoteEndPoint, cancellationToken).ConfigureAwait(false);
+        SendRaw(segments[0], synapseConnection.RemoteEndPoint);
     }
 
     /// <summary>
     /// Splits a payload into wire-ready segments and sends them all.
     /// For reliable sends, the segment array is stored in <see cref="SynapseConnection.PendingReliable"/>
     /// and its lifetime is managed by the retransmission sweep and ACK handler.
-    /// For unreliable sends, the backing buffer is returned to the pool after the last send completes.
+    /// For unreliable sends, the backing buffer is returned to the pool after the last send.
     /// </summary>
     /// <param name="synapseConnection">The target connection.</param>
     /// <param name="payload">The application payload to split and send.</param>
     /// <param name="isReliable">True to send segments reliably with retransmission; false for unreliable delivery.</param>
     /// <param name="splitter">The <see cref="PacketSplitter"/> instance used to produce the segment array.</param>
-    /// <param name="cancellationToken">Token to cancel the send operations.</param>
-    internal async Task SendSegmentedAsync(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable, PacketSplitter splitter, CancellationToken cancellationToken)
+    internal void SendSegmented(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable, PacketSplitter splitter)
     {
         if (isReliable && synapseConnection.PendingReliableQueue.Count >= _config.Reliable.MaximumPending)
             throw new InvalidOperationException("Reliable backpressure limit reached.");
@@ -156,10 +176,7 @@ public sealed partial class TransmissionEngine
         ushort sequence = 0;
 
         if (isReliable)
-        {
-            lock (synapseConnection.ReliableLock)
-                sequence = synapseConnection.NextOutgoingSequence++;
-        }
+            sequence = synapseConnection.NextOutgoingSequence++;
 
         List<ArraySegment<byte>> segments = splitter.Split(payload.AsSpan(), isReliable, out int segmentCount, sequence, out byte[] backingBuffer);
 
@@ -171,59 +188,22 @@ public sealed partial class TransmissionEngine
             synapseConnection.PendingReliableQueue[sequence] = pendingReliable;
 
             // Segments are now owned by PendingReliable; do NOT return them here.
-            if (_isLatencySimulatorEnabled)
-            {
-                // Fire all segments concurrently so each receives an independent random delay,
-                // producing genuine out-of-order arrival at the receiver when ReorderChance > 0.
-                List<Task> sendTasks = ListPool<Task>.Rent();
-                try
-                {
-                    for (int i = 0; i < segments.Count; i++)
-                        sendTasks.Add(SendRawAsync(segments[i], synapseConnection.RemoteEndPoint, cancellationToken));
-                    await Task.WhenAll(sendTasks).ConfigureAwait(false);
-                }
-                finally
-                {
-                    ListPool<Task>.Return(sendTasks);
-                }
-            }
-            else
-            {
-                for (int i = 0; i < segments.Count; i++)
-                    await SendRawAsync(segments[i], synapseConnection.RemoteEndPoint, cancellationToken).ConfigureAwait(false);
-            }
+            // When the latency simulator is enabled it copies each segment, so an independent random
+            // delay per segment produces genuine out-of-order arrival at the receiver.
+            for (int i = 0; i < segments.Count; i++)
+                SendRaw(segments[i], synapseConnection.RemoteEndPoint);
         }
         // Unreliable does not need to retain buffers.
         else
         {
-            if (_isLatencySimulatorEnabled)
+            try
             {
-                // Fire all segments concurrently so each receives an independent random delay,
-                // producing genuine out-of-order arrival at the receiver when ReorderChance > 0.
-                List<Task> sendTasks = ListPool<Task>.Rent();
-                try
-                {
-                    for (int i = 0; i < segmentCount; i++)
-                        sendTasks.Add(SendRawAsync(segments[i], synapseConnection.RemoteEndPoint, cancellationToken));
-                    await Task.WhenAll(sendTasks).ConfigureAwait(false);
-                }
-                finally
-                {
-                    ListPool<Task>.Return(sendTasks);
-                    ArrayPool<byte>.Shared.Return(backingBuffer);
-                }
+                for (int i = 0; i < segmentCount; i++)
+                    SendRaw(segments[i], synapseConnection.RemoteEndPoint);
             }
-            else
+            finally
             {
-                try
-                {
-                    for (int i = 0; i < segmentCount; i++)
-                        await SendRawAsync(segments[i], synapseConnection.RemoteEndPoint, cancellationToken).ConfigureAwait(false);
-                }
-                finally
-                {
-                    ArrayPool<byte>.Shared.Return(backingBuffer);
-                }
+                ArrayPool<byte>.Shared.Return(backingBuffer);
             }
         }
     }
@@ -233,24 +213,20 @@ public sealed partial class TransmissionEngine
     /// </summary>
     /// <param name="synapseConnection">The connection to acknowledge.</param>
     /// <param name="sequence">The sequence number being acknowledged.</param>
-    /// <param name="cancellationToken">Token to cancel the send operation.</param>
-    /// <returns>A task that completes when the ACK packet has been handed to the socket.</returns>
-    public Task SendAckAsync(SynapseConnection synapseConnection, ushort sequence, CancellationToken cancellationToken)
+    public void SendAck(SynapseConnection synapseConnection, ushort sequence)
     {
         const PacketType Type = PacketType.Ack;
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, sequence, 0, 0, 0);
-        return SendAndPoolBufferAsync(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint, cancellationToken);
+        SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint);
     }
 
     /// <summary>
     /// Sends a handshake packet with an 8-byte cryptographic nonce in the payload.
     /// </summary>
     /// <param name="target">The remote endpoint to send the handshake to.</param>
-    /// <param name="cancellationToken">Token to cancel the send operation.</param>
-    /// <returns>A task that completes when the handshake packet has been handed to the socket.</returns>
-    public Task SendHandshakeAsync(IPEndPoint target, CancellationToken cancellationToken)
+    public void SendHandshake(IPEndPoint target)
     {
         const PacketType Type = PacketType.Handshake;
         const int NonceSize = 8;
@@ -259,37 +235,33 @@ public sealed partial class TransmissionEngine
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(totalSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
         RandomNumberGenerator.Fill(rentedBuffer.AsSpan(headerSize, NonceSize));
-        return SendAndPoolBufferAsync(new(rentedBuffer, 0, totalSize), target, cancellationToken);
+        SendAndPoolBuffer(new(rentedBuffer, 0, totalSize), target);
     }
 
     /// <summary>
     /// Sends a keep-alive heartbeat to the connection's remote endpoint.
     /// </summary>
     /// <param name="synapseConnection">The connection to send the heartbeat to.</param>
-    /// <param name="cancellationToken">Token to cancel the send operation.</param>
-    /// <returns>A task that completes when the keep-alive packet has been handed to the socket.</returns>
-    public Task SendKeepAliveAsync(SynapseConnection synapseConnection, CancellationToken cancellationToken)
+    public void SendKeepAlive(SynapseConnection synapseConnection)
     {
         const PacketType Type = PacketType.KeepAlive;
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
-        return SendAndPoolBufferAsync(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint, cancellationToken);
+        SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint);
     }
 
     /// <summary>
     /// Sends a disconnect notification to the connection's remote endpoint.
     /// </summary>
     /// <param name="synapseConnection">The connection being torn down.</param>
-    /// <param name="cancellationToken">Token to cancel the send operation.</param>
-    /// <returns>A task that completes when the disconnect packet has been handed to the socket.</returns>
-    public Task SendDisconnectAsync(SynapseConnection synapseConnection, CancellationToken cancellationToken)
+    public void SendDisconnect(SynapseConnection synapseConnection)
     {
         const PacketType Type = PacketType.Disconnect;
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
-        return SendAndPoolBufferAsync(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint, cancellationToken);
+        SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint);
     }
 
     /// <summary>
@@ -298,30 +270,24 @@ public sealed partial class TransmissionEngine
     /// </summary>
     /// <param name="segment">The packet data to send, including offset and length.</param>
     /// <param name="target">The remote endpoint to send to.</param>
-    private async Task SendDirectAsync(ArraySegment<byte> segment, IPEndPoint target)
+    private void SendDirect(ArraySegment<byte> segment, IPEndPoint target)
     {
         Socket socket = target.AddressFamily == AddressFamily.InterNetworkV6 && _ipv6Socket is not null ? _ipv6Socket : _ipv4Socket;
-        #if NET8_0_OR_GREATER
-        // ReadOnlyMemory<byte> + ValueTask overload; CancellationToken.None because SendDirectAsync has no token.
-        int bytesSent = await socket.SendToAsync(segment.AsMemory(), SocketFlags.None, target, CancellationToken.None).ConfigureAwait(false);
-        #else
-        int bytesSent = await socket.SendToAsync(segment, SocketFlags.None, target).ConfigureAwait(false);
-        #endif
+        int bytesSent = socket.SendTo(segment.Array!, segment.Offset, segment.Count, SocketFlags.None, target);
         _telemetry.OnSent(bytesSent);
     }
 
     /// <summary>
-    /// Sends a packet and returns its backing buffer to the shared <see cref="ArrayPool{T}"/>
-    /// once the send completes, guaranteeing the rental is returned even if an exception occurs.
+    /// Sends a packet and returns its backing buffer to the shared <see cref="ArrayPool{T}"/> afterwards,
+    /// guaranteeing the rental is returned even if the send throws.
     /// </summary>
     /// <param name="segment">The wire-ready bytes to send; <see cref="ArraySegment{T}.Array"/> is returned to the pool after sending.</param>
     /// <param name="target">The remote endpoint to send to.</param>
-    /// <param name="cancellationToken">Token to cancel the send operation.</param>
-    private async Task SendAndPoolBufferAsync(ArraySegment<byte> segment, IPEndPoint target, CancellationToken cancellationToken)
+    private void SendAndPoolBuffer(ArraySegment<byte> segment, IPEndPoint target)
     {
         try
         {
-            await SendRawAsync(segment, target, cancellationToken).ConfigureAwait(false);
+            SendRaw(segment, target);
         }
         finally
         {

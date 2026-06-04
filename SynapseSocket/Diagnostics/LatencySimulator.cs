@@ -1,8 +1,7 @@
 using System;
 using System.Buffers;
+using System.Collections.Generic;
 using System.Net;
-using System.Threading;
-using System.Threading.Tasks;
 using SynapseSocket.Core.Configuration;
 using SynapseSocket.Packets;
 
@@ -11,6 +10,12 @@ namespace SynapseSocket.Diagnostics;
 /// <summary>
 /// Optional middleware for testing network degradation.
 /// Adds latency, jitter, out-of-order delivery, and packet loss to outgoing packets.
+/// <para>
+/// In the synchronous/poll-driven engine this never blocks the sender: a packet that should be
+/// delayed is copied into a private buffer and parked on an internal queue, then released by
+/// <see cref="Flush"/> when its due time elapses. <see cref="Flush"/> is driven from the engine's
+/// poll, so the simulator runs entirely on the engine's single thread — no timers, no Tasks.
+/// </para>
 /// </summary>
 public sealed class LatencySimulator
 {
@@ -25,19 +30,29 @@ public sealed class LatencySimulator
     private readonly LatencySimulatorConfig _config;
 
     /// <summary>
-    /// Per-thread <see cref="Random"/> instance. <see cref="Random"/> is not thread-safe,
-    /// and <see cref="ProcessAsync"/> is called concurrently from many send paths.
-    /// Using a thread-local avoids locking while still giving each thread independent state.
-    /// Minor statistical imperfection (e.g., occasional repeats across threads) is acceptable
-    /// for a latency simulator.
+    /// Packets parked for delayed release, in insertion order. Drained by <see cref="Flush"/> on the
+    /// engine's poll thread. The engine is single-threaded, so no synchronization is required.
     /// </summary>
-    [ThreadStatic]
-    private static Random? _threadRandom;
+    private readonly List<Deferred> _deferred = [];
 
     /// <summary>
-    /// Lazily initializes and returns the per-thread <see cref="Random"/>.
+    /// A single outbound packet awaiting its release time. <see cref="Buffer"/> is a private rental
+    /// (the caller's backing array may be recycled before the delay elapses), returned to the pool
+    /// once the packet is released.
     /// </summary>
-    private static Random ThreadRandom => _threadRandom ??= new(unchecked(Environment.TickCount * 397) ^ Environment.CurrentManagedThreadId);
+    private struct Deferred
+    {
+        public byte[] Buffer;
+        public int Count;
+        public IPEndPoint Target;
+        public long DueTicks;
+    }
+
+    /// <summary>
+    /// Random source for loss/jitter/reorder rolls. The engine drives the simulator from one thread,
+    /// so a single instance is sufficient.
+    /// </summary>
+    private readonly Random _random = new();
 
     /// <summary>
     /// Creates a simulator from the provided configuration.
@@ -49,15 +64,15 @@ public sealed class LatencySimulator
     }
 
     /// <summary>
-    /// Processes an outbound packet through the simulator.
-    /// The sender function is invoked after the computed delay unless the packet is dropped.
+    /// Routes an outbound packet through the simulator. Connection-setup packets bypass the simulator
+    /// and are sent immediately; in-session packets may be dropped, sent immediately, or parked for
+    /// later release by <see cref="Flush"/>.
     /// </summary>
     /// <param name="segment">The packet data to send, including offset and length.</param>
     /// <param name="target">The remote endpoint the packet is addressed to.</param>
-    /// <param name="sender">The underlying send function to invoke after any simulated delay.</param>
-    /// <param name="cancellationToken">Token used to cancel the delayed send.</param>
-    /// <returns>A task that completes when the packet has been passed to <paramref name="sender"/> or dropped.</returns>
-    public Task ProcessAsync(ArraySegment<byte> segment, IPEndPoint target, Func<ArraySegment<byte>, IPEndPoint, Task> sender, CancellationToken cancellationToken)
+    /// <param name="nowTicks">Current time in <see cref="DateTime.Ticks"/>, used to compute the release time.</param>
+    /// <param name="sender">The underlying send function, invoked now for non-delayed packets.</param>
+    public void Process(ArraySegment<byte> segment, IPEndPoint target, long nowTicks, Action<ArraySegment<byte>, IPEndPoint> sender)
     {
         // Handshake and NAT setup packets bypass the sim — they represent connection
         // establishment, not in-session traffic, so loss/delay here would prevent
@@ -66,52 +81,81 @@ public sealed class LatencySimulator
         {
             PacketType type = (PacketType)segment.Array[segment.Offset];
             if (type is PacketType.Handshake or PacketType.NatProbe or PacketType.NatChallenge)
-                return sender(segment, target);
+            {
+                sender(segment, target);
+                return;
+            }
         }
 
-        Random random = ThreadRandom;
-        double lossRoll = random.NextDouble();
-        int jitter = _config.JitterMilliseconds > 0 ? random.Next(0, (int)_config.JitterMilliseconds) : 0;
+        double lossRoll = _random.NextDouble();
+        int jitter = _config.JitterMilliseconds > 0 ? _random.Next(0, (int)_config.JitterMilliseconds) : 0;
         int delayMilliseconds = (int)_config.BaseLatencyMilliseconds + jitter;
 
-        if (_config.ReorderChance > 0 && random.NextDouble() < _config.ReorderChance)
-            delayMilliseconds += _config.OutOfOrderExtraDelayMilliseconds > 0 ? random.Next(0, (int)_config.OutOfOrderExtraDelayMilliseconds) : 0;
+        if (_config.ReorderChance > 0 && _random.NextDouble() < _config.ReorderChance)
+            delayMilliseconds += _config.OutOfOrderExtraDelayMilliseconds > 0 ? _random.Next(0, (int)_config.OutOfOrderExtraDelayMilliseconds) : 0;
 
         if (lossRoll < _config.PacketLossChance)
-            return Task.CompletedTask;
+            return;
 
-        return DelayedSendAsync(segment, target, sender, delayMilliseconds, cancellationToken);
+        if (delayMilliseconds <= 0)
+        {
+            sender(segment, target);
+            return;
+        }
+
+        // Copy into a private buffer: the caller's backing array may be returned to the pool
+        // (e.g. on reliable-packet ACK) before the delay elapses, which would corrupt in-flight data.
+        byte[] owned = ArrayPool<byte>.Shared.Rent(segment.Count);
+        segment.AsSpan().CopyTo(owned);
+
+        _deferred.Add(new Deferred
+        {
+            Buffer = owned,
+            Count = segment.Count,
+            Target = target,
+            DueTicks = nowTicks + delayMilliseconds * TimeSpan.TicksPerMillisecond
+        });
     }
 
     /// <summary>
-    /// Copies <paramref name="segment"/> into a private rented buffer, waits for the
-    /// specified delay, then invokes the sender function and returns the buffer to the pool.
-    /// The copy is required because the caller's backing array may be returned to
-    /// <see cref="ArrayPool{T}.Shared"/> (e.g. on reliable-packet ACK) before the delay
-    /// elapses, which would corrupt the in-flight data.
+    /// Releases every parked packet whose due time has elapsed, sending it via <paramref name="sender"/>
+    /// and returning its private buffer to the pool. Called once per engine poll.
     /// </summary>
-    /// <param name="segment">The packet data to send, including offset and length.</param>
-    /// <param name="target">The remote endpoint the packet is addressed to.</param>
-    /// <param name="sender">The underlying send function to invoke after the delay.</param>
-    /// <param name="delayMilliseconds">Milliseconds to wait before sending.</param>
-    /// <param name="cancellationToken">Token used to cancel the delay.</param>
-    /// <returns>A task that completes when the delayed send has finished.</returns>
-    private static async Task DelayedSendAsync(ArraySegment<byte> segment, IPEndPoint target, Func<ArraySegment<byte>, IPEndPoint, Task> sender, int delayMilliseconds, CancellationToken cancellationToken)
+    /// <param name="nowTicks">Current time in <see cref="DateTime.Ticks"/>.</param>
+    /// <param name="sender">The underlying send function.</param>
+    public void Flush(long nowTicks, Action<ArraySegment<byte>, IPEndPoint> sender)
     {
-        byte[] owned = ArrayPool<byte>.Shared.Rent(segment.Count);
-        segment.AsSpan().CopyTo(owned);
-        ArraySegment<byte> ownedSegment = new(owned, 0, segment.Count);
+        int writeIndex = 0;
 
-        try
+        for (int readIndex = 0; readIndex < _deferred.Count; readIndex++)
         {
-            if (delayMilliseconds > 0)
-                await Task.Delay(delayMilliseconds, cancellationToken).ConfigureAwait(false);
+            Deferred deferred = _deferred[readIndex];
 
-            await sender(ownedSegment, target).ConfigureAwait(false);
+            if (deferred.DueTicks <= nowTicks)
+            {
+                sender(new ArraySegment<byte>(deferred.Buffer, 0, deferred.Count), deferred.Target);
+                ArrayPool<byte>.Shared.Return(deferred.Buffer);
+            }
+            else
+            {
+                // Keep the not-yet-due entry, compacting toward the front to preserve insertion order.
+                _deferred[writeIndex++] = deferred;
+            }
         }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(owned);
-        }
+
+        if (writeIndex < _deferred.Count)
+            _deferred.RemoveRange(writeIndex, _deferred.Count - writeIndex);
+    }
+
+    /// <summary>
+    /// Returns all parked buffers to the pool and clears the queue. Called on engine shutdown so no
+    /// rented buffers are leaked when packets are still awaiting release.
+    /// </summary>
+    public void Clear()
+    {
+        foreach (Deferred deferred in _deferred)
+            ArrayPool<byte>.Shared.Return(deferred.Buffer);
+
+        _deferred.Clear();
     }
 }
