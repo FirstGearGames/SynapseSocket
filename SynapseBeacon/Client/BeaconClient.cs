@@ -302,16 +302,20 @@ public sealed class BeaconClient : IDisposable
     /// <summary>
     /// Sends a rented buffer to the beacon server and returns it to the pool once the send completes.
     /// </summary>
-    private async Task SendAndReturnAsync(byte[] buffer, int length, CancellationToken cancellationToken)
+    private Task SendAndReturnAsync(byte[] buffer, int length, CancellationToken cancellationToken)
     {
         try
         {
-            await _synapse.SendRawAsync(_serverEndPoint, new(buffer, 0, length), cancellationToken).ConfigureAwait(false);
+            // SynapseManager.SendRaw is synchronous (the engine is poll-driven); the surrounding beacon API stays
+            // async because it awaits server responses elsewhere.
+            _synapse.SendRaw(_serverEndPoint, new(buffer, 0, length));
         }
         finally
         {
             ArrayPool<byte>.Shared.Return(buffer);
         }
+
+        return Task.CompletedTask;
     }
 
     /// <summary>
