@@ -1,8 +1,13 @@
 # SynapseSocket threadpool-starvation hardening — handoff
 
-**Status: OPEN — analysis + recommendation only. No SynapseSocket code changed yet.**
+**Status: CLOSED — implementation attempted, then superseded by a synchronous/poll-driven rework.**
+**The threadpool-hardening WIP described in "Recommended changes" was implemented on branch
+`backup/threadpool-hardening-attempt` and abandoned. See "## OUTCOME" at the bottom for why, and
+`docs/SYNCHRONOUS_POLL_REWORK.md` (on `main`) for the replacement direction.**
 
-This is a resumable handoff. A fresh session can pick the work up by reading this file top-to-bottom, then opening the files referenced under "Where it lives," then doing the work under "Recommended changes" and "How to verify." Nothing here has been implemented; the engine is byte-correct as-is (see "Why this is a perf/robustness issue, not a correctness bug").
+This was a resumable handoff for the threadpool-hardening approach. The analysis below remains accurate
+about the *starvation* mechanism, but the recommended fix (moving the receive loop off the shared pool)
+turned out to have a hard correctness blocker — see the OUTCOME section.
 
 ---
 
@@ -64,3 +69,44 @@ The loops are genuinely `async` and release their thread on every `await` (the r
 - **Done:** root-caused the Nucleus corruption (engine exonerated); documented the starvation mechanism and the concrete hardening direction here. No SynapseSocket code changed.
 - **Next (resume here):** implement recommendation #1 (dedicated receive thread + cancellable/disposable shutdown), then #2, then re-verify under parallel load. Engine source is otherwise unchanged.
 - **Related context:** Nucleus repo `Docs/synapse-buffer-investigation.md` (the corruption resolution and why the engine is exonerated). The Nucleus-side fix already makes off-loop send completions safe for Nucleus, so this hardening is a pure perf/robustness improvement, not a correctness prerequisite.
+
+---
+
+## OUTCOME (2026-06-04) — attempted, then abandoned for a rework
+
+Recommendation #1 (+ a cooperative bounded overflow pool, the user's "dedicate-up-to-a-cap then
+consolidate" refinement) **was implemented** and is preserved on branch
+`backup/threadpool-hardening-attempt`:
+
+- `SynapseSocket/Core/ReceiveDispatcher.cs` (new): process-wide dedicated-thread budget +
+  `BoundedTaskScheduler` (cooperative bounded pool for overflow receive loops).
+- `IngressEngine.StartAsync`/`ReceiveLoop`/`ReceiveLoopAsync`: dual receive path (dedicated blocking
+  thread up to the cap, else async on the bounded pool); receive await made cancellable.
+- `SynapseManager.MaxDedicatedReceiveThreads` (new public static knob).
+- `ConnectionManager`: a **real, standalone fix** — `_connections` (a plain `List`) had concurrent
+  writers (ingress add vs. maintenance timeout-remove) and racy sweep reads; now guarded by a lock with
+  a `TryGetConnectionAt` accessor. Worth salvaging independently of the rest.
+
+### Why it was abandoned
+
+In isolation every test passes. But under the **full parallel stress suite** the change reproducibly
+causes **payload corruption** — shared-`ArrayPool` poisoning, `ARRIVED-CORRUPT`/`DEFERRED-ALIASED`, and
+impossible reassembled lengths (e.g. 1403, 5965 bytes). The clean baseline shows only benign
+load-induced packet loss, **never corruption**. Confirmed it is not specific to the dedicated threads:
+forcing every receive loop onto the cooperative pool corrupts too.
+
+**Root cause:** moving the receive loop off the shared `ThreadPool` — by *any* mechanism — perturbs
+timing enough to surface **latent teardown-vs-receive data races on the engine's pooled objects.** The
+`PacketReassembler`/`PacketSplitter` are returned to a shared `ResettableObjectPool` on teardown
+(`ReturnConnectionSegmenters`/`ResetForReconnect`/`OnReturn`) while a receive thread may still be
+mid-`TryReassemble`; another connection then re-rents that reassembler and two receive paths corrupt
+its state — producing the impossible reassembled lengths. The deferred reliable-buffer release has the
+same shape. These are **pre-existing** races (clean `main` keeps them dormant by accident of timing),
+not introduced by the receive-loop change, but reliably triggered by it.
+
+So the receive-loop change is **not** the "pure perf/robustness, no correctness prerequisite" this doc
+assumed — it has a real prerequisite: the engine's pooled-object/teardown concurrency must be
+race-free. Rather than patch those delicate multi-threaded races, the decision was to **remove the
+concurrency entirely** by moving to a synchronous send + poll-driven (sharded, single-threaded-per-
+socket) model. That kills both the starvation (no background loops on the pool) and the corruption
+(no cross-thread access to pooled state). See `docs/SYNCHRONOUS_POLL_REWORK.md`.
