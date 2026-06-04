@@ -30,7 +30,7 @@ internal sealed partial class IngressEngine
     /// Handles an inbound NAT probe from an unrecognised endpoint.
     /// Responds with a challenge token instead of a handshake, subject to per-IP rate limiting.
     /// </summary>
-    private void ProcessNatProbe(IPEndPoint fromEndPoint, CancellationToken cancellationToken)
+    private void ProcessNatProbe(IPEndPoint fromEndPoint)
     {
         if (!_isNatEnabled)
             return;
@@ -67,7 +67,7 @@ internal sealed partial class IngressEngine
 
         Span<byte> token = stackalloc byte[NatTokenSize];
         ComputeNatToken(fromEndPoint, nowTicks / NatTokenTimeBucketTicks, token);
-        _ = _sender.SendNatChallengeAsync(fromEndPoint, token, cancellationToken);
+        _sender.SendNatChallenge(fromEndPoint, token);
     }
 
     /// <summary>
@@ -75,7 +75,7 @@ internal sealed partial class IngressEngine
     /// If the payload matches a token this engine issued, sends a handshake (completing the probe exchange).
     /// Otherwise echoes the token back — this is the initiator side of a simultaneous P2P probe.
     /// </summary>
-    private void ProcessNatChallengeExchange(IPEndPoint fromEndPoint, ReadOnlySpan<byte> payload, CancellationToken cancellationToken)
+    private void ProcessNatChallengeExchange(IPEndPoint fromEndPoint, ReadOnlySpan<byte> payload)
     {
         if (!_isNatEnabled)
             return;
@@ -103,9 +103,9 @@ internal sealed partial class IngressEngine
         _natProbeLastResponseTicks[addressKey] = nowTicks;
 
         if (VerifyNatToken(fromEndPoint, payload))
-            _ = _sender.SendHandshakeAsync(fromEndPoint, cancellationToken);
+            _sender.SendHandshake(fromEndPoint);
         else
-            _ = _sender.SendNatChallengeAsync(fromEndPoint, payload, cancellationToken);
+            _sender.SendNatChallenge(fromEndPoint, payload);
     }
 
     /// <summary>

@@ -179,133 +179,166 @@ internal sealed partial class IngressEngine
     }
 
     /// <summary>
-    /// Starts the async receive loop on the thread pool.
+    /// Maximum UDP datagram size. The engine always receives into a buffer this large so that oversized datagrams
+    /// are not silently truncated by the kernel — the security layer must see them to raise an Oversized violation.
     /// </summary>
-    /// <param name="cancellationToken">Token that signals the receive loop to stop.</param>
-    /// <returns>A task that completes when the receive loop exits.</returns>
-    public Task StartAsync(CancellationToken cancellationToken)
+    private const int MaximumUdpDatagramSize = 65535;
+    /// <summary>
+    /// Receive buffer rented for this engine's lifetime and reused across every <see cref="Drain"/>.
+    /// </summary>
+    private byte[]? _receiveBuffer;
+    /// <summary>
+    /// Wildcard source endpoint handed (by ref) to each blocking receive; the kernel overwrites it with the sender.
+    /// </summary>
+    private EndPoint? _anyEndPoint;
+
+    /// <summary>
+    /// Allocates the receive buffer and marks the engine running. Called once by the manager before the first poll.
+    /// </summary>
+    public void Start()
     {
+        _anyEndPoint = _socket.AddressFamily == AddressFamily.InterNetworkV6 ? new IPEndPoint(IPAddress.IPv6Any, 0) : new IPEndPoint(IPAddress.Any, 0);
+        _receiveBuffer = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
         IsRunning = true;
-        return Task.Run(() => ReceiveLoopAsync(cancellationToken), cancellationToken);
     }
 
     /// <summary>
-    /// Core receive loop: awaits datagrams, runs lowest-level filters, and dispatches to packet handlers.
-    /// Runs until <paramref name="cancellationToken"/> is cancelled or the socket is disposed.
+    /// Marks the engine stopped and returns the receive buffer to the pool.
     /// </summary>
-    /// <param name="cancellationToken">Token that signals the loop to exit cleanly.</param>
-    private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
+    public void Stop()
     {
-        EndPoint anyEndPoint = _socket.AddressFamily == AddressFamily.InterNetworkV6 ? new(IPAddress.IPv6Any, 0) : new IPEndPoint(IPAddress.Any, 0);
+        IsRunning = false;
 
-        // Always receive into a max-UDP-sized buffer so that oversized datagrams are not silently truncated by the kernel — we want to see them so the security layer can raise an Oversized violation.
-        const int MaximumUdpDatagramSize = 65535;
-        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
-
-        while (!cancellationToken.IsCancellationRequested)
+        if (_receiveBuffer is not null)
         {
+            ArrayPool<byte>.Shared.Return(_receiveBuffer, clearArray: false);
+            _receiveBuffer = null;
+        }
+    }
+
+    /// <summary>
+    /// Drains every datagram currently buffered on the socket, running lowest-level filters and dispatching each
+    /// to the packet handlers inline. Called once per engine poll on the host's thread; returns when the socket
+    /// has nothing more to read. The kernel receive buffer (SO_RCVBUF) bounds how much can accumulate between polls.
+    /// </summary>
+    public void Drain()
+    {
+        if (_receiveBuffer is null)
+            return;
+
+        while (true)
+        {
+            int receivedLength;
+            EndPoint remoteEndPoint = _anyEndPoint!;
+
             try
             {
-                SocketReceiveFromResult socketReceiveResult;
-                try
-                {
-                    #if NET8_0_OR_GREATER
-                    // Memory<byte> overload returns ValueTask<SocketReceiveFromResult>; no per-call Task allocation on synchronous completions.
-                    socketReceiveResult = await _socket.ReceiveFromAsync(rentedBuffer.AsMemory(0, MaximumUdpDatagramSize), SocketFlags.None, anyEndPoint, CancellationToken.None).ConfigureAwait(false);
-                    #else
-                    socketReceiveResult = await _socket.ReceiveFromAsync(new(rentedBuffer, 0, MaximumUdpDatagramSize), SocketFlags.None, anyEndPoint).ConfigureAwait(false);
-                    #endif
-                }
-                catch (ObjectDisposedException)
-                {
+                // Poll(0) returns immediately: true when a datagram is ready (or the socket is closed), false when
+                // there is nothing to read. The socket stays in blocking mode, so sends are unaffected, and because
+                // the engine is single-threaded a readable result guarantees ReceiveFrom will not block.
+                if (!_socket.Poll(0, SelectMode.SelectRead))
                     break;
-                }
-                catch (SocketException socketException) when (socketException.SocketErrorCode == SocketError.MessageSize)
-                {
-                    // Datagram larger than our buffer (should not happen with 64K, but be defensive).
-                    // Report as oversized from unknown endpoint.
-                    ViolationOccurred?.Invoke(new(IPAddress.Any, 0), 0, ViolationReason.Oversized, 0, "MessageSize", ViolationAction.KickAndBlacklist);
-                    continue;
-                }
-                catch (SocketException)
-                {
-                    continue;
-                }
 
-                IPEndPoint fromEndPoint = (IPEndPoint)socketReceiveResult.RemoteEndPoint;
-                int receivedLength = socketReceiveResult.ReceivedBytes;
-                long nowTicks = DateTime.UtcNow.Ticks;
-
-                // Lowest-level mitigation first, before any copy.
-                // Established connections skip signature recomputation and blacklist lookup — those only apply at handshake time. Size and rate-limit checks still run for all senders.
-                FilterResult filterResult;
-                ulong signature;
-
-                bool isEstablished = _connections.ConnectionsByEndPoint.TryGetValue(fromEndPoint, out SynapseConnection? synapseConnection);
-
-                if (isEstablished)
-                {
-                    signature = synapseConnection!.Signature;
-                    filterResult = _security.InspectEstablished(synapseConnection, receivedLength);
-                }
-                else
-                    filterResult = _security.InspectNew(fromEndPoint, receivedLength, out signature);
-
-                if (filterResult is FilterResult.Allowed)
-                {
-                     _telemetry.OnReceived(receivedLength);
-                    ProcessPacket(rentedBuffer, receivedLength, fromEndPoint, synapseConnection, nowTicks, cancellationToken);
-                }
-                else
-                {
-                    _telemetry.OnSecurityDroppedReceived();
-
-                    if (filterResult is FilterResult.Blacklisted)
-                    {
-                        // Blacklisted = REJECTION, not a per-packet violation.
-                        // The peer is already known-bad; surface a connection-rejected event.
-                        ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.Blacklisted, filterResult.ToString());
-                        continue;
-                    }
-
-                    ViolationReason violationReason = filterResult switch
-                    {
-                        FilterResult.Oversized => ViolationReason.Oversized,
-                        FilterResult.RateLimited => ViolationReason.RateLimitExceeded,
-                        _ => ViolationReason.Malformed
-                    };
-                    
-                    ViolationOccurred?.Invoke(fromEndPoint, signature, violationReason, receivedLength, filterResult.ToString(), ViolationAction.KickAndBlacklist);
-                }
+                receivedLength = _socket.ReceiveFrom(_receiveBuffer, 0, MaximumUdpDatagramSize, SocketFlags.None, ref remoteEndPoint);
             }
-            catch (OperationCanceledException)
+            catch (ObjectDisposedException)
             {
-                // Shutdown in progress - exit cleanly.
                 break;
+            }
+            catch (SocketException socketException) when (socketException.SocketErrorCode is SocketError.Interrupted or SocketError.OperationAborted or SocketError.NotSocket)
+            {
+                // Socket closed during shutdown.
+                break;
+            }
+            catch (SocketException socketException) when (socketException.SocketErrorCode == SocketError.MessageSize)
+            {
+                // Datagram larger than our buffer (should not happen with 64K, but be defensive).
+                ViolationOccurred?.Invoke(new(IPAddress.Any, 0), 0, ViolationReason.Oversized, 0, "MessageSize", ViolationAction.KickAndBlacklist);
+                continue;
+            }
+            catch (SocketException)
+            {
+                // Datagram-specific error (e.g. a prior ICMP port-unreachable surfacing as ConnectionReset). Skip it.
+                continue;
             }
             catch (Exception unexpectedException)
             {
-                // Unexpected bug in the processing path. Surface it and keep the loop alive so a single bad packet cannot silently kill the receive loop.
+                UnhandledException?.Invoke(unexpectedException);
+                continue;
+            }
+
+            try
+            {
+                HandleDatagram(_receiveBuffer, receivedLength, (IPEndPoint)remoteEndPoint);
+            }
+            catch (Exception unexpectedException)
+            {
+                // A single bad packet must not stop the drain.
                 UnhandledException?.Invoke(unexpectedException);
             }
         }
-
-        ArrayPool<byte>.Shared.Return(rentedBuffer, clearArray: false);
-
-
-        IsRunning = false;
     }
 
     /// <summary>
-    /// Parses a single received datagram and routes it to the appropriate handler (handshake, data, ack, discofnnect, keep-alive, or NAT probe/server).
+    /// Runs the lowest-level mitigations on one received datagram and dispatches it to the packet handlers.
+    /// Established connections skip signature recomputation and blacklist lookup — those only apply at handshake
+    /// time. Size and rate-limit checks still run for all senders.
+    /// </summary>
+    /// <param name="buffer">The raw receive buffer containing the datagram.</param>
+    /// <param name="receivedLength">Number of valid bytes in <paramref name="buffer"/>.</param>
+    /// <param name="fromEndPoint">The source endpoint of the datagram.</param>
+    private void HandleDatagram(byte[] buffer, int receivedLength, IPEndPoint fromEndPoint)
+    {
+        long nowTicks = DateTime.UtcNow.Ticks;
+
+        FilterResult filterResult;
+        ulong signature;
+
+        bool isEstablished = _connections.ConnectionsByEndPoint.TryGetValue(fromEndPoint, out SynapseConnection? synapseConnection);
+
+        if (isEstablished)
+        {
+            signature = synapseConnection!.Signature;
+            filterResult = _security.InspectEstablished(synapseConnection, receivedLength);
+        }
+        else
+            filterResult = _security.InspectNew(fromEndPoint, receivedLength, out signature);
+
+        if (filterResult is FilterResult.Allowed)
+        {
+            _telemetry.OnReceived(receivedLength);
+            ProcessPacket(buffer, receivedLength, fromEndPoint, synapseConnection, nowTicks);
+            return;
+        }
+
+        _telemetry.OnSecurityDroppedReceived();
+
+        if (filterResult is FilterResult.Blacklisted)
+        {
+            // Blacklisted = REJECTION, not a per-packet violation. The peer is already known-bad.
+            ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.Blacklisted, filterResult.ToString());
+            return;
+        }
+
+        ViolationReason violationReason = filterResult switch
+        {
+            FilterResult.Oversized => ViolationReason.Oversized,
+            FilterResult.RateLimited => ViolationReason.RateLimitExceeded,
+            _ => ViolationReason.Malformed
+        };
+
+        ViolationOccurred?.Invoke(fromEndPoint, signature, violationReason, receivedLength, filterResult.ToString(), ViolationAction.KickAndBlacklist);
+    }
+
+    /// <summary>
+    /// Parses a single received datagram and routes it to the appropriate handler (handshake, data, ack, disconnect, keep-alive, or NAT probe/challenge).
     /// </summary>
     /// <param name="buffer">The raw receive buffer containing the datagram.</param>
     /// <param name="length">Number of valid bytes in <paramref name="buffer"/>.</param>
     /// <param name="fromEndPoint">The source endpoint of the datagram.</param>
-    /// <param name = "nowTicks"></param>
-    /// <param name="cancellationToken">Token forwarded to async send helpers.</param>
     /// <param name = "synapseConnection"></param>
-    private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, SynapseConnection? synapseConnection, long nowTicks, CancellationToken cancellationToken)
+    /// <param name = "nowTicks"></param>
+    private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, SynapseConnection? synapseConnection, long nowTicks)
     {
         // Fast path: unreliable unsegmented payload — the dominant case.
         // PacketType.None = 0, header is exactly one byte. Filter guarantees length > 0.
@@ -386,15 +419,15 @@ internal sealed partial class IngressEngine
         switch (type)
         {
             case PacketType.Handshake:
-                ProcessHandshake(fromEndPoint, buffer, headerSize, length, cancellationToken);
+                ProcessHandshake(fromEndPoint, buffer, headerSize, length);
                 return;
 
             case PacketType.NatProbe:
-                ProcessNatProbe(fromEndPoint, cancellationToken);
+                ProcessNatProbe(fromEndPoint);
                 return;
 
             case PacketType.NatChallenge:
-                ProcessNatChallengeExchange(fromEndPoint, buffer.AsSpan(headerSize, length - headerSize), cancellationToken);
+                ProcessNatChallengeExchange(fromEndPoint, buffer.AsSpan(headerSize, length - headerSize));
                 return;
         }
 
@@ -419,10 +452,10 @@ internal sealed partial class IngressEngine
                 return;
 
             case PacketType.Ack:
-                // Remove immediately (stops retransmission and frees backpressure), but defer the buffer return to
-                // the maintenance thread: an in-flight retransmit on that thread may still be reading this buffer.
-                if (synapseConnection.PendingReliableQueue.TryRemove(sequence, out SynapseConnection.PendingReliable? acked))
-                    _connections.DeferReliableRelease(acked);
+                // Remove immediately (stops retransmission and frees backpressure) and return the buffer now.
+                // The engine is single-threaded, so no retransmit can be reading the buffer concurrently.
+                if (synapseConnection.PendingReliableQueue.Remove(sequence, out SynapseConnection.PendingReliable? acked))
+                    SynapseConnection.ReleasePendingReliable(acked);
                 return;
         }
 
@@ -452,7 +485,7 @@ internal sealed partial class IngressEngine
                 byte[] payloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
                 Buffer.BlockCopy(buffer, headerSize, payloadBuffer, 0, payloadLength);
 
-                EnqueueOrSendAck(synapseConnection, sequence, cancellationToken);
+                EnqueueOrSendAck(synapseConnection, sequence);
 
                 ArraySegment<byte> payload = new(payloadBuffer, 0, payloadLength);
                 DeliverOrdered(synapseConnection, sequence, payload, isReliable: true);
@@ -471,7 +504,7 @@ internal sealed partial class IngressEngine
 
                     if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, payload, isReliable: true, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
                     {
-                        EnqueueOrSendAck(synapseConnection, sequence, cancellationToken);
+                        EnqueueOrSendAck(synapseConnection, sequence);
                         DeliverOrdered(synapseConnection, sequence, assembledPayload, isReliable: true);
                     }
                     else if (isProtocolViolation)
@@ -553,56 +586,53 @@ internal sealed partial class IngressEngine
     {
         List<ArraySegment<byte>>? toDeliver = null;
 
-        lock (synapseConnection.ReliableLock)
+        if (sequence == synapseConnection.NextExpectedSequence)
         {
-            if (sequence == synapseConnection.NextExpectedSequence)
+            synapseConnection.NextExpectedSequence++;
+
+            toDeliver = ListPool<ArraySegment<byte>>.Rent();
+            toDeliver.Add(payload);
+
+            while (synapseConnection.ReorderBuffer.TryGetValue(synapseConnection.NextExpectedSequence, out ArraySegment<byte> nextPayload))
             {
+                synapseConnection.ReorderBuffer.Remove(synapseConnection.NextExpectedSequence);
                 synapseConnection.NextExpectedSequence++;
-
-                toDeliver ??= ListPool<ArraySegment<byte>>.Rent();
-                toDeliver.Add(payload);
-
-                while (synapseConnection.ReorderBuffer.TryGetValue(synapseConnection.NextExpectedSequence, out ArraySegment<byte> nextPayload))
-                {
-                    synapseConnection.ReorderBuffer.Remove(synapseConnection.NextExpectedSequence);
-                    synapseConnection.NextExpectedSequence++;
-                    toDeliver.Add(nextPayload);
-                }
-            }
-            else
-            {
-                // Half-space comparison: if (sequence - NextExpectedSequence) wraps past the midpoint,
-                // the sequence is "behind" — a retransmit of an already-delivered packet. Discard it.
-                if (unchecked((ushort)(sequence - synapseConnection.NextExpectedSequence)) >= 32768)
-                {
-                    if (payload.Array is not null)
-                        ArrayPool<byte>.Shared.Return(payload.Array);
-                    return;
-                }
-
-                // Out of order - buffer (only if not already received).
-                if (_isSecurityEnabled && synapseConnection.ReorderBuffer.Count >= _effectiveMaximumOutOfOrderReliablePackets)
-                {
-                    if (payload.Array is not null)
-                        ArrayPool<byte>.Shared.Return(payload.Array);
-
-                    ViolationOccurred?.Invoke(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.Oversized, 0, ViolationReorderBufferExceeded, ViolationAction.KickAndBlacklist);
-                    return;
-                }
-
-                if (!synapseConnection.ReorderBuffer.TryAdd(sequence, payload) && payload.Array is not null)
-                    ArrayPool<byte>.Shared.Return(payload.Array);
+                toDeliver.Add(nextPayload);
             }
         }
-
-        // Callbacks happen OUTSIDE the lock so user handlers are free to call back into the engine (e.g., SendReliableAsync) safely.
-        if (toDeliver is not null)
+        else
         {
-            foreach (ArraySegment<byte> deliverPayload in toDeliver)
-                PayloadDelivered?.Invoke(synapseConnection, deliverPayload, isReliable);
+            // Half-space comparison: if (sequence - NextExpectedSequence) wraps past the midpoint,
+            // the sequence is "behind" — a retransmit of an already-delivered packet. Discard it.
+            if (unchecked((ushort)(sequence - synapseConnection.NextExpectedSequence)) >= 32768)
+            {
+                if (payload.Array is not null)
+                    ArrayPool<byte>.Shared.Return(payload.Array);
+                return;
+            }
 
-            ListPool<ArraySegment<byte>>.Return(toDeliver);
+            // Out of order - buffer (only if not already received).
+            if (_isSecurityEnabled && synapseConnection.ReorderBuffer.Count >= _effectiveMaximumOutOfOrderReliablePackets)
+            {
+                if (payload.Array is not null)
+                    ArrayPool<byte>.Shared.Return(payload.Array);
+
+                ViolationOccurred?.Invoke(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.Oversized, 0, ViolationReorderBufferExceeded, ViolationAction.KickAndBlacklist);
+                return;
+            }
+
+            if (!synapseConnection.ReorderBuffer.TryAdd(sequence, payload) && payload.Array is not null)
+                ArrayPool<byte>.Shared.Return(payload.Array);
+
+            return;
         }
+
+        // Deliver after the sequence/reorder bookkeeping is done so user handlers may safely re-enter the engine
+        // (e.g. SendReliable) from within the callback. No lock is needed — the engine is single-threaded.
+        foreach (ArraySegment<byte> deliverPayload in toDeliver)
+            PayloadDelivered?.Invoke(synapseConnection, deliverPayload, isReliable);
+
+        ListPool<ArraySegment<byte>>.Return(toDeliver);
     }
 
     /// <summary>
@@ -613,8 +643,7 @@ internal sealed partial class IngressEngine
     /// <param name="buffer">The raw receive buffer.</param>
     /// <param name="headerSize">Byte offset where the payload begins in <paramref name="buffer"/>.</param>
     /// <param name="length">Total number of valid bytes in <paramref name="buffer"/>.</param>
-    /// <param name="cancellationToken">Token forwarded to the handshake-ack send.</param>
-    private void ProcessHandshake(IPEndPoint fromEndPoint, byte[] buffer, int headerSize, int length, CancellationToken cancellationToken)
+    private void ProcessHandshake(IPEndPoint fromEndPoint, byte[] buffer, int headerSize, int length)
     {
         ReadOnlySpan<byte> handshakePayload = buffer.AsSpan(headerSize, length - headerSize);
         ulong signature = _security.ComputeSignature(fromEndPoint, handshakePayload);
@@ -689,7 +718,7 @@ internal sealed partial class IngressEngine
             // We do respond for brand-new connections (!isExistingConnection) and for forced
             // reconnects where the peer was previously fully Connected (wasConnected).
             if (!isExistingConnection || wasConnected)
-                _ = _sender.SendHandshakeAsync(fromEndPoint, cancellationToken);
+                _sender.SendHandshake(fromEndPoint);
 
             ConnectionEstablished?.Invoke(synapseConnection);
         }
@@ -727,13 +756,12 @@ internal sealed partial class IngressEngine
     /// </summary>
     /// <param name="synapseConnection">The connection whose ACK queue receives the sequence, or that receives the immediate send when batching is disabled.</param>
     /// <param name="sequence">The reliable sequence number being acknowledged.</param>
-    /// <param name="cancellationToken">Token forwarded to the immediate ACK send when batching is disabled.</param>
-    private void EnqueueOrSendAck(SynapseConnection synapseConnection, ushort sequence, CancellationToken cancellationToken)
+    private void EnqueueOrSendAck(SynapseConnection synapseConnection, ushort sequence)
     {
         if (_isAckBatchingEnabled)
             synapseConnection.PendingAcks.Enqueue(sequence);
         else
-            _ = _sender.SendAckAsync(synapseConnection, sequence, cancellationToken);
+            _sender.SendAck(synapseConnection, sequence);
     }
 
     /// <summary>

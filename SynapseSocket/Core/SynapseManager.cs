@@ -20,7 +20,7 @@ namespace SynapseSocket.Core;
 /// The main entry point for the SynapseSocket UDP Transport Engine.
 /// This is a partial class; the core API lives here, and the background maintenance loops (keep-alive, reliable retransmission) live in <c>SynapseManager.Maintenance.cs</c>.
 /// </summary>
-public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
+public sealed partial class SynapseManager : IDisposable
 {
     /// <summary>
     /// Raised when a payload is received from any connection.
@@ -122,26 +122,14 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     private readonly List<Socket> _sockets = [];
     /// <summary>
-    /// Tasks running each <see cref="IngressEngine"/> receive loop, one per socket.
+    /// Ingress engines, one per socket. Each is drained on every <see cref="Poll"/>.
     /// </summary>
-    private readonly List<Task> _ingressTasks = [];
+    private readonly List<IngressEngine> _ingressEngines = [];
     /// <summary>
-    /// Shared outbound engine used by all send paths and the maintenance loop.
-    /// Null until <see cref="StartAsync"/> binds sockets.
+    /// Shared outbound engine used by all send paths and maintenance.
+    /// Null until <see cref="Start"/> binds sockets.
     /// </summary>
     private TransmissionEngine? _transmissionEngine;
-    /// <summary>
-    /// Linked cancellation source that drives all background loops. Created on start, disposed on stop.
-    /// </summary>
-    private CancellationTokenSource? _cancellationTokenSource;
-    /// <summary>
-    /// Task running <see cref="MaintenanceLoopAsync"/>. Null until <see cref="StartAsync"/> completes.
-    /// </summary>
-    private Task? _maintenanceTask;
-    /// <summary>
-    /// Task running <see cref="PendingAckLoopAsync"/>. Null when ACK batching is disabled or the engine has not started.
-    /// </summary>
-    private Task? _pendingAckTask;
 
     /// <summary>
     /// Creates a new SynapseSocket engine from the supplied configuration.
@@ -184,17 +172,17 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Binds all configured endpoints, starts ingress loops, and launches background maintenance (keep-alive and reliable retransmission).
+    /// Binds all configured endpoints and prepares the ingress engines. After this returns the host must call
+    /// <see cref="Poll"/> regularly (e.g. once per frame) to receive datagrams and run maintenance — the engine
+    /// spawns no background threads.
     /// </summary>
-    public Task StartAsync(CancellationToken cancellationToken)
+    public void Start()
     {
         if (_isStarted)
             throw new InvalidOperationException("Engine is already running.");
 
         if (_isDisposed)
             throw new ObjectDisposedException(nameof(SynapseManager));
-
-        _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
         Socket? ipv4Socket = null;
         Socket? ipv6Socket = null;
@@ -249,41 +237,65 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             ingressEngine.UnhandledException += OnUnhandledException;
             ingressEngine.UnknownPacketReceived += OnUnknownPacketReceivedInternal;
 
-            _ingressTasks.Add(ingressEngine.StartAsync(_cancellationTokenSource.Token));
+            ingressEngine.Start();
+            _ingressEngines.Add(ingressEngine);
         }
 
-        _maintenanceTask = Task.Run(() => MaintenanceLoopAsync(_cancellationTokenSource.Token), _cancellationTokenSource.Token);
-        if (_isAckBatchingEnabled)
-            _pendingAckTask = Task.Run(() => PendingAckLoopAsync(_cancellationTokenSource.Token), _cancellationTokenSource.Token);
-
         _isStarted = true;
-        return Task.CompletedTask;
     }
 
     /// <summary>
-    /// Gracefully stops all ingress loops and background maintenance, then closes all sockets.
-    /// The engine may be restarted by calling <see cref="StartAsync"/> again after this returns.
+    /// Pumps the engine: receives and dispatches all buffered datagrams, advances NAT hole-punching, runs
+    /// maintenance (keep-alive, timeout, reliable retransmit, segment timeout), and flushes batched ACKs.
+    /// The host must call this regularly (e.g. once per frame) on the same thread it uses for sends. Received
+    /// payloads are delivered via the <see cref="PacketReceived"/> event synchronously during this call.
     /// </summary>
-    public async Task StopAsync()
+    public void Poll()
+    {
+        if (!_isStarted || _isDisposed || _transmissionEngine is null)
+            return;
+
+        long nowTicks = DateTime.UtcNow.Ticks;
+
+        // 1. Receive: drain each socket, processing and delivering inline on this thread.
+        for (int i = 0; i < _ingressEngines.Count; i++)
+            _ingressEngines[i].Drain();
+
+        // 2. Advance NAT hole-punch state machines for any pending FullCone connects.
+        AdvanceNatPunches(nowTicks);
+
+        // 3. Maintenance: keep-alive, timeout, reliable retransmit, segment-assembly timeout, rate-counter reset.
+        RunMaintenance(nowTicks);
+
+        // 4. Flush batched outbound ACKs.
+        if (_isAckBatchingEnabled)
+            FlushPendingAcks();
+
+        // 5. Release any latency-simulator-delayed packets whose due time has elapsed.
+        _transmissionEngine.FlushDeferredSends(nowTicks);
+    }
+
+    /// <summary>
+    /// Gracefully stops the engine: tears down connections and closes all sockets.
+    /// The engine may be restarted by calling <see cref="Start"/> again after this returns.
+    /// </summary>
+    public void Stop()
     {
         if (!_isStarted || _isDisposed)
             return;
 
         _isStarted = false;
-        await ShutdownCoreAsync().ConfigureAwait(false);
-        CancellationTokenSource? oldCts = _cancellationTokenSource;
-        _cancellationTokenSource = null;
-        oldCts?.Dispose();
+        ShutdownCore();
     }
 
     /// <summary>
     /// Initiates an outgoing connection to the specified remote endpoint.
-    /// Sends a handshake packet; the connection is considered established when the remote handshake response arrives.
+    /// Sends a handshake packet; the connection is considered established when the remote handshake response arrives
+    /// (observed on a subsequent <see cref="Poll"/>).
     /// </summary>
-    public async Task<SynapseConnection> ConnectAsync(IPEndPoint endPoint, CancellationToken cancellationToken)
+    public SynapseConnection Connect(IPEndPoint endPoint)
     {
-        if (!_isStarted || _transmissionEngine is null)
-            throw new InvalidOperationException("Engine not started.");
+        EnsureRunning();
 
         ulong signature = Security.ComputeSignature(endPoint, ReadOnlySpan<byte>.Empty);
 
@@ -295,10 +307,10 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
 
         SynapseConnection synapseConnection = Connections.CreateNew(endPoint, signature);
 
-        await _transmissionEngine.SendHandshakeAsync(endPoint, cancellationToken).ConfigureAwait(false);
+        _transmissionEngine!.SendHandshake(endPoint);
 
         if (Config.NatTraversal.Mode == NatTraversalMode.FullCone)
-            _ = Task.Run(() => NatPunchAsync(synapseConnection, endPoint, cancellationToken), cancellationToken);
+            RegisterNatPunch(synapseConnection, endPoint);
 
         return synapseConnection;
     }
@@ -312,16 +324,16 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// <item><see cref="UnreliableSegmentMode.SegmentReliable"/> — splits into reliable segments.</item>
     /// </list>
     /// </summary>
-    public async Task SendAsync(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable, CancellationToken cancellationToken)
+    public void Send(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable)
     {
         EnsureRunning();
 
         if (payload.Count <= _maximumUnsegmentedPayload)
         {
             if (isReliable)
-                await _transmissionEngine!.SendReliableUnsegmentedAsync(synapseConnection, payload, cancellationToken).ConfigureAwait(false);
+                _transmissionEngine!.SendReliableUnsegmented(synapseConnection, payload);
             else
-                await _transmissionEngine!.SendUnreliableUnsegmentedAsync(synapseConnection, payload, cancellationToken).ConfigureAwait(false);
+                _transmissionEngine!.SendUnreliableUnsegmented(synapseConnection, payload);
 
             RaisePacketSent(synapseConnection.RemoteEndPoint, payload, isReliable);
 
@@ -346,7 +358,7 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
             isReliable = unreliableSegmentMode is UnreliableSegmentMode.SegmentReliable;
         }
 
-        await _transmissionEngine!.SendSegmentedAsync(synapseConnection, payload, isReliable, GetOrRentSplitter(synapseConnection), cancellationToken).ConfigureAwait(false);
+        _transmissionEngine!.SendSegmented(synapseConnection, payload, isReliable, GetOrRentSplitter(synapseConnection));
         RaisePacketSent(synapseConnection.RemoteEndPoint, payload, isReliable);
     }
 
@@ -364,20 +376,19 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     /// <param name="target">The remote endpoint to send to.</param>
     /// <param name="data">The wire-ready bytes to send.</param>
-    /// <param name="cancellationToken">Token to cancel the send operation.</param>
-    public Task SendRawAsync(IPEndPoint target, ArraySegment<byte> data, CancellationToken cancellationToken)
+    public void SendRaw(IPEndPoint target, ArraySegment<byte> data)
     {
         EnsureRunning();
-        return _transmissionEngine!.SendRawAsync(data, target, cancellationToken);
+        _transmissionEngine!.SendRaw(data, target);
     }
 
     /// <summary>
     /// Gracefully disconnects a connection, notifying the peer.
     /// </summary>
-    public async Task DisconnectAsync(SynapseConnection synapseConnection, CancellationToken cancellationToken)
+    public void Disconnect(SynapseConnection synapseConnection)
     {
         if (_transmissionEngine is not null)
-            await _transmissionEngine.SendDisconnectAsync(synapseConnection, cancellationToken).ConfigureAwait(false);
+            _transmissionEngine.SendDisconnect(synapseConnection);
 
         ReturnConnectionSegmenters(synapseConnection);
         ReturnReorderBufferToPool(synapseConnection);
@@ -447,87 +458,45 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
         _isDisposed = true;
         _isStarted = false;
 
-        try
-        {
-            _cancellationTokenSource?.Cancel();
-        }
-        catch { }
-
-        CloseSockets();
-
-        List<Task> pendingTasks = [.. _ingressTasks];
-
-        if (_maintenanceTask is not null)
-            pendingTasks.Add(_maintenanceTask);
-        _maintenanceTask = null;
-
-        if (_pendingAckTask is not null)
-            pendingTasks.Add(_pendingAckTask);
-        _pendingAckTask = null;
-
-        _ingressTasks.Clear();
-
-
-        if (pendingTasks.Count > 0)
-        {
-            try
-            {
-                Task.WhenAll(pendingTasks).Wait(5000);
-            }
-            catch { }
-        }
-
-        _cancellationTokenSource?.Dispose();
+        ShutdownCore();
     }
 
     /// <summary>
-    /// Stops the engine and releases all resources asynchronously.
+    /// Closes sockets, stops the ingress engines, tears down all connections, and returns pooled resources.
+    /// Shared by <see cref="Stop"/> and <see cref="Dispose"/>.
     /// </summary>
-    public async ValueTask DisposeAsync()
+    private void ShutdownCore()
     {
-        if (_isDisposed)
-            return;
+        CloseSockets();
 
-        _isDisposed = true;
-        _isStarted = false;
+        for (int i = 0; i < _ingressEngines.Count; i++)
+            _ingressEngines[i].Stop();
+        _ingressEngines.Clear();
 
-        await ShutdownCoreAsync().ConfigureAwait(false);
+        _transmissionEngine?.ClearDeferredSends();
 
-        _cancellationTokenSource?.Dispose();
+        TeardownAllConnections();
+        _natPunches.Clear();
     }
 
     /// <summary>
-    /// Cancels all loops, closes sockets, and waits up to 5 seconds for all background tasks to exit.
-    /// Shared by <see cref="StopAsync"/> and <see cref="DisposeAsync"/>.
+    /// Frees every live connection's pooled buffers (reliable queue, reorder buffer, segmenters) and clears the
+    /// connection tables. Safe because the engine is single-threaded and stopped.
     /// </summary>
-    private async Task ShutdownCoreAsync()
+    private void TeardownAllConnections()
     {
-        try
+        IReadOnlyList<SynapseConnection> connections = Connections.Connections;
+
+        for (int i = connections.Count - 1; i >= 0; i--)
         {
-            _cancellationTokenSource?.Cancel();
+            SynapseConnection connection = connections[i];
+            ReturnConnectionSegmenters(connection);
+            ReturnReorderBufferToPool(connection);
+            SynapseConnection.DrainPendingReliableQueue(connection);
+            connection.State = ConnectionState.Disconnected;
         }
-        catch { }
 
-        CloseSockets();
-
-        List<Task> pendingTasks = [.. _ingressTasks];
-
-        if (_maintenanceTask is not null)
-            pendingTasks.Add(_maintenanceTask);
-        _maintenanceTask = null;
-
-        if (_pendingAckTask is not null)
-            pendingTasks.Add(_pendingAckTask);
-        _pendingAckTask = null;
-
-        _ingressTasks.Clear();
-
-        if (pendingTasks.Count > 0)
-            await Task.WhenAny(Task.WhenAll(pendingTasks), Task.Delay(5000)).ConfigureAwait(false);
-
-        // The maintenance loop has stopped, so no resend is in flight; reclaim any reliable buffers that were
-        // deferred for release but not yet drained, so they are returned to the pool rather than leaked.
-        Connections.DrainReliableReleases();
+        Connections.Clear();
     }
 
     /// <summary>
@@ -616,16 +585,13 @@ public sealed partial class SynapseManager : IDisposable, IAsyncDisposable
     /// </summary>
     private static void ReturnReorderBufferToPool(SynapseConnection synapseConnection)
     {
-        lock (synapseConnection.ReliableLock)
+        foreach (ArraySegment<byte> segment in synapseConnection.ReorderBuffer.Values)
         {
-            foreach (ArraySegment<byte> segment in synapseConnection.ReorderBuffer.Values)
-            {
-                if (segment.Array is not null)
-                    ArrayPool<byte>.Shared.Return(segment.Array);
-            }
-
-            synapseConnection.ReorderBuffer.Clear();
+            if (segment.Array is not null)
+                ArrayPool<byte>.Shared.Return(segment.Array);
         }
+
+        synapseConnection.ReorderBuffer.Clear();
     }
 
     /// <summary>

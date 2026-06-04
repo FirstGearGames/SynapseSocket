@@ -40,52 +40,6 @@ public sealed class ConnectionManager
     private readonly List<SynapseConnection> _connections = [];
 
     /// <summary>
-    /// Acknowledged or evicted reliable packets awaiting their pooled buffers to be returned. Producers (ingress
-    /// ACK, teardown, retransmit eviction) add under <see cref="_reliableReleaseLock"/>; the maintenance loop
-    /// swaps this with <see cref="_drainingReliableReleases"/> and drains the swapped list, so a buffer is never
-    /// returned to the pool while a zero-copy resend is still reading it. Two reused lists keep the steady state
-    /// allocation-free. See <see cref="DeferReliableRelease"/> and <see cref="DrainReliableReleases"/>.
-    /// </summary>
-    private List<SynapseConnection.PendingReliable> _pendingReliableReleases = [];
-    private List<SynapseConnection.PendingReliable> _drainingReliableReleases = [];
-    private readonly object _reliableReleaseLock = new();
-
-    /// <summary>
-    /// Queues a removed <see cref="SynapseConnection.PendingReliable"/> for its buffers to be returned to the pool
-    /// later by the maintenance loop, rather than freeing it on the calling thread. The entry must already have
-    /// been removed from its connection's pending queue so no further retransmit will reference it.
-    /// </summary>
-    /// <param name="pendingReliable">The removed pending-reliable entry whose buffers should be reclaimed.</param>
-    internal void DeferReliableRelease(SynapseConnection.PendingReliable pendingReliable)
-    {
-        lock (_reliableReleaseLock)
-            _pendingReliableReleases.Add(pendingReliable);
-    }
-
-    /// <summary>
-    /// Returns every deferred <see cref="SynapseConnection.PendingReliable"/> buffer to the pool. Must be called
-    /// only from the maintenance thread at a moment when no retransmit send is in flight (e.g. the top of a sweep,
-    /// after the previous sweep's awaited resends have completed). The swap is done under lock so producers never
-    /// touch the list being drained; processing happens outside the lock and the drained list is reused.
-    /// </summary>
-    internal void DrainReliableReleases()
-    {
-        lock (_reliableReleaseLock)
-        {
-            if (_pendingReliableReleases.Count == 0)
-                return;
-
-            (_pendingReliableReleases, _drainingReliableReleases) = (_drainingReliableReleases, _pendingReliableReleases);
-        }
-
-        for (int i = 0; i < _drainingReliableReleases.Count; i++)
-            SynapseConnection.ReleasePendingReliable(_drainingReliableReleases[i]);
-
-        _drainingReliableReleases.Clear();
-    }
-
-
-    /// <summary>
     /// Registers a new connection.
     /// Returns the existing one if already present.
     /// </summary>
@@ -102,7 +56,7 @@ public sealed class ConnectionManager
             synapseConnection = ResettableObjectPool<SynapseConnection>.Rent();
 
             int connectionsIndex = _connections.Count;
-            synapseConnection.Initialize(endPoint, signature, connectionsIndex, this);
+            synapseConnection.Initialize(endPoint, signature, connectionsIndex);
 
             _connectionsByEndPoint[endPoint] = synapseConnection;
             _connections.Add(synapseConnection);
@@ -151,7 +105,7 @@ public sealed class ConnectionManager
 
         SynapseConnection synapseConnection = ResettableObjectPool<SynapseConnection>.Rent();
         int connectionsIndex = _connections.Count;
-        synapseConnection.Initialize(endPoint, signature, connectionsIndex, this);
+        synapseConnection.Initialize(endPoint, signature, connectionsIndex);
 
         _connectionsByEndPoint[endPoint] = synapseConnection;
         _connections.Add(synapseConnection);
@@ -199,6 +153,17 @@ public sealed class ConnectionManager
         }
 
         return isRemoved;
+    }
+
+    /// <summary>
+    /// Removes all connections from every lookup table. Called on engine shutdown after the connections' pooled
+    /// buffers have been reclaimed.
+    /// </summary>
+    public void Clear()
+    {
+        _connectionsByEndPoint.Clear();
+        _connectionsBySignature.Clear();
+        _connections.Clear();
     }
 
     /// <summary>

@@ -1,6 +1,5 @@
 using System;
 using System.Buffers;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
 using System.Threading;
@@ -66,24 +65,21 @@ public sealed partial class SynapseConnection : IPoolResettable
     [PoolResettableMember]
     internal ushort NextExpectedSequence;
     /// <summary>
-    /// Pending unacked reliable packets keyed by sequence.
+    /// Pending unacked reliable packets keyed by sequence. The engine is single-threaded (driven by the
+    /// host's poll), so a plain <see cref="Dictionary{TKey,TValue}"/> is safe and no longer races.
     /// </summary>
     [PoolResettableMember]
-    internal readonly ConcurrentDictionary<ushort, PendingReliable> PendingReliableQueue = [];
+    internal readonly Dictionary<ushort, PendingReliable> PendingReliableQueue = new();
     /// <summary>
     /// Outbound ACK sequence numbers queued for batch delivery when ACK batching is enabled.
     /// </summary>
     [PoolResettableMember]
-    internal readonly ConcurrentQueue<ushort> PendingAcks = [];
+    internal readonly Queue<ushort> PendingAcks = new();
     /// <summary>
     /// Out-of-order reliable packets awaiting delivery.
     /// </summary>
     [PoolResettableMember]
     internal readonly Dictionary<ushort, ArraySegment<byte>> ReorderBuffer = [];
-    /// <summary>
-    /// Gate for reorder buffer and sequence manipulation.
-    /// </summary>
-    internal readonly object ReliableLock = new();
     /// <summary>
     /// Send-side splitter, rented from <see cref="CodeBoost.Performance.ResettableObjectPool{T}"/>
     /// on the first segmented send and returned to the pool on disconnect.
@@ -105,11 +101,6 @@ public sealed partial class SynapseConnection : IPoolResettable
     [PoolResettableMember]
     internal TransmissionEngine? TransmissionEngine;
     /// <summary>
-    /// The owning <see cref="ConnectionManager"/>. Used to defer reliable-buffer release to the maintenance thread
-    /// so a buffer is never returned to the pool while an in-flight retransmit is still reading it.
-    /// </summary>
-    internal ConnectionManager? Manager;
-    /// <summary>
     /// Value used when ConnectionsIndex is not set.
     /// </summary>
     public const int UnsetConnectionsIndex = -1;
@@ -123,26 +114,23 @@ public sealed partial class SynapseConnection : IPoolResettable
     /// <param name="remoteEndPoint">The peer's remote endpoint.</param>
     /// <param name="signature">The 64-bit signature that uniquely identifies this peer.</param>
     /// <param name = "connectionsIndex"></param>
-    /// <param name="manager">The owning connection manager, used for deferred reliable-buffer release.</param>
-    public void Initialize(IPEndPoint remoteEndPoint, ulong signature, int connectionsIndex, ConnectionManager manager)
+    public void Initialize(IPEndPoint remoteEndPoint, ulong signature, int connectionsIndex)
     {
         RemoteEndPoint = remoteEndPoint ?? throw new ArgumentNullException(nameof(remoteEndPoint));
         Signature = signature;
         ConnectionsIndex = connectionsIndex;
-        Manager = manager;
         State = ConnectionState.Pending;
         LastReceivedTicks = DateTime.UtcNow.Ticks;
     }
 
     /// <summary>
     /// Dequeues all pending ACK sequence numbers and sends each via <see cref="TransmissionEngine"/>.
-    /// Called by the maintenance loop when ACK batching is enabled.
+    /// Called by the engine's maintenance step when ACK batching is enabled.
     /// </summary>
-    /// <param name="cancellationToken">Token forwarded to each ACK send.</param>
-    internal void SendPendingAcks(CancellationToken cancellationToken)
+    internal void SendPendingAcks()
     {
         while (PendingAcks.TryDequeue(out ushort sequence))
-            _ = TransmissionEngine?.SendAckAsync(this, sequence, cancellationToken);
+            TransmissionEngine?.SendAck(this, sequence);
     }
 
     /// <summary>
@@ -226,19 +214,14 @@ public sealed partial class SynapseConnection : IPoolResettable
     }
 
     /// <summary>
-    /// Drains the pending reliable queue of <paramref name="synapseConnection"/>, deferring every entry's pooled
-    /// buffers to the maintenance thread for release. Call on connection teardown to avoid leaking rented buffers.
+    /// Drains the pending reliable queue of <paramref name="synapseConnection"/>, returning every entry's pooled
+    /// buffers immediately. Safe because the engine is single-threaded: no retransmit can be reading these buffers
+    /// concurrently. Call on connection teardown to avoid leaking rented buffers.
     /// </summary>
     internal static void DrainPendingReliableQueue(SynapseConnection synapseConnection)
     {
-        // Claim each entry with TryRemove before deferring so a concurrent ingress ACK or retransmit sweep cannot
-        // release the same PendingReliable. The actual buffer return is deferred to the maintenance thread so it
-        // never happens while an in-flight retransmit is still reading the buffer.
         foreach (KeyValuePair<ushort, PendingReliable> entry in synapseConnection.PendingReliableQueue)
-        {
-            if (synapseConnection.PendingReliableQueue.TryRemove(entry.Key, out PendingReliable? claimed))
-                synapseConnection.Manager?.DeferReliableRelease(claimed);
-        }
+            ReleasePendingReliable(entry.Value);
 
         synapseConnection.PendingReliableQueue.Clear();
     }
@@ -262,15 +245,12 @@ public sealed partial class SynapseConnection : IPoolResettable
         DrainPendingReliableQueue(this);
         PendingAcks.Clear();
 
-        lock (ReliableLock)
-        {
-            foreach (ArraySegment<byte> segment in ReorderBuffer.Values)
-                segment.PoolArrayIntoShared();
+        foreach (ArraySegment<byte> segment in ReorderBuffer.Values)
+            segment.PoolArrayIntoShared();
 
-            ReorderBuffer.Clear();
-            NextOutgoingSequence = 0;
-            NextExpectedSequence = 0;
-        }
+        ReorderBuffer.Clear();
+        NextOutgoingSequence = 0;
+        NextExpectedSequence = 0;
 
         UnansweredKeepAlives = 0;
         LastKeepAliveSentTicks = 0;
@@ -293,15 +273,9 @@ public sealed partial class SynapseConnection : IPoolResettable
         NextOutgoingSequence = 0;
         NextExpectedSequence = 0;
         PendingAcks.Clear();
-        
-        // Claim each entry with TryRemove before deferring so a concurrent ingress ACK or retransmit sweep cannot
-        // release the same PendingReliable. The buffer return is deferred to the maintenance thread so it never
-        // races an in-flight retransmit.
+
         foreach (KeyValuePair<ushort, PendingReliable> entry in PendingReliableQueue)
-        {
-            if (PendingReliableQueue.TryRemove(entry.Key, out PendingReliable? claimed))
-                Manager?.DeferReliableRelease(claimed);
-        }
+            ReleasePendingReliable(entry.Value);
 
         PendingReliableQueue.Clear();
 

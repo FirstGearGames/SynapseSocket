@@ -1,7 +1,5 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
-using System.Threading;
-using System.Threading.Tasks;
 using SynapseSocket.Connections;
 using SynapseSocket.Core.Configuration;
 using SynapseSocket.Core.Events;
@@ -9,8 +7,9 @@ using SynapseSocket.Core.Events;
 namespace SynapseSocket.Core;
 
 /// <summary>
-/// Background maintenance for <see cref="SynapseManager"/>: progressive keep-alive sweeps, timeout detection, and reliable retransmission.
-/// Implemented as a partial class to separate feature sets per the spec.
+/// Background maintenance for <see cref="SynapseManager"/>: keep-alive sweeps, timeout detection, and reliable
+/// retransmission. Driven synchronously from <see cref="SynapseManager.Poll"/> on the host's thread — there are no
+/// background loops.
 /// </summary>
 public sealed partial class SynapseManager
 {
@@ -52,14 +51,6 @@ public sealed partial class SynapseManager
     /// </summary>
     private readonly bool _isAckBatchingEnabled;
     /// <summary>
-    /// Index of the connection to process on the next maintenance tick. Wraps around when it reaches the connection count.
-    /// </summary>
-    private int _nextMaintenanceConnectionIndex;
-    /// <summary>
-    /// Index of the connection to flush pending ACKs for on the next ACK loop tick. Wraps around when it reaches the connection count.
-    /// </summary>
-    private int _nextPendingAckConnectionIndex;
-    /// <summary>
     /// Sentinel value indicating that ACK batching interval is unset (batching disabled).
     /// </summary>
     public const long UnsetAckBatchingIntervalTicks = 0;
@@ -69,154 +60,71 @@ public sealed partial class SynapseManager
     private const long UnsetSegmentAssemblyTimeoutTicks = 0;
 
     /// <summary>
-    /// Background loop that periodically runs keep-alive, retransmit, and segment-timeout sweeps.
+    /// Runs one maintenance pass over every connection: keep-alive, timeout detection, reliable retransmission,
+    /// segment-assembly timeout, and inbound rate-counter reset. Called once per <see cref="Poll"/>.
     /// </summary>
-    private async Task MaintenanceLoopAsync(CancellationToken cancellationToken)
+    /// <param name="nowTicks">Current time in <see cref="DateTime.Ticks"/>.</param>
+    private void RunMaintenance(long nowTicks)
     {
-        int maintenanceLoopTargetMilliseconds = (int)Math.Min(int.MaxValue, Config.Connection.SweepWindowMilliseconds);
+        if (_transmissionEngine is null)
+            return;
 
-        while (!cancellationToken.IsCancellationRequested)
+        IReadOnlyList<SynapseConnection> connections = Connections.Connections;
+
+        // Iterate backward: a connection removed mid-sweep (timeout or reliable-exhaustion does a swap-remove of
+        // the last entry into the freed slot) must not cause an entry to be skipped or visited twice. The engine is
+        // single-threaded, so a removal only ever targets the connection currently being processed.
+        for (int i = connections.Count - 1; i >= 0; i--)
         {
-            // Return acknowledged/evicted reliable buffers to the pool here, at the top of the sweep, where no
-            // retransmit send is in flight (the previous sweep's resends were awaited). This is the only place
-            // reliable buffers are freed, so freeing can never race a zero-copy retransmit still reading one.
-            Connections.DrainReliableReleases();
-
-            if (!DoConnectionsExist())
-            {
-                await Task.Delay(maintenanceLoopTargetMilliseconds, cancellationToken).ConfigureAwait(false);
+            if (i >= connections.Count)
                 continue;
-            }
 
-            int connectionsCount = Connections.Connections.Count;
-            int connectionsPerTick = Math.Max(1, connectionsCount / maintenanceLoopTargetMilliseconds);
+            SynapseConnection connection = connections[i];
 
             try
             {
-                long nowTicks = DateTime.UtcNow.Ticks;
-
-                for (int i = 0; i < connectionsPerTick; i++)
+                if (PerformKeepAlive(nowTicks, connection))
                 {
-                    SynapseConnection connection = GetConnectionAndIncreaseIndex(connectionsCount, ref _nextMaintenanceConnectionIndex);
-
-                    if (PerformKeepAlive(nowTicks, connection, cancellationToken))
-                    {
-                        await RetransmitReliable(nowTicks, connection, cancellationToken);
-                        TimeoutAssembledSegments(nowTicks, connection);
-                        ResetInboundRateCounters(nowTicks, connection);
-                    }
+                    RetransmitReliable(nowTicks, connection);
+                    TimeoutAssembledSegments(nowTicks, connection);
+                    ResetInboundRateCounters(nowTicks, connection);
                 }
-            }
-            catch (OperationCanceledException)
-            {
-                break;
             }
             catch (Exception unexpectedException)
             {
                 UnhandledException?.Invoke(unexpectedException);
             }
-
-            try
-            {
-                await WaitDelayForLoop(maintenanceLoopTargetMilliseconds, connectionsCount, cancellationToken);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
         }
     }
 
     /// <summary>
-    /// Background loop that flushes batched outbound ACKs for each connection at the configured <see cref="Configuration.ReliableConfig.AckBatchIntervalMilliseconds"/> interval.
-    /// Only started when ACK batching is enabled.
+    /// Flushes batched outbound ACKs for every connection. Called once per <see cref="Poll"/> when ACK batching is enabled.
     /// </summary>
-    private async Task PendingAckLoopAsync(CancellationToken cancellationToken)
+    private void FlushPendingAcks()
     {
-        /* Enabled state of batching does not need to be checked.
-         * This Task will not start if batching is disabled. */
+        IReadOnlyList<SynapseConnection> connections = Connections.Connections;
 
-        int pendingAckLoopTargetMilliseconds = (int)Math.Clamp(Config.Reliable.AckBatchIntervalMilliseconds, ReliableConfig.MinimumAckBatchIntervalMilliseconds, ReliableConfig.MaximumAckBatchIntervalMilliseconds);
-
-        while (!cancellationToken.IsCancellationRequested)
+        for (int i = connections.Count - 1; i >= 0; i--)
         {
-            if (!DoConnectionsExist())
-            {
-                await Task.Delay(pendingAckLoopTargetMilliseconds, cancellationToken).ConfigureAwait(false);
+            if (i >= connections.Count)
                 continue;
-            }
-
-            int connectionsCount = Connections.Connections.Count;
-            int connectionsPerTick = Math.Max(1, connectionsCount / pendingAckLoopTargetMilliseconds);
 
             try
             {
-                for (int i = 0; i < connectionsPerTick; i++)
-                {
-                    SynapseConnection connection = GetConnectionAndIncreaseIndex(connectionsCount, ref _nextPendingAckConnectionIndex);
-                    connection.SendPendingAcks(cancellationToken);
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                break;
+                connections[i].SendPendingAcks();
             }
             catch (Exception unexpectedException)
             {
                 UnhandledException?.Invoke(unexpectedException);
             }
-
-            try
-            {
-                await WaitDelayForLoop(pendingAckLoopTargetMilliseconds, connectionsCount, cancellationToken);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
         }
     }
 
     /// <summary>
-    /// Returns the connection at <paramref name="currentIndex"/>, wrapping the index to zero when it reaches <paramref name="connectionsCount"/>, then advances it.
+    /// Keep-alive: detects timed-out peers and emits heartbeats with exponential backoff.
     /// </summary>
-    /// <param name="connectionsCount">Current snapshot of the connection count, used for wrap-around.</param>
-    /// <param name="currentIndex">The index to read and advance. Passed by ref so the caller's field is updated.</param>
-    private SynapseConnection GetConnectionAndIncreaseIndex(int connectionsCount, ref int currentIndex)
-    {
-        if (currentIndex >= connectionsCount)
-            currentIndex = 0;
-
-        SynapseConnection connection = Connections.Connections[currentIndex];
-        currentIndex++;
-        return connection;
-    }
-
-    /// <summary>
-    /// Returns true when the connection list is non-null and has at least one entry.
-    /// </summary>
-    private bool DoConnectionsExist() => Connections is not null && Connections.Connections.Count > 0;
-
-    /// <summary>
-    /// Delays for a per-connection slice of <paramref name="targetMilliseconds"/> so all connections are visited within approximately that window.
-    /// </summary>
-    /// <param name="targetMilliseconds">The total sweep window in milliseconds.</param>
-    /// <param name="connectionsCount">Current connection count used to calculate the per-connection wait slice.</param>
-    /// <param name="cancellationToken">Token forwarded to <see cref="Task.Delay(int, CancellationToken)"/>.</param>
-    private async Task WaitDelayForLoop(int targetMilliseconds, int connectionsCount, CancellationToken cancellationToken)
-    {
-        /* Wait time is calculated to have iterated all connections
-         * at roughly the target milliseconds. */
-        int waitMilliseconds = Math.Max(1, targetMilliseconds / connectionsCount);
-        await Task.Delay(waitMilliseconds, cancellationToken).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Progressive keep-alive: iterates a slice of connections per tick so heartbeat traffic is spread across the configured sweep window.
-    /// Also detects timeouts and disconnects non-responsive peers.
-    /// </summary>
-    /// <returns>True if the connection is still valid. False will be returned if the connection had been disconnected.</returns>
-    private bool PerformKeepAlive(long nowTicks, SynapseConnection synapseConnection, CancellationToken cancellationToken)
+    /// <returns>True if the connection is still valid. False if the connection was disconnected (timed out).</returns>
+    private bool PerformKeepAlive(long nowTicks, SynapseConnection synapseConnection)
     {
         if (_transmissionEngine is null)
             return false;
@@ -259,7 +167,7 @@ public sealed partial class SynapseManager
 
         synapseConnection.LastKeepAliveSentTicks = nowTicks;
 
-        _ = _transmissionEngine.SendKeepAliveAsync(synapseConnection, cancellationToken);
+        _transmissionEngine.SendKeepAlive(synapseConnection);
 
         return true;
     }
@@ -282,7 +190,7 @@ public sealed partial class SynapseManager
     /// Reliable retransmission sweep: any pending reliable packet whose resend timer has expired is re-sent.
     /// Packets exceeding the retry cap are treated as a <see cref="ViolationReason.ReliableExhausted"/> violation.
     /// </summary>
-    private async Task RetransmitReliable(long nowTicks, SynapseConnection synapseConnection, CancellationToken cancellationToken)
+    private void RetransmitReliable(long nowTicks, SynapseConnection synapseConnection)
     {
         if (_transmissionEngine is null)
             return;
@@ -299,11 +207,11 @@ public sealed partial class SynapseManager
 
             if (pendingReliable.Retries >= _maximumReliableRetries)
             {
-                // Defer only if this sweep wins the removal. The ingress ACK path may have already removed this
-                // entry; deferring it twice would return BackingArray to the pool a second time. The buffer is
-                // reclaimed by DrainReliableReleases on the next sweep, never while a resend is in flight.
-                if (synapseConnection.PendingReliableQueue.TryRemove(keyValuePair.Key, out SynapseConnection.PendingReliable? exhausted))
-                    Connections.DeferReliableRelease(exhausted);
+                // Remove the exhausted entry and free its buffer immediately. The loop is abandoned (return) right
+                // after, so mutating the dictionary here does not invalidate the in-progress enumeration. The engine
+                // is single-threaded, so no resend can be reading the buffer.
+                if (synapseConnection.PendingReliableQueue.Remove(keyValuePair.Key, out SynapseConnection.PendingReliable? exhausted))
+                    SynapseConnection.ReleasePendingReliable(exhausted);
                 Telemetry.OnLost();
                 HandleViolation(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.ReliableExhausted, 0, ViolationReliableExhausted, ViolationAction.Kick);
 
@@ -315,9 +223,6 @@ public sealed partial class SynapseManager
 
             Telemetry.OnReliableResend();
 
-            // Await each resend so the buffer read finishes before the sweep moves on. The buffer is only returned
-            // to the pool by DrainReliableReleases at the top of a sweep, when no resend is in flight — so nothing
-            // can free this buffer while the loop below is still reading it.
             List<ArraySegment<byte>>? segments = pendingReliable.Segments;
             if (segments is null)
                 continue;
@@ -325,11 +230,7 @@ public sealed partial class SynapseManager
             try
             {
                 for (int i = 0; i < segments.Count; i++)
-                    await _transmissionEngine.SendRawAsync(segments[i], synapseConnection.RemoteEndPoint, cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
+                    _transmissionEngine.SendRaw(segments[i], synapseConnection.RemoteEndPoint);
             }
             catch (Exception)
             {
