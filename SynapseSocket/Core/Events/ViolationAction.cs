@@ -4,7 +4,7 @@ namespace SynapseSocket.Core.Events;
 /// Actions the engine can take in response to a detected violation.
 /// The default (when no <c>ViolationDetected</c> handler is wired up) is <see cref="KickAndBlacklist"/>.
 /// </summary>
-public enum ViolationAction
+public enum ViolationAction : byte
 {
     /// <summary>
     /// Take no action at all (packet is NOT dropped). Use sparingly.

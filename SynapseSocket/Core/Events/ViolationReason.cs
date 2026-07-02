@@ -5,7 +5,7 @@ namespace SynapseSocket.Core.Events;
 /// Some reasons apply only to established connections; others can fire pre-connection.
 /// Surfaced on the <c>ViolationDetected</c> event via <see cref="ViolationEventArgs"/>.
 /// </summary>
-public enum ViolationReason
+public enum ViolationReason : byte
 {
     /// <summary>
     /// Connection timed out (no traffic received within the configured window).

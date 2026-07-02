@@ -3,7 +3,7 @@ namespace SynapseSocket.Connections;
 /// <summary>
 /// Lifecycle state of a Synapse connection.
 /// </summary>
-public enum ConnectionState
+public enum ConnectionState : byte
 {
     /// <summary>
     /// Newly created; has not yet completed a handshake.

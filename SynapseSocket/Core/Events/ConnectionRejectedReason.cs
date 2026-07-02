@@ -4,7 +4,7 @@ namespace SynapseSocket.Core.Events;
 /// Reasons a connection attempt was rejected before (or instead of) being established.
 /// Surfaced on the <c>ConnectionFailed</c> event via <see cref="ConnectionFailedEventArgs"/>.
 /// </summary>
-public enum ConnectionRejectedReason
+public enum ConnectionRejectedReason : byte
 {
     /// <summary>
     /// Binding the local socket failed.

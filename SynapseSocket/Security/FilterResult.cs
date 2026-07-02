@@ -3,7 +3,7 @@
 /// <summary>
 /// Result of running an incoming packet through the lowest-level filter.
 /// </summary>
-public enum FilterResult
+public enum FilterResult : byte
 {
     /// <summary>
     /// Packet passed all filter checks and may be processed.

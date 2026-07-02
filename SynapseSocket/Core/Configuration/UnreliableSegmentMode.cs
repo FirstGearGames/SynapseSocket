@@ -3,7 +3,7 @@
 /// <summary>
 /// Controls how the engine handles unreliable payloads that exceed the MTU.
 /// </summary>
-public enum UnreliableSegmentMode
+public enum UnreliableSegmentMode : byte
 {
     /// <summary>
     /// Throw when an unreliable payload exceeds the MTU.

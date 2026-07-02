@@ -3,7 +3,7 @@ namespace SynapseSocket.Core.Configuration;
 /// <summary>
 /// Controls which NAT traversal strategy the engine uses when a direct connection fails.
 /// </summary>
-public enum NatTraversalMode
+public enum NatTraversalMode : byte
 {
     /// <summary>
     /// NAT traversal is disabled. Only direct connections are attempted.
