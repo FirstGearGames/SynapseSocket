@@ -233,10 +233,12 @@ internal sealed partial class IngressEngine
 
             try
             {
-                // Poll(0) returns immediately: true when a datagram is ready (or the socket is closed), false when
-                // there is nothing to read. The socket stays in blocking mode, so sends are unaffected, and because
-                // the engine is single-threaded a readable result guarantees ReceiveFrom will not block.
-                if (!_socket.Poll(0, SelectMode.SelectRead))
+                // Available (FIONREAD) reports the pending datagram bytes and is reliable across runtimes, whereas
+                // Socket.Poll(0, SelectRead) under Unity's Mono can report no data on a UDP socket that has some — the
+                // single-process loopback handshake stalls there while it connects under .NET. The socket stays in blocking
+                // mode, so sends are unaffected, and because the engine is single-threaded a positive Available guarantees
+                // ReceiveFrom will not block.
+                if (_socket.Available == 0)
                     break;
 
                 receivedLength = _socket.ReceiveFrom(_receiveBuffer, 0, MaximumUdpDatagramSize, SocketFlags.None, ref remoteEndPoint);
