@@ -28,6 +28,14 @@ public sealed class ConnectionManager
     /// </summary>
     public IReadOnlyDictionary<IPEndPoint, SynapseConnection> ConnectionsByEndPoint => _connectionsByEndPoint;
     private readonly ConcurrentDictionary<IPEndPoint, SynapseConnection> _connectionsByEndPoint = new(IPEndPointComparer.Default);
+#if NET8_0_OR_GREATER
+    /// <summary>
+    /// Maps a connection's serialized <see cref="SocketAddress"/> to its <see cref="SynapseConnection"/>, so the
+    /// allocation-free receive path resolves the sender without materializing an <see cref="IPEndPoint"/> per datagram.
+    /// SocketAddress equality and hashing read the address buffer, so the reusable receive instance works as a lookup key.
+    /// </summary>
+    private readonly Dictionary<SocketAddress, SynapseConnection> _connectionsBySocketAddress = [];
+#endif
     /// <summary>
     /// Maps a connection's 64-bit signature to its <see cref="SynapseConnection"/>.
     /// </summary>
@@ -59,6 +67,9 @@ public sealed class ConnectionManager
             synapseConnection.Initialize(endPoint, signature, connectionsIndex);
 
             _connectionsByEndPoint[endPoint] = synapseConnection;
+#if NET8_0_OR_GREATER
+            _connectionsBySocketAddress[synapseConnection.RemoteSocketAddress] = synapseConnection;
+#endif
             _connections.Add(synapseConnection);
         }
 
@@ -85,6 +96,9 @@ public sealed class ConnectionManager
     {
         if (_connectionsByEndPoint.TryRemove(endPoint, out SynapseConnection? old))
         {
+#if NET8_0_OR_GREATER
+            _connectionsBySocketAddress.Remove(old.RemoteSocketAddress);
+#endif
             if (old.ConnectionsIndex is not SynapseConnection.UnsetConnectionsIndex)
             {
                 int lastIndex = _connections.Count - 1;
@@ -108,6 +122,9 @@ public sealed class ConnectionManager
         synapseConnection.Initialize(endPoint, signature, connectionsIndex);
 
         _connectionsByEndPoint[endPoint] = synapseConnection;
+#if NET8_0_OR_GREATER
+        _connectionsBySocketAddress[synapseConnection.RemoteSocketAddress] = synapseConnection;
+#endif
         _connections.Add(synapseConnection);
 
         if (!_connectionsBySignature.TryAdd(signature, synapseConnection))
@@ -128,6 +145,9 @@ public sealed class ConnectionManager
 
         if (isRemoved && removedSynapseConnection is not null)
         {
+#if NET8_0_OR_GREATER
+            _connectionsBySocketAddress.Remove(removedSynapseConnection.RemoteSocketAddress);
+#endif
             _connectionsBySignature.TryRemove(removedSynapseConnection.Signature, out _);
 
             int connectionsIndex = removedSynapseConnection.ConnectionsIndex;
@@ -162,9 +182,22 @@ public sealed class ConnectionManager
     public void Clear()
     {
         _connectionsByEndPoint.Clear();
+#if NET8_0_OR_GREATER
+        _connectionsBySocketAddress.Clear();
+#endif
         _connectionsBySignature.Clear();
         _connections.Clear();
     }
+
+#if NET8_0_OR_GREATER
+    /// <summary>
+    /// Resolves a connection from a serialized sender address, without materializing an <see cref="IPEndPoint"/>.
+    /// </summary>
+    /// <param name="socketAddress">The sender's address, typically the receive path's reusable instance.</param>
+    /// <param name="synapseConnection">When this method returns true, the resolved connection.</param>
+    /// <returns>True when a connection is registered for the address.</returns>
+    public bool TryGetBySocketAddress(SocketAddress socketAddress, out SynapseConnection? synapseConnection) => _connectionsBySocketAddress.TryGetValue(socketAddress, out synapseConnection);
+#endif
 
     /// <summary>
     /// Key wrapper that compares IPEndPoint by address+port without boxing.

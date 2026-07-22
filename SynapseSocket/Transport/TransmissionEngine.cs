@@ -48,6 +48,19 @@ public sealed partial class TransmissionEngine
     /// Cached delegate for <see cref="SendDirect"/>, handed to the latency simulator to avoid a per-call allocation.
     /// </summary>
     private readonly Action<ArraySegment<byte>, IPEndPoint> _sendDirect;
+#if NET8_0_OR_GREATER
+    /// <summary>
+    /// Serialized form of each send target, built once per endpoint. The EndPoint-based SendTo serializes the target into a
+    /// fresh SocketAddress on every call — two allocations per sent datagram for endpoints that never change — while the
+    /// SocketAddress overload sends with none.
+    /// </summary>
+    private readonly Dictionary<IPEndPoint, SocketAddress> _serializedSendTargets = [];
+    /// <summary>
+    /// Ceiling for <see cref="_serializedSendTargets"/>. Steady-state targets are the connected peers, so the cap only ever
+    /// engages under a flood of transient handshake targets; clearing simply re-serializes on the next send.
+    /// </summary>
+    private const int MaximumSerializedSendTargets = 4096;
+#endif
 
     /// <summary>
     /// Creates a new transmission engine bound to the given sockets.
@@ -273,7 +286,24 @@ public sealed partial class TransmissionEngine
     private void SendDirect(ArraySegment<byte> segment, IPEndPoint target)
     {
         Socket socket = target.AddressFamily == AddressFamily.InterNetworkV6 && _ipv6Socket is not null ? _ipv6Socket : _ipv4Socket;
+
+#if NET8_0_OR_GREATER
+        /* The SocketAddress overload sends without serializing the endpoint; the EndPoint overload below re-serializes the
+         * same stable per-connection endpoint on every datagram. netstandard2.1 has no SocketAddress overload, so only the
+         * modern build takes this path. */
+        if (!_serializedSendTargets.TryGetValue(target, out SocketAddress? serializedTarget))
+        {
+            if (_serializedSendTargets.Count >= MaximumSerializedSendTargets)
+                _serializedSendTargets.Clear();
+
+            serializedTarget = target.Serialize();
+            _serializedSendTargets.Add(target, serializedTarget);
+        }
+
+        int bytesSent = socket.SendTo(segment.AsSpan(), SocketFlags.None, serializedTarget);
+#else
         int bytesSent = socket.SendTo(segment.Array!, segment.Offset, segment.Count, SocketFlags.None, target);
+#endif
         _telemetry.OnSent(bytesSent);
     }
 

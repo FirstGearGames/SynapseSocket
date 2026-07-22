@@ -22,6 +22,15 @@ public sealed partial class SynapseConnection : IPoolResettable
     /// </summary>
     [PoolResettableMember]
     public IPEndPoint RemoteEndPoint { get; private set; }
+#if NET8_0_OR_GREATER
+    /// <summary>
+    /// <see cref="RemoteEndPoint"/> serialized once at <see cref="Initialize"/>, so the allocation-free
+    /// <see cref="System.Net.Sockets.Socket"/> SocketAddress send and receive overloads never re-serialize the endpoint per
+    /// datagram. Unavailable on netstandard2.1, whose Socket API has no SocketAddress overloads.
+    /// </summary>
+    [PoolResettableMember]
+    public SocketAddress RemoteSocketAddress { get; private set; }
+#endif
     /// <summary>
     /// The computed signature binding this connection to a physical identity.
     /// </summary>
@@ -117,6 +126,9 @@ public sealed partial class SynapseConnection : IPoolResettable
     public void Initialize(IPEndPoint remoteEndPoint, ulong signature, int connectionsIndex)
     {
         RemoteEndPoint = remoteEndPoint ?? throw new ArgumentNullException(nameof(remoteEndPoint));
+#if NET8_0_OR_GREATER
+        RemoteSocketAddress = remoteEndPoint.Serialize();
+#endif
         Signature = signature;
         ConnectionsIndex = connectionsIndex;
         State = ConnectionState.Pending;
@@ -261,6 +273,9 @@ public sealed partial class SynapseConnection : IPoolResettable
     public void OnReturn()
     {
         RemoteEndPoint = null;
+#if NET8_0_OR_GREATER
+        RemoteSocketAddress = null;
+#endif
         TransmissionEngine = null;
         Signature = SecurityProvider.UnsetSignature;
         ConnectionsIndex = UnsetConnectionsIndex;

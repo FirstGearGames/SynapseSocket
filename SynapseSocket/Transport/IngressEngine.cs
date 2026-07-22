@@ -191,6 +191,19 @@ internal sealed partial class IngressEngine
     /// Wildcard source endpoint handed (by ref) to each blocking receive; the kernel overwrites it with the sender.
     /// </summary>
     private EndPoint? _anyEndPoint;
+#if NET8_0_OR_GREATER
+    /// <summary>
+    /// Reusable sender address the allocation-free receive overload fills per datagram, resolved against the connection
+    /// table without materializing an <see cref="IPEndPoint"/>. The classic ref-EndPoint receive allocates a SocketAddress,
+    /// an IPEndPoint, and an IPAddress per datagram; this instance replaces all three for every known sender.
+    /// </summary>
+    private SocketAddress? _receivedSocketAddress;
+    /// <summary>
+    /// Template endpoint <see cref="_receivedSocketAddress"/> materializes unknown senders through — handshake and
+    /// violation paths still need a real <see cref="IPEndPoint"/>, and creating one is the exception, not the per-datagram rule.
+    /// </summary>
+    private IPEndPoint? _endPointTemplate;
+#endif
 
     /// <summary>
     /// Allocates the receive buffer and marks the engine running. Called once by the manager before the first poll.
@@ -198,6 +211,10 @@ internal sealed partial class IngressEngine
     public void Start()
     {
         _anyEndPoint = _socket.AddressFamily == AddressFamily.InterNetworkV6 ? new IPEndPoint(IPAddress.IPv6Any, 0) : new IPEndPoint(IPAddress.Any, 0);
+#if NET8_0_OR_GREATER
+        _receivedSocketAddress = new(_socket.AddressFamily);
+        _endPointTemplate = (IPEndPoint)_anyEndPoint;
+#endif
         _receiveBuffer = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
         IsRunning = true;
     }
@@ -241,7 +258,14 @@ internal sealed partial class IngressEngine
                 if (_socket.Available == 0)
                     break;
 
+#if NET8_0_OR_GREATER
+                /* The SocketAddress overload fills the reusable instance in place. The classic ref-EndPoint overload below
+                 * allocates a SocketAddress, an IPEndPoint, and an IPAddress for every datagram; netstandard2.1 has no
+                 * allocation-free alternative, so only the modern build takes this path. */
+                receivedLength = _socket.ReceiveFrom(_receiveBuffer.AsSpan(0, MaximumUdpDatagramSize), SocketFlags.None, _receivedSocketAddress!);
+#else
                 receivedLength = _socket.ReceiveFrom(_receiveBuffer, 0, MaximumUdpDatagramSize, SocketFlags.None, ref remoteEndPoint);
+#endif
             }
             catch (ObjectDisposedException)
             {
@@ -271,7 +295,17 @@ internal sealed partial class IngressEngine
 
             try
             {
+#if NET8_0_OR_GREATER
+                /* A known sender resolves to its connection's stable endpoint without materializing anything; only an unknown
+                 * sender — a handshake, probe, or violation, never the steady state — pays for a fresh IPEndPoint. */
+                IPEndPoint fromEndPoint = _connections.TryGetBySocketAddress(_receivedSocketAddress!, out SynapseConnection? resolvedConnection)
+                    ? resolvedConnection!.RemoteEndPoint
+                    : (IPEndPoint)_endPointTemplate!.Create(_receivedSocketAddress!);
+
+                HandleDatagram(_receiveBuffer, receivedLength, fromEndPoint);
+#else
                 HandleDatagram(_receiveBuffer, receivedLength, (IPEndPoint)remoteEndPoint);
+#endif
             }
             catch (Exception unexpectedException)
             {
