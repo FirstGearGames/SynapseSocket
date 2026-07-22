@@ -48,6 +48,16 @@ public sealed partial class TransmissionEngine
     /// Cached delegate for <see cref="SendDirect"/>, handed to the latency simulator to avoid a per-call allocation.
     /// </summary>
     private readonly Action<ArraySegment<byte>, IPEndPoint> _sendDirect;
+    /// <summary>
+    /// The single remote the engine's socket is OS-connected to when <see cref="SynapseConfig.ConnectedSocketEnabled"/> engaged,
+    /// or null for the ordinary any-target mode. Sends to it go through the endpoint-free Send call — no per-datagram target
+    /// serialization on any runtime.
+    /// </summary>
+    private IPEndPoint? _connectedRemoteEndPoint;
+    /// <summary>
+    /// The OS-connected socket sends to <see cref="_connectedRemoteEndPoint"/> ride, resolved once when the connection is made.
+    /// </summary>
+    private Socket? _connectedSocket;
 #if NET8_0_OR_GREATER
     /// <summary>
     /// Serialized form of each send target, built once per endpoint. The EndPoint-based SendTo serializes the target into a
@@ -80,6 +90,17 @@ public sealed partial class TransmissionEngine
         _latencySimulator = latency;
         _isLatencySimulatorEnabled = _latencySimulator.IsEnabled;
         _sendDirect = SendDirect;
+    }
+
+    /// <summary>
+    /// Routes every future send addressed to the remote through the endpoint-free Send call on the OS-connected socket.
+    /// </summary>
+    /// <param name="connectedSocket">The socket that has been OS-connected to <paramref name="remoteEndPoint"/>.</param>
+    /// <param name="remoteEndPoint">The remote the socket is connected to.</param>
+    public void SetConnectedRemote(Socket connectedSocket, IPEndPoint remoteEndPoint)
+    {
+        _connectedSocket = connectedSocket;
+        _connectedRemoteEndPoint = remoteEndPoint;
     }
 
     /// <summary>
@@ -285,6 +306,17 @@ public sealed partial class TransmissionEngine
     /// <param name="target">The remote endpoint to send to.</param>
     private void SendDirect(ArraySegment<byte> segment, IPEndPoint target)
     {
+        /* A connected socket sends through the endpoint-free Send call — the SendTo paths below serialize the target per
+         * datagram (unavoidably so on Unity's Mono). Reference equality catches the steady state (every per-connection send
+         * addresses the stored RemoteEndPoint instance); the value fallback covers a caller-built equal endpoint. */
+        if (_connectedRemoteEndPoint is not null && (ReferenceEquals(target, _connectedRemoteEndPoint) || _connectedRemoteEndPoint.Equals(target)))
+        {
+            int connectedBytesSent = _connectedSocket!.Send(segment.Array!, segment.Offset, segment.Count, SocketFlags.None);
+            _telemetry.OnSent(connectedBytesSent);
+
+            return;
+        }
+
         Socket socket = target.AddressFamily == AddressFamily.InterNetworkV6 && _ipv6Socket is not null ? _ipv6Socket : _ipv4Socket;
 
 #if NET8_0_OR_GREATER

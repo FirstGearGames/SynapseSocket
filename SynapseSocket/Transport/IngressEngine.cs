@@ -191,6 +191,12 @@ internal sealed partial class IngressEngine
     /// Wildcard source endpoint handed (by ref) to each blocking receive; the kernel overwrites it with the sender.
     /// </summary>
     private EndPoint? _anyEndPoint;
+    /// <summary>
+    /// The single remote the socket is OS-connected to when <see cref="SynapseConfig.ConnectedSocketEnabled"/> engaged, or null
+    /// for the ordinary any-sender mode. A connected socket receives through the endpoint-free Receive call and every datagram
+    /// is attributed to this stable instance — no per-datagram endpoint serialization or materialization on any runtime.
+    /// </summary>
+    private IPEndPoint? _connectedRemoteEndPoint;
 #if NET8_0_OR_GREATER
     /// <summary>
     /// Reusable sender address the allocation-free receive overload fills per datagram, resolved against the connection
@@ -218,6 +224,13 @@ internal sealed partial class IngressEngine
         _receiveBuffer = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
         IsRunning = true;
     }
+
+    /// <summary>
+    /// Attributes every future receive to the single remote the socket has been OS-connected to, switching the drain onto the
+    /// endpoint-free Receive path.
+    /// </summary>
+    /// <param name="remoteEndPoint">The remote the socket is connected to.</param>
+    public void SetConnectedRemote(IPEndPoint remoteEndPoint) => _connectedRemoteEndPoint = remoteEndPoint;
 
     /// <summary>
     /// Marks the engine stopped and returns the receive buffer to the pool.
@@ -258,13 +271,26 @@ internal sealed partial class IngressEngine
                 if (_socket.Available == 0)
                     break;
 
+                /* A connected socket receives through the endpoint-free Receive call — no endpoint is serialized or
+                 * materialized on any runtime, which is the only zero-allocation receive Unity's Mono has at all. The kernel
+                 * already filtered the datagram to the connected remote, so attribution is the stable stored instance. */
+                if (_connectedRemoteEndPoint is not null)
+                {
+                    receivedLength = _socket.Receive(_receiveBuffer, 0, MaximumUdpDatagramSize, SocketFlags.None);
+                }
 #if NET8_0_OR_GREATER
                 /* The SocketAddress overload fills the reusable instance in place. The classic ref-EndPoint overload below
                  * allocates a SocketAddress, an IPEndPoint, and an IPAddress for every datagram; netstandard2.1 has no
-                 * allocation-free alternative, so only the modern build takes this path. */
-                receivedLength = _socket.ReceiveFrom(_receiveBuffer.AsSpan(0, MaximumUdpDatagramSize), SocketFlags.None, _receivedSocketAddress!);
+                 * allocation-free any-sender alternative, so only the modern build takes this path. */
+                else
+                {
+                    receivedLength = _socket.ReceiveFrom(_receiveBuffer.AsSpan(0, MaximumUdpDatagramSize), SocketFlags.None, _receivedSocketAddress!);
+                }
 #else
-                receivedLength = _socket.ReceiveFrom(_receiveBuffer, 0, MaximumUdpDatagramSize, SocketFlags.None, ref remoteEndPoint);
+                else
+                {
+                    receivedLength = _socket.ReceiveFrom(_receiveBuffer, 0, MaximumUdpDatagramSize, SocketFlags.None, ref remoteEndPoint);
+                }
 #endif
             }
             catch (ObjectDisposedException)
@@ -295,16 +321,26 @@ internal sealed partial class IngressEngine
 
             try
             {
+                if (_connectedRemoteEndPoint is not null)
+                {
+                    HandleDatagram(_receiveBuffer, receivedLength, _connectedRemoteEndPoint);
+                }
 #if NET8_0_OR_GREATER
                 /* A known sender resolves to its connection's stable endpoint without materializing anything; only an unknown
                  * sender — a handshake, probe, or violation, never the steady state — pays for a fresh IPEndPoint. */
-                IPEndPoint fromEndPoint = _connections.TryGetBySocketAddress(_receivedSocketAddress!, out SynapseConnection? resolvedConnection)
-                    ? resolvedConnection!.RemoteEndPoint
-                    : (IPEndPoint)_endPointTemplate!.Create(_receivedSocketAddress!);
+                else
+                {
+                    IPEndPoint fromEndPoint = _connections.TryGetBySocketAddress(_receivedSocketAddress!, out SynapseConnection? resolvedConnection)
+                        ? resolvedConnection!.RemoteEndPoint
+                        : (IPEndPoint)_endPointTemplate!.Create(_receivedSocketAddress!);
 
-                HandleDatagram(_receiveBuffer, receivedLength, fromEndPoint);
+                    HandleDatagram(_receiveBuffer, receivedLength, fromEndPoint);
+                }
 #else
-                HandleDatagram(_receiveBuffer, receivedLength, (IPEndPoint)remoteEndPoint);
+                else
+                {
+                    HandleDatagram(_receiveBuffer, receivedLength, (IPEndPoint)remoteEndPoint);
+                }
 #endif
             }
             catch (Exception unexpectedException)

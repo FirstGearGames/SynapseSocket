@@ -305,6 +305,9 @@ public sealed partial class SynapseManager : IDisposable
             throw new InvalidOperationException("Remote endpoint is blacklisted.");
         }
 
+        if (Config.ConnectedSocketEnabled)
+            ConnectSocketToRemote(endPoint);
+
         SynapseConnection synapseConnection = Connections.CreateNew(endPoint, signature);
 
         _transmissionEngine!.SendHandshake(endPoint);
@@ -553,6 +556,37 @@ public sealed partial class SynapseManager : IDisposable
     {
         if (!_isStarted || _transmissionEngine is null || _isDisposed)
             throw new InvalidOperationException("Engine is not running.");
+    }
+
+    /// <summary>
+    /// OS-connects the bound socket whose address family matches the remote, switching its ingress drain and every send
+    /// addressed to the remote onto the endpoint-free connected socket calls.
+    /// </summary>
+    /// <param name="endPoint">The single remote this engine will talk to.</param>
+    /// <remarks>With no family-matched bound socket the engine simply stays in any-sender mode, as
+    /// <see cref="SynapseConfig.ConnectedSocketEnabled"/> documents.</remarks>
+    private void ConnectSocketToRemote(IPEndPoint endPoint)
+    {
+        /* The OS filters a connected socket's inbound datagrams to the connected remote, and full-cone traversal depends on
+         * receiving probes from third parties — the combination can never work, so it fails loudly instead of silently. */
+        if (Config.NatTraversal.Mode == NatTraversalMode.FullCone)
+            throw new InvalidOperationException($"{nameof(SynapseConfig.ConnectedSocketEnabled)} cannot combine with full-cone NAT traversal: a connected socket cannot receive third-party probe datagrams.");
+
+        for (int index = 0; index < _sockets.Count; index++)
+        {
+            Socket socket = _sockets[index];
+
+            if (socket.AddressFamily != endPoint.AddressFamily)
+                continue;
+
+            socket.Connect(endPoint);
+
+            // Ingress engines are created in socket order, so the index pairs the drain with the socket it owns.
+            _ingressEngines[index].SetConnectedRemote(endPoint);
+            _transmissionEngine!.SetConnectedRemote(socket, endPoint);
+
+            return;
+        }
     }
 
     /// <summary>
