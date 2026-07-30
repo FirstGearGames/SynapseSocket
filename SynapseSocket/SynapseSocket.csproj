@@ -33,6 +33,13 @@
     <ItemGroup>
         <Compile Include="..\submodules\CodeBoost\CodeBoost\**\*.cs"
                  Link="CodeBoost\%(RecursiveDir)%(Filename)%(Extension)"/>
+        <!--
+            The transport is engine-agnostic and ships beside Nucleus.dll inside a game engine's project, so no engine's types
+            may reach it. CodeBoost's Unity subtree references UnityEngine, UnityEditor, TMPro and Sirenix, and is held out of a
+            non-Unity build only by #if guards inside a submodule this repository does not own. Removing it here makes the rule
+            the compiler's to enforce rather than a reviewer's to remember. Nothing in SynapseSocket references the namespace.
+        -->
+        <Compile Remove="..\submodules\CodeBoost\CodeBoost\Unity\**\*.cs"/>
     </ItemGroup>
     
 </Project>
