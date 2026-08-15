@@ -48,6 +48,16 @@ public class EngineLifecycleTests
     }
 
     [Fact]
+    public void Config_Copies_Received_Payloads_By_Default()
+    {
+        SynapseConfig synapseConfig = new();
+
+        /* The zero-copy path dispatches the ingress engine's own receive buffer, which the payload dispatch then
+         * returns to the pool while the engine still owns it, so the copy stays on until that return is conditional. */
+        Assert.True(synapseConfig.CopyReceivedPayloads);
+    }
+
+    [Fact]
     public void Dispose_Releases_Sockets_And_Stops_Running()
     {
         int port = TestHarness.GetFreePort();

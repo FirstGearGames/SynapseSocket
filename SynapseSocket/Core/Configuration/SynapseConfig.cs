@@ -65,11 +65,11 @@ public sealed class SynapseConfig
     /// <summary>
     /// When true (default), received payloads are copied into a fresh buffer before being dispatched via <see cref="SynapseManager.PacketReceived"/>.
     /// The copy is recycled after the event returns; do not retain references to <see cref="SynapseSocket.Core.Events.PacketReceivedEventArgs.Payload"/> beyond the handler.
-    /// When false, the internal payload buffer is dispatched directly and recycled immediately after the event returns.
+    /// When false, the unreliable fast path dispatches the ingress engine's own receive buffer directly, and that buffer is returned to <see cref="System.Buffers.ArrayPool{T}"/> after the event returns while the engine still owns it. Leave this true until that return is made conditional on the copy.
     /// Copy payload data within the handler if it is needed beyond the callback.
     /// Note: reliable and segmented receives always copy internally regardless of this setting.
     /// </summary>
-    public bool CopyReceivedPayloads = false;
+    public bool CopyReceivedPayloads = true;
 
     /// <summary>
     /// Enables telemetry counters.
