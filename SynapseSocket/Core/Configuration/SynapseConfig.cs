@@ -65,10 +65,18 @@ public sealed class SynapseConfig
     /// <summary>
     /// When true (default), received payloads are copied into a fresh buffer before being dispatched via <see cref="SynapseManager.PacketReceived"/>.
     /// The copy is recycled after the event returns; do not retain references to <see cref="SynapseSocket.Core.Events.PacketReceivedEventArgs.Payload"/> beyond the handler.
-    /// When false, the unreliable fast path dispatches the ingress engine's own receive buffer directly, and that buffer is returned to <see cref="System.Buffers.ArrayPool{T}"/> after the event returns while the engine still owns it. Leave this true until that return is made conditional on the copy.
+    /// When false, the unreliable fast path dispatches a segment of the ingress engine's own receive buffer directly, which removes the per-packet rental and copy entirely.
+    /// The engine keeps that buffer and overwrites it with the next datagram, so the payload is valid only for the duration of the handler and the handler must not poll the engine re-entrantly.
     /// Copy payload data within the handler if it is needed beyond the callback.
-    /// Note: reliable and segmented receives always copy internally regardless of this setting.
     /// </summary>
+    /// <remarks>
+    /// The default stays true because zero-copy narrows what a handler may safely assume. The delivered segment carries a
+    /// non-zero <see cref="System.ArraySegment{T}.Offset"/> into a 64 KiB buffer whose bytes outside
+    /// <see cref="System.ArraySegment{T}.Count"/> are the leading packet-type byte and the residue of earlier datagrams, so
+    /// a handler that reads <see cref="System.ArraySegment{T}.Array"/> wholesale instead of honouring the offset and count
+    /// sees the wrong bytes. Set this to false once the receiving handlers are known to respect both.
+    /// Note: reliable and segmented receives always copy internally regardless of this setting.
+    /// </remarks>
     public bool CopyReceivedPayloads = true;
 
     /// <summary>

@@ -123,7 +123,7 @@ await client.DisconnectAsync(connection);
 | `MaximumOutOfOrderReliablePackets` | 64 | Reorder buffer cap per connection; overflow raises a violation |
 | `MaximumConcurrentConnections` | 0 | Maximum simultaneous peers; 0 disables the cap |
 | `UnreliableSegmentMode` | `SegmentUnreliable` | How oversized unreliable payloads are handled |
-| `CopyReceivedPayloads` | `true` | When false, the ingress buffer is handed directly to the callback (zero-copy), which the engine is not yet safe against |
+| `CopyReceivedPayloads` | `true` | When false, the unreliable fast path hands a segment of the ingress receive buffer directly to the callback (zero-copy); the payload is valid only for the duration of the handler, which must honour the segment's offset and count |
 | `SegmentAssemblyTimeoutMilliseconds` | 5000 | Incomplete assemblies older than this are evicted; 0 disables |
 | `IsTelemetryEnabled` | `false` | Enables byte/packet counters |
 | `Reliable.MaximumPending` | 256 | Unacknowledged reliable packets per connection before backpressure |

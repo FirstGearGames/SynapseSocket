@@ -52,8 +52,9 @@ public class EngineLifecycleTests
     {
         SynapseConfig synapseConfig = new();
 
-        /* The zero-copy path dispatches the ingress engine's own receive buffer, which the payload dispatch then
-         * returns to the pool while the engine still owns it, so the copy stays on until that return is conditional. */
+        /* Zero-copy is safe to switch on now that the payload dispatch only returns buffers it actually rented, but it
+         * hands out a segment of a reused 64 KiB buffer whose bytes outside the segment belong to other datagrams. The
+         * copy stays on by default so a handler that ignores the segment's offset and count cannot silently misread. */
         Assert.True(synapseConfig.CopyReceivedPayloads);
     }
 

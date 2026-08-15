@@ -644,10 +644,20 @@ public sealed partial class SynapseManager : IDisposable
     }
 
     /// <summary>
-    /// Ingress callback: wraps the delivered payload in a pooled <see cref="PacketReceivedEventArgs"/>
-    /// and raises <see cref="PacketReceived"/>. Returns the payload buffer to the pool in the finally block.
+    /// Ingress callback: wraps the delivered payload in a <see cref="PacketReceivedEventArgs"/> and raises
+    /// <see cref="PacketReceived"/>. Returns the payload buffer to the pool in the finally block, but only when the
+    /// ingress path rented that buffer for this delivery and handed ownership over with it.
     /// </summary>
-    private void OnPayloadDelivered(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable)
+    /// <param name="synapseConnection">The connection the payload arrived on.</param>
+    /// <param name="payload">The complete payload to dispatch.</param>
+    /// <param name="isReliable">True when the payload was sent reliably.</param>
+    /// <param name="isPayloadRented">
+    /// True when <paramref name="payload"/> is a per-delivery rental this method owns and must return. False when the
+    /// buffer is the ingress engine's own receive buffer, delivered zero-copy under
+    /// <see cref="Configuration.SynapseConfig.CopyReceivedPayloads"/>. Returning that one would put the engine's live
+    /// buffer back in the pool for a second owner to rent, and the engine would return it once more at shutdown.
+    /// </param>
+    private void OnPayloadDelivered(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable, bool isPayloadRented)
     {
         PacketReceivedEventArgs packetReceivedEventArgs = new(synapseConnection, payload, isReliable);
 
@@ -657,7 +667,7 @@ public sealed partial class SynapseManager : IDisposable
         }
         finally
         {
-            if (payload.Array is not null)
+            if (isPayloadRented && payload.Array is not null)
                 ArrayPool<byte>.Shared.Return(payload.Array);
         }
     }

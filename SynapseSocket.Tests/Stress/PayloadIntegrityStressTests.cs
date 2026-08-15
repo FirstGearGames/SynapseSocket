@@ -33,6 +33,15 @@ public class PayloadIntegrityStressTests
     /// <summary>Payload sizes per message; mixes unsegmented (&lt;=MTU) and multi-segment payloads.</summary>
     private static readonly int[] PayloadSizes = [16, 200, 1_100, 1_500, 3_000, 5_000, 800, 2_400];
 
+    /// <summary>Payload sizes that all stay under the MTU, so every send takes the unsegmented unreliable fast path.</summary>
+    private static readonly int[] UnsegmentedPayloadSizes = [16, 200, 512, 800, 1_100];
+
+    /// <summary>
+    /// Size the ingress engine rents its receive buffer at, mirroring <c>IngressEngine.MaximumUdpDatagramSize</c>.
+    /// Canaries rented at this size land in the same <see cref="ArrayPool{T}.Shared"/> size class as that buffer.
+    /// </summary>
+    private const int MaximumUdpDatagramSize = 65535;
+
     /// <summary>
     /// Fills a buffer with a pattern derived from <paramref name="seed"/>: bytes 0..3 hold the seed,
     /// every later byte is (seed + index) truncated to a byte.
@@ -40,13 +49,23 @@ public class PayloadIntegrityStressTests
     private static byte[] MakePatternedPayload(uint seed, int length)
     {
         byte[] payload = new byte[length];
-        payload[0] = (byte)(seed & 0xFF);
-        payload[1] = (byte)((seed >> 8) & 0xFF);
-        payload[2] = (byte)((seed >> 16) & 0xFF);
-        payload[3] = (byte)((seed >> 24) & 0xFF);
-        for (int i = 4; i < length; i++)
-            payload[i] = (byte)((seed + (uint)i) & 0xFF);
+        FillPattern(payload, seed, length);
+
         return payload;
+    }
+
+    /// <summary>
+    /// Writes the seed-derived pattern into the first <paramref name="length"/> bytes of <paramref name="buffer"/>.
+    /// </summary>
+    private static void FillPattern(byte[] buffer, uint seed, int length)
+    {
+        buffer[0] = (byte)(seed & 0xFF);
+        buffer[1] = (byte)((seed >> 8) & 0xFF);
+        buffer[2] = (byte)((seed >> 16) & 0xFF);
+        buffer[3] = (byte)((seed >> 24) & 0xFF);
+
+        for (int i = 4; i < length; i++)
+            buffer[i] = (byte)((seed + (uint)i) & 0xFF);
     }
 
     /// <summary>Returns a description of the first pattern violation in <paramref name="payload"/>, or null when it is intact.</summary>
@@ -335,6 +354,185 @@ public class PayloadIntegrityStressTests
         Assert.True(corruptions.IsEmpty, FormatCorruptions(corruptions));
     }
 
+    [Fact]
+    public void ZeroCopyUnreliablePayloads_StayIntact_AcrossManyPackets()
+    {
+        // CopyReceivedPayloads = false hands the ingress engine's own receive buffer straight to the callback on the
+        // unreliable fast path. The engine keeps that buffer for every later datagram, so nothing downstream may
+        // return it to the shared pool. Two detectors run here: each payload's pattern is validated the instant it is
+        // delivered, and datagram-sized canaries are rented AFTER traffic has already flowed, so a receive buffer
+        // wrongly handed back to the pool is rented out as a canary and then visibly overwritten by the datagrams
+        // that keep arriving into it.
+        const int Cycles = 8;
+        const int WarmupMessages = 32;
+        const int MessagesPerCycle = 400;
+        const int DatagramCanaryCount = 8;
+
+        ConcurrentBag<string> corruptions = [];
+        int totalReceived = 0;
+
+        for (int cycle = 0; cycle < Cycles && corruptions.IsEmpty; cycle++)
+        {
+            int port = TestHarness.GetFreePort();
+
+            void Tweak(SynapseConfig config)
+            {
+                config.CopyReceivedPayloads = false;
+                config.Security.Enabled = false;
+            }
+
+            using SynapseManager server = new(TestHarness.ServerConfig(port, Tweak));
+            using SynapseManager client = new(TestHarness.ClientConfig(Tweak));
+
+            using TestHarness.FailureObserver observer = TestHarness.ObserveFailures(server, client);
+
+            int receivedCount = 0;
+
+            server.PacketReceived += args =>
+            {
+                byte[] copy = args.Payload.ToArray();
+                string? violation = ValidatePattern(copy);
+
+                if (violation is not null)
+                    corruptions.Add($"cycle {cycle}: content {violation}");
+
+                Interlocked.Increment(ref receivedCount);
+            };
+
+            server.Start();
+            client.Start();
+
+            SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+            TestHarness.PumpUntil(() => connection.State == ConnectionState.Connected, 2_000, server, client);
+
+            // Warm up first. The receive buffer can only reach the pool once unreliable payloads have actually been
+            // delivered, so the datagram canaries have to be rented after that has had a chance to happen.
+            for (int message = 0; message < WarmupMessages; message++)
+            {
+                uint warmupSeed = (uint)(cycle * 1_000_000 + message + 1);
+                client.Send(connection, MakePatternedPayload(warmupSeed, UnsegmentedPayloadSizes[message % UnsegmentedPayloadSizes.Length]), isReliable: false);
+
+                server.Poll();
+                client.Poll();
+            }
+
+            TestHarness.PumpUntil(() => Volatile.Read(ref receivedCount) >= WarmupMessages, 4_000, server, client);
+
+            List<(byte[] buffer, int length, uint seed)> datagramCanaries = RentDatagramCanaries(cycle, DatagramCanaryCount);
+            List<(byte[] buffer, int length, uint seed)> canaries = RentCanaries(cycle);
+
+            for (int message = 0; message < MessagesPerCycle; message++)
+            {
+                uint seed = (uint)(cycle * 1_000_000 + WarmupMessages + message + 1);
+                client.Send(connection, MakePatternedPayload(seed, UnsegmentedPayloadSizes[message % UnsegmentedPayloadSizes.Length]), isReliable: false);
+
+                server.Poll();
+                client.Poll();
+            }
+
+            int expected = WarmupMessages + MessagesPerCycle;
+            TestHarness.PumpUntil(() => Volatile.Read(ref receivedCount) >= expected, 6_000, server, client);
+
+            VerifyCanaries(datagramCanaries, cycle, corruptions);
+            VerifyCanaries(canaries, cycle, corruptions);
+            ReturnCanaries(datagramCanaries);
+            ReturnCanaries(canaries);
+
+            totalReceived += receivedCount;
+
+            // Unreliable delivery is allowed to drop, but the fast path has to carry the overwhelming majority of
+            // what was sent or the integrity check above proves nothing.
+            if (receivedCount < expected * 9 / 10)
+                corruptions.Add($"cycle {cycle}: only {receivedCount}/{expected} unreliable payloads delivered");
+
+            observer.AssertNoFailures();
+
+            client.Disconnect(connection);
+        }
+
+        _output.WriteLine($"received={totalReceived} corruptions={corruptions.Count}");
+        Assert.True(corruptions.IsEmpty, FormatCorruptions(corruptions));
+    }
+
+    [Fact]
+    public void ZeroCopyReceiveBuffer_IsNotReturnedToTheSharedPool()
+    {
+        // The ingress engine rents exactly one datagram-sized receive buffer at Start and returns it at Stop. On the
+        // zero-copy fast path the delivery must not return it as well: a second return leaves the same array sitting
+        // in the shared pool more than once, and the pool then hands that one array to two owners at the same time.
+        const int Messages = 64;
+        const int Rentals = 16;
+        const int PayloadLength = 256;
+
+        int port = TestHarness.GetFreePort();
+        int receivedCount = 0;
+
+        void Tweak(SynapseConfig config)
+        {
+            config.CopyReceivedPayloads = false;
+            config.Security.Enabled = false;
+        }
+
+        using (SynapseManager server = new(TestHarness.ServerConfig(port, Tweak)))
+        using (SynapseManager client = new(TestHarness.ClientConfig(Tweak)))
+        {
+            using TestHarness.FailureObserver observer = TestHarness.ObserveFailures(server, client);
+
+            server.PacketReceived += _ => Interlocked.Increment(ref receivedCount);
+
+            server.Start();
+            client.Start();
+
+            SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+            Assert.True(TestHarness.PumpUntil(() => connection.State == ConnectionState.Connected, 2_000, server, client), "the client never connected");
+
+            for (int message = 0; message < Messages; message++)
+            {
+                client.Send(connection, MakePatternedPayload((uint)(message + 1), PayloadLength), isReliable: false);
+
+                server.Poll();
+                client.Poll();
+            }
+
+            Assert.True(TestHarness.PumpUntil(() => Volatile.Read(ref receivedCount) >= Messages, 4_000, server, client), $"only {receivedCount}/{Messages} unreliable payloads were delivered");
+
+            observer.AssertNoFailures();
+
+            client.Disconnect(connection);
+        }
+
+        // Both engines have stopped and returned their receive buffers exactly once each. Draw from the datagram size
+        // class: any reference the pool hands out twice is an array that was returned twice.
+        List<byte[]> distinctRentals = new(Rentals);
+        int duplicateCount = 0;
+
+        for (int i = 0; i < Rentals; i++)
+        {
+            byte[] rental = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
+            bool isDuplicate = false;
+
+            foreach (byte[] existingRental in distinctRentals)
+            {
+                if (ReferenceEquals(existingRental, rental))
+                {
+                    isDuplicate = true;
+                    break;
+                }
+            }
+
+            if (isDuplicate)
+                duplicateCount++;
+            else
+                distinctRentals.Add(rental);
+        }
+
+        // Only the distinct references go back, so a failing run leaves the pool no worse than it already is.
+        foreach (byte[] rental in distinctRentals)
+            ArrayPool<byte>.Shared.Return(rental);
+
+        Assert.True(duplicateCount == 0, $"the shared pool handed out {duplicateCount} duplicate datagram buffer(s), so the ingress receive buffer was returned to it more than once");
+    }
+
     /// <summary>Rents and patterns a batch of shared-pool buffers in size classes that overlap the engine's wire/payload buffers.</summary>
     private static List<(byte[] buffer, int length, uint seed)> RentCanaries(int cycle)
     {
@@ -352,6 +550,26 @@ public class PayloadIntegrityStressTests
                 Array.Copy(pattern, buffer, length);
                 canaries.Add((buffer, length, seed));
             }
+        }
+
+        return canaries;
+    }
+
+    /// <summary>
+    /// Rents and patterns buffers in the datagram size class the ingress engine's receive buffer occupies, so a
+    /// receive buffer wrongly returned to the shared pool is handed back here and is then caught the moment the
+    /// engine writes the next datagram into it.
+    /// </summary>
+    private static List<(byte[] buffer, int length, uint seed)> RentDatagramCanaries(int cycle, int count)
+    {
+        List<(byte[], int, uint)> canaries = new(count);
+
+        for (int i = 0; i < count; i++)
+        {
+            uint seed = (uint)(0xDA_00_00_00 + cycle * 100 + i);
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
+            FillPattern(buffer, seed, MaximumUdpDatagramSize);
+            canaries.Add((buffer, MaximumUdpDatagramSize, seed));
         }
 
         return canaries;

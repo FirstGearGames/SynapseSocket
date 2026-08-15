@@ -8,7 +8,18 @@ namespace SynapseSocket.Core.Events;
 /// <summary>
 /// Fired by the ingress path when a payload has been delivered to a connection.
 /// </summary>
-internal delegate void PayloadDeliveredHandler(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable);
+/// <param name="synapseConnection">The connection the payload arrived on.</param>
+/// <param name="payload">The complete payload, valid only for the duration of the callback.</param>
+/// <param name="isReliable">True when the payload was sent reliably.</param>
+/// <param name="isPayloadRented">
+/// True when <paramref name="payload"/> is backed by a buffer the ingress path rented from
+/// <see cref="System.Buffers.ArrayPool{T}"/> for this delivery alone. Ownership transfers to the subscriber, which
+/// must return the buffer once the delivery completes. False when the buffer belongs to the ingress engine itself
+/// (the zero-copy unreliable fast path under
+/// <see cref="SynapseSocket.Core.Configuration.SynapseConfig.CopyReceivedPayloads"/>), in which case the subscriber
+/// must not return it: the engine keeps reading and writing it for every later datagram and returns it at shutdown.
+/// </param>
+internal delegate void PayloadDeliveredHandler(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable, bool isPayloadRented);
 
 /// <summary>
 /// Fired by the ingress path when a connection is established or closed.

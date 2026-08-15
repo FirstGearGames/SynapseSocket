@@ -428,13 +428,16 @@ internal sealed partial class IngressEngine
 
             if (!_copyReceivedPayloads)
             {
-                PayloadDelivered?.Invoke(synapseConnection, new(buffer, PacketHeader.TypeSize, fastPayloadLength), false);
+                /* Zero-copy: the segment points straight into this engine's receive buffer, which is rented once in
+                 * Start and reused for every datagram. Ownership stays here, so the delivery is flagged unrented and
+                 * the subscriber must not return the array. */
+                PayloadDelivered?.Invoke(synapseConnection, new(buffer, PacketHeader.TypeSize, fastPayloadLength), isReliable: false, isPayloadRented: false);
             }
             else
             {
                 byte[] payloadCopyBuffer = ArrayPool<byte>.Shared.Rent(fastPayloadLength);
                 Buffer.BlockCopy(buffer, PacketHeader.TypeSize, payloadCopyBuffer, 0, fastPayloadLength);
-                PayloadDelivered?.Invoke(synapseConnection, new(payloadCopyBuffer, 0, fastPayloadLength), false);
+                PayloadDelivered?.Invoke(synapseConnection, new(payloadCopyBuffer, 0, fastPayloadLength), isReliable: false, isPayloadRented: true);
             }
 
             return;
@@ -603,7 +606,7 @@ internal sealed partial class IngressEngine
 
                     if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, new(segmentPayloadBuffer, 0, payloadLength), isReliable: false, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
                     {
-                        PayloadDelivered?.Invoke(synapseConnection, assembledPayload, false);
+                        PayloadDelivered?.Invoke(synapseConnection, assembledPayload, isReliable: false, isPayloadRented: true);
                     }
                     else if (isProtocolViolation)
                     {
@@ -654,6 +657,11 @@ internal sealed partial class IngressEngine
     /// <param name="sequence">The sequence number of the arriving packet.</param>
     /// <param name="payload">The payload bytes to deliver.</param>
     /// <param name="isReliable">True if the payload was sent reliably; forwarded to <see cref="PayloadDelivered"/>.</param>
+    /// <remarks>
+    /// Every payload reaching this method is backed by a buffer rented from <see cref="ArrayPool{T}.Shared"/>, whether it
+    /// arrived unsegmented, was reassembled, or was held in the reorder buffer. Ownership therefore always transfers to
+    /// the delivery, and the buffer is returned here on each path that drops a payload instead of delivering it.
+    /// </remarks>
     private void DeliverOrdered(SynapseConnection synapseConnection, ushort sequence, ArraySegment<byte> payload, bool isReliable)
     {
         List<ArraySegment<byte>>? toDeliver = null;
@@ -702,7 +710,7 @@ internal sealed partial class IngressEngine
         // Deliver after the sequence/reorder bookkeeping is done so user handlers may safely re-enter the engine
         // (e.g. SendReliable) from within the callback. No lock is needed — the engine is single-threaded.
         foreach (ArraySegment<byte> deliverPayload in toDeliver)
-            PayloadDelivered?.Invoke(synapseConnection, deliverPayload, isReliable);
+            PayloadDelivered?.Invoke(synapseConnection, deliverPayload, isReliable, isPayloadRented: true);
 
         ListPool<ArraySegment<byte>>.Return(toDeliver);
     }
