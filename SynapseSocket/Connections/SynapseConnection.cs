@@ -47,10 +47,20 @@ public sealed partial class SynapseConnection : IPoolResettable
     [PoolResettableMember]
     public ConnectionState State { get; internal set; }
     /// <summary>
-    /// UTC ticks of the last received packet from this peer.
+    /// UTC ticks of the last received packet from this peer. Drives timeout detection.
     /// </summary>
     [PoolResettableMember]
     public long LastReceivedTicks { get; internal set; }
+    /// <summary>
+    /// UTC ticks of the last packet of any type sent to this peer, stamped by every connection-addressed send.
+    /// Drives keep-alive scheduling: every datagram we send refreshes the peer's timeout, so a heartbeat is only owed
+    /// by a side that has gone quiet. Scheduling off this rather than <see cref="LastReceivedTicks"/> is what keeps a
+    /// receive-only peer emitting heartbeats. Such a peer takes a steady inbound stream and transmits nothing of its
+    /// own, so its last-received is always fresh while its last-sent is not, and scheduling off last-received would
+    /// leave it silent until the far side timed it out.
+    /// </summary>
+    [PoolResettableMember]
+    public long LastSentTicks { get; internal set; }
     /// <summary>
     /// UTC ticks of the last sent keep-alive to this peer.
     /// </summary>
@@ -132,7 +142,11 @@ public sealed partial class SynapseConnection : IPoolResettable
         Signature = signature;
         ConnectionsIndex = connectionsIndex;
         State = ConnectionState.Pending;
-        LastReceivedTicks = DateTime.UtcNow.Ticks;
+
+        long nowTicks = DateTime.UtcNow.Ticks;
+        LastReceivedTicks = nowTicks;
+        // Seeded so a brand-new connection does not owe a keep-alive on its very first maintenance sweep.
+        LastSentTicks = nowTicks;
     }
 
     /// <summary>
@@ -282,6 +296,7 @@ public sealed partial class SynapseConnection : IPoolResettable
         State = ConnectionState.Disconnected;
 
         LastReceivedTicks = 0;
+        LastSentTicks = 0;
         LastKeepAliveSentTicks = 0;
         UnansweredKeepAlives = 0;
 

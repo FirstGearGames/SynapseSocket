@@ -788,8 +788,13 @@ internal sealed partial class IngressEngine
 
         if (!isExistingConnection || synapseConnection.State != ConnectionState.Connected)
         {
+            long establishedTicks = DateTime.UtcNow.Ticks;
+
             synapseConnection.State = ConnectionState.Connected;
-            synapseConnection.LastReceivedTicks = DateTime.UtcNow.Ticks;
+            synapseConnection.LastReceivedTicks = establishedTicks;
+            // The handshake exchange that got us here is fresh traffic in both directions.
+            // Stamping last-sent too holds the keep-alive sweep a full interval out instead of firing on the first pass.
+            synapseConnection.LastSentTicks = establishedTicks;
             synapseConnection.TransmissionEngine = _sender;
 
             // Send a handshake-ack only when this side did not initiate the connection.

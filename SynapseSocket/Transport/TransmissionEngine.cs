@@ -153,7 +153,7 @@ public sealed partial class TransmissionEngine
         try
         {
             int written = PacketHeader.BuildPacket(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0, payload.AsSpan());
-            SendRaw(new(rentedBuffer, 0, written), synapseConnection.RemoteEndPoint);
+            SendToConnection(new(rentedBuffer, 0, written), synapseConnection);
         }
         finally
         {
@@ -189,7 +189,7 @@ public sealed partial class TransmissionEngine
 
         synapseConnection.PendingReliableQueue[sequence] = pendingReliable;
 
-        SendRaw(segments[0], synapseConnection.RemoteEndPoint);
+        SendToConnection(segments[0], synapseConnection);
     }
 
     /// <summary>
@@ -214,10 +214,15 @@ public sealed partial class TransmissionEngine
 
         List<ArraySegment<byte>> segments = splitter.Split(payload.AsSpan(), isReliable, out int segmentCount, sequence, out byte[] backingBuffer);
 
+        // One last-sent stamp covers the whole burst rather than routing each segment through SendToConnection.
+        // The segments leave back to back, so a per-segment clock read would buy nothing on a send of up to 255 of them.
+        long nowTicks = DateTime.UtcNow.Ticks;
+        synapseConnection.LastSentTicks = nowTicks;
+
         if (isReliable)
         {
             SynapseConnection.PendingReliable pendingReliable = ResettableObjectPool<SynapseConnection.PendingReliable>.Rent();
-            pendingReliable.Initialize(segments, backingBuffer, DateTime.UtcNow.Ticks);
+            pendingReliable.Initialize(segments, backingBuffer, nowTicks);
 
             synapseConnection.PendingReliableQueue[sequence] = pendingReliable;
 
@@ -253,7 +258,7 @@ public sealed partial class TransmissionEngine
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, sequence, 0, 0, 0);
-        SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint);
+        SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), synapseConnection);
     }
 
     /// <summary>
@@ -282,7 +287,7 @@ public sealed partial class TransmissionEngine
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
-        SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint);
+        SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), synapseConnection);
     }
 
     /// <summary>
@@ -295,7 +300,7 @@ public sealed partial class TransmissionEngine
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
-        SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), synapseConnection.RemoteEndPoint);
+        SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), synapseConnection);
     }
 
     /// <summary>
@@ -355,5 +360,31 @@ public sealed partial class TransmissionEngine
         {
             ArrayPool<byte>.Shared.Return(segment.Array!, clearArray: false);
         }
+    }
+
+    /// <summary>
+    /// Sends to a connection's remote endpoint, stamping <see cref="SynapseConnection.LastSentTicks"/> first. Every send
+    /// routed at a connection must go through this or <see cref="SendAndPoolBuffer(ArraySegment{byte}, SynapseConnection)"/>:
+    /// the keep-alive sweep reads that stamp to decide whether this side still owes the peer a heartbeat, so a send that
+    /// skips it would let the sweep emit a redundant one.
+    /// </summary>
+    /// <param name="segment">The wire-ready bytes to send.</param>
+    /// <param name="synapseConnection">The connection being sent to.</param>
+    private void SendToConnection(ArraySegment<byte> segment, SynapseConnection synapseConnection)
+    {
+        synapseConnection.LastSentTicks = DateTime.UtcNow.Ticks;
+        SendRaw(segment, synapseConnection.RemoteEndPoint);
+    }
+
+    /// <summary>
+    /// Connection-addressed <see cref="SendAndPoolBuffer(ArraySegment{byte}, IPEndPoint)"/>: stamps
+    /// <see cref="SynapseConnection.LastSentTicks"/>, then sends and returns the rental.
+    /// </summary>
+    /// <param name="segment">The wire-ready bytes to send; <see cref="ArraySegment{T}.Array"/> is returned to the pool after sending.</param>
+    /// <param name="synapseConnection">The connection being sent to.</param>
+    private void SendAndPoolBuffer(ArraySegment<byte> segment, SynapseConnection synapseConnection)
+    {
+        synapseConnection.LastSentTicks = DateTime.UtcNow.Ticks;
+        SendAndPoolBuffer(segment, synapseConnection.RemoteEndPoint);
     }
 }

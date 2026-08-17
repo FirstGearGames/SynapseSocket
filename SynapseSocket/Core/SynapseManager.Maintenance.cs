@@ -146,12 +146,17 @@ public sealed partial class SynapseManager
             return false;
         }
 
-        // Keep-alive: skip when traffic is already flowing; reset backoff when active.
+        // Inbound traffic of any kind proves the peer is still answering, so the backoff starts over.
+        // Whether this side owes a heartbeat is a separate question, decided below off what was sent.
         if (nowTicks - synapseConnection.LastReceivedTicks < _connectionKeepAliveTicks)
-        {
             synapseConnection.UnansweredKeepAlives = 0;
+
+        // Keep-alive: skip only when this side is already transmitting.
+        // Any packet sent refreshes the peer's timeout, so a side carrying traffic of its own owes no heartbeat.
+        // Scheduling off last-received instead would silence the peer that most needs to speak.
+        // A peer taking a steady inbound stream sends nothing at all, and the far side then times it out mid-stream.
+        if (nowTicks - synapseConnection.LastSentTicks < _connectionKeepAliveTicks)
             return true;
-        }
 
         // Exponential backoff: double the interval for each consecutive unanswered keep-alive, capped at 8×.
         long effectiveIntervalTicks = _connectionKeepAliveTicks << Math.Min(synapseConnection.UnansweredKeepAlives, 3);
@@ -226,6 +231,10 @@ public sealed partial class SynapseManager
             List<ArraySegment<byte>>? segments = pendingReliable.Segments;
             if (segments is null)
                 continue;
+
+            // A retransmit refreshes the peer's timeout like any other packet.
+            // It postpones the heartbeat exactly as an original send does.
+            synapseConnection.LastSentTicks = nowTicks;
 
             try
             {
