@@ -99,20 +99,7 @@ public sealed class ConnectionManager
 #if NET8_0_OR_GREATER
             _connectionsBySocketAddress.Remove(old.RemoteSocketAddress);
 #endif
-            if (old.ConnectionsIndex is not SynapseConnection.UnsetConnectionsIndex)
-            {
-                int lastIndex = _connections.Count - 1;
-
-                if (old.ConnectionsIndex < lastIndex)
-                {
-                    SynapseConnection swapped = _connections[lastIndex];
-                    swapped.ConnectionsIndex = old.ConnectionsIndex;
-                    _connections[old.ConnectionsIndex] = swapped;
-                }
-
-                _connections.RemoveAt(old.ConnectionsIndex < lastIndex ? old.ConnectionsIndex : lastIndex);
-                old.ConnectionsIndex = SynapseConnection.UnsetConnectionsIndex;
-            }
+            RemoveFromConnections(old);
 
             _connectionsBySignature.TryRemove(old.Signature, out _);
         }
@@ -150,26 +137,7 @@ public sealed class ConnectionManager
 #endif
             _connectionsBySignature.TryRemove(removedSynapseConnection.Signature, out _);
 
-            int connectionsIndex = removedSynapseConnection.ConnectionsIndex;
-            if (connectionsIndex is not SynapseConnection.UnsetConnectionsIndex)
-            {
-                int lastConnectionsIndex = _connections.Count - 1;
-
-                /* If connectionsIndex is the not last entry then
-                 * move the last connections entry to connectionsIndex
-                 * and update the ConnectionsIndex member for the moved
-                 * connection. */
-                if (connectionsIndex < lastConnectionsIndex)
-                {
-                    SynapseConnection otherConnection = _connections[lastConnectionsIndex];
-                    otherConnection.ConnectionsIndex = connectionsIndex;
-
-                    _connections[connectionsIndex] = otherConnection;
-                    removedSynapseConnection.ConnectionsIndex = SynapseConnection.UnsetConnectionsIndex;
-                }
-
-                _connections.RemoveAt(connectionsIndex);
-            }
+            RemoveFromConnections(removedSynapseConnection);
         }
 
         return isRemoved;
@@ -198,6 +166,35 @@ public sealed class ConnectionManager
     /// <returns>True when a connection is registered for the address.</returns>
     public bool TryGetBySocketAddress(SocketAddress socketAddress, out SynapseConnection? synapseConnection) => _connectionsBySocketAddress.TryGetValue(socketAddress, out synapseConnection);
 #endif
+
+/// <summary>
+    /// Unlinks a connection from the dense connections list with a swap-remove, keeping every surviving entry's <see cref="SynapseConnection.ConnectionsIndex"/> equal to its own slot and clearing the removed connection's.
+    /// </summary>
+    /// <param name="synapseConnection">The connection to unlink.</param>
+    /// <remarks>
+    /// Stated once rather than at each removal site, because both statements of it were wrong the same way: each moved the last entry into the freed slot and then removed the FREED slot, which deletes the entry just moved in and shifts the rest down, so the contents survive while every survivor's recorded index does not. The next removal then reads a stale index and evicts a live connection from the list or indexes past its end. Removing the tail is what makes the recorded indices true.
+    /// </remarks>
+    private void RemoveFromConnections(SynapseConnection synapseConnection)
+    {
+        int connectionsIndex = synapseConnection.ConnectionsIndex;
+
+        if (connectionsIndex is SynapseConnection.UnsetConnectionsIndex)
+            return;
+
+        int lastConnectionsIndex = _connections.Count - 1;
+
+        if (connectionsIndex < lastConnectionsIndex)
+        {
+            SynapseConnection movedSynapseConnection = _connections[lastConnectionsIndex];
+            movedSynapseConnection.ConnectionsIndex = connectionsIndex;
+            _connections[connectionsIndex] = movedSynapseConnection;
+        }
+
+        _connections.RemoveAt(lastConnectionsIndex);
+
+        // Cleared unconditionally: a tail removal left the outgoing connection carrying a live-looking index, and nothing resets it.
+        synapseConnection.ConnectionsIndex = SynapseConnection.UnsetConnectionsIndex;
+    }
 
     /// <summary>
     /// Key wrapper that compares IPEndPoint by address+port without boxing.
