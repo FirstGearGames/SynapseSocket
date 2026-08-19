@@ -51,10 +51,6 @@ public sealed partial class SynapseManager
     /// </summary>
     private readonly bool _isAckBatchingEnabled;
     /// <summary>
-    /// Sentinel value indicating that ACK batching interval is unset (batching disabled).
-    /// </summary>
-    public const long UnsetAckBatchingIntervalTicks = 0;
-    /// <summary>
     /// Sentinel value indicating that segment assembly timeout is disabled.
     /// </summary>
     private const long UnsetSegmentAssemblyTimeoutTicks = 0;

@@ -23,25 +23,10 @@ public sealed class ReliableConfig
     public uint MaximumRetries = 10;
 
     /// <summary>
-    /// When true, outgoing ACKs are queued and flushed in batches rather than sent immediately per packet.
-    /// Reduces ACK traffic under burst receive conditions at the cost of a small delivery delay.
-    /// Flush interval is controlled by <see cref="AckBatchIntervalMilliseconds"/>.
+    /// When true, outgoing ACKs are queued and flushed once per poll rather than sent immediately per packet.
+    /// Reduces ACK traffic under burst receive conditions at the cost of a delivery delay of one poll.
     /// </summary>
+    /// <remarks>The flush cadence is the poll cadence and is not separately configurable. An interval setting and its two clamp constants used to sit here, and none of the three was ever read: the flush has always run unconditionally from the maintenance pass.</remarks>
     public bool AckBatchingEnabled = true;
-
-    /// <summary>
-    /// Milliseconds between ACK batch flushes when <see cref="AckBatchingEnabled"/> is true.
-    /// Lower values reduce ACK latency; higher values improve batching efficiency under bursts.
-    /// </summary>
-    public uint AckBatchIntervalMilliseconds = 20;
-
-    /// <summary>
-    /// Minimum permitted value for <see cref="AckBatchIntervalMilliseconds"/>. Values below this are clamped up.
-    /// </summary>
-    public const uint MinimumAckBatchIntervalMilliseconds = 20;
-    /// <summary>
-    /// Maximum permitted value for <see cref="AckBatchIntervalMilliseconds"/>. Values above this are clamped down.
-    /// </summary>
-    public const uint MaximumAckBatchIntervalMilliseconds = 1000;
 
 }

@@ -1,7 +1,7 @@
 namespace SynapseSocket.Core.Configuration;
 
 /// <summary>
-/// Configuration for connection lifecycle: keep-alive heartbeats, timeout detection, and the maintenance sweep window.
+/// Configuration for connection lifecycle: keep-alive heartbeats and timeout detection.
 /// </summary>
 public sealed class ConnectionConfig
 {
@@ -14,9 +14,4 @@ public sealed class ConnectionConfig
     /// Time in milliseconds after which an idle connection is considered timed out.
     /// </summary>
     public uint TimeoutMilliseconds = 15000;
-
-    /// <summary>
-    /// Width of the maintenance sweep window in milliseconds.
-    /// </summary>
-    public uint SweepWindowMilliseconds = 50;
 }
