@@ -8,8 +8,8 @@
         <GenerateDocumentationFile>true</GenerateDocumentationFile>
         <NoWarn>$(NoWarn);CS1591</NoWarn>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-        <!-- Suppress warnings that originate in CodeBoost source files. -->
-        <NoWarn>$(NoWarn);CS8618;CS8625;CS0067</NoWarn>
+        <!-- Pre-nullable SynapseSocket source; previously attributed to the CodeBoost embed, but the warnings are local. -->
+        <NoWarn>$(NoWarn);CS8618;CS8625</NoWarn>
         <Description>Synapse - High-Performance Multi-Stack UDP Transport Engine</Description>
         <Version>1.0.0</Version>
         <TargetFrameworks>netstandard2.1;net8.0</TargetFrameworks>
@@ -26,20 +26,16 @@
                           OutputItemType="Analyzer"
                           ReferenceOutputAssembly="false"/>
 
+        <!--
+            CodeBoost is the shared assembly checked out beside this repository, the same copy Nucleus and every integration
+            reference, so a CodeBoost type is one type across the whole stack. Embedding its sources here instead would put a
+            second copy of every CodeBoost type into SynapseSocket.dll, and a Unity assembly referencing both DLLs cannot
+            disambiguate them: Unity has no extern alias. SynapseSocket.dll therefore ships beside CodeBoost.dll.
+        -->
+        <ProjectReference Include="..\..\CodeBoost\CodeBoost\CodeBoost.csproj"/>
+
         <!-- Only needed on netstandard2.1; built into net7.0+ -->
         <PackageReference Include="System.Runtime.CompilerServices.Unsafe" Version="5.0.0" Condition="'$(TargetFramework)' == 'netstandard2.1'" />
-    </ItemGroup>
-
-    <ItemGroup>
-        <Compile Include="..\submodules\CodeBoost\CodeBoost\**\*.cs"
-                 Link="CodeBoost\%(RecursiveDir)%(Filename)%(Extension)"/>
-        <!--
-            The transport is engine-agnostic and ships beside Nucleus.dll inside a game engine's project, so no engine's types
-            may reach it. CodeBoost's Unity subtree references UnityEngine, UnityEditor, TMPro and Sirenix, and is held out of a
-            non-Unity build only by #if guards inside a submodule this repository does not own. Removing it here makes the rule
-            the compiler's to enforce rather than a reviewer's to remember. Nothing in SynapseSocket references the namespace.
-        -->
-        <Compile Remove="..\submodules\CodeBoost\CodeBoost\Unity\**\*.cs"/>
     </ItemGroup>
     
 </Project>

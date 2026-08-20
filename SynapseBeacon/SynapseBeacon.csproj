@@ -19,7 +19,7 @@
                           OutputItemType="Analyzer"
                           ReferenceOutputAssembly="false"/>
 
-        <!-- CodeBoost source is transitively compiled into SynapseSocket; reference that for pools etc. -->
+        <!-- SynapseSocket references the shared CodeBoost project, which flows here transitively for pools etc. -->
         <ProjectReference Include="..\SynapseSocket\SynapseSocket.csproj" />
     </ItemGroup>
 
