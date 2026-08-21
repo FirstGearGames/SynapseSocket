@@ -173,7 +173,7 @@ public sealed partial class SynapseManager : IDisposable
 
     /// <summary>
     /// Binds all configured endpoints and prepares the ingress engines. After this returns the host must call
-    /// <see cref="Poll"/> regularly (e.g. once per frame) to receive datagrams and run maintenance — the engine
+    /// <see cref="Poll"/> regularly (e.g. once per frame) to receive datagrams and run maintenance, the engine
     /// spawns no background threads.
     /// </summary>
     public void Start()
@@ -322,9 +322,9 @@ public sealed partial class SynapseManager : IDisposable
     /// Sends an unreliable payload on the given connection.
     /// When the payload exceeds the MTU, behaviour is controlled by <see cref="SegmentConfig.UnreliableMode"/>:
     /// <list type="bullet">
-    /// <item><see cref="UnreliableSegmentMode.Disabled"/> — throws.</item>
-    /// <item><see cref="UnreliableSegmentMode.SegmentUnreliable"/> — splits into unreliable segments (default).</item>
-    /// <item><see cref="UnreliableSegmentMode.SegmentReliable"/> — splits into reliable segments.</item>
+    /// <item><see cref="UnreliableSegmentMode.Disabled"/>: throws.</item>
+    /// <item><see cref="UnreliableSegmentMode.SegmentUnreliable"/>: splits into unreliable segments (default).</item>
+    /// <item><see cref="UnreliableSegmentMode.SegmentReliable"/>: splits into reliable segments.</item>
     /// </list>
     /// </summary>
     public void Send(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable)
@@ -568,7 +568,7 @@ public sealed partial class SynapseManager : IDisposable
     private void ConnectSocketToRemote(IPEndPoint endPoint)
     {
         /* The OS filters a connected socket's inbound datagrams to the connected remote, and full-cone traversal depends on
-         * receiving probes from third parties — the combination can never work, so it fails loudly instead of silently. */
+         * receiving probes from third parties, the combination can never work, so it fails loudly instead of silently. */
         if (Config.NatTraversal.Mode == NatTraversalMode.FullCone)
             throw new InvalidOperationException($"{nameof(SynapseConfig.ConnectedSocketEnabled)} cannot combine with full-cone NAT traversal: a connected socket cannot receive third-party probe datagrams.");
 

@@ -15,8 +15,8 @@ namespace SynapseSocket.Transport;
 /// <summary>
 /// Transmission Engine (Sender).
 /// Manages outgoing packet flow for both the unreliable and reliable channels.
-/// Sends are synchronous and immediate (blocking <see cref="Socket.SendTo(byte[], int, int, SocketFlags, EndPoint)"/>)
-/// — the engine is single-threaded and driven by the host's poll, so there are no async continuations.
+/// Sends are synchronous and immediate (blocking <see cref="Socket.SendTo(byte[], int, int, SocketFlags, EndPoint)"/>).
+/// The engine is single-threaded and driven by the host's poll, so there are no async continuations.
 /// </summary>
 public sealed partial class TransmissionEngine
 {
@@ -50,7 +50,7 @@ public sealed partial class TransmissionEngine
     private readonly Action<ArraySegment<byte>, IPEndPoint> _sendDirect;
     /// <summary>
     /// The single remote the engine's socket is OS-connected to when <see cref="SynapseConfig.ConnectedSocketEnabled"/> engaged,
-    /// or null for the ordinary any-target mode. Sends to it go through the endpoint-free Send call — no per-datagram target
+    /// or null for the ordinary any-target mode. Sends to it go through the endpoint-free Send call, no per-datagram target
     /// serialization on any runtime.
     /// </summary>
     private IPEndPoint? _connectedRemoteEndPoint;
@@ -61,7 +61,7 @@ public sealed partial class TransmissionEngine
 #if NET8_0_OR_GREATER
     /// <summary>
     /// Serialized form of each send target, built once per endpoint. The EndPoint-based SendTo serializes the target into a
-    /// fresh SocketAddress on every call — two allocations per sent datagram for endpoints that never change — while the
+    /// fresh SocketAddress on every call, two allocations per sent datagram for endpoints that never change, while the
     /// SocketAddress overload sends with none.
     /// </summary>
     private readonly Dictionary<IPEndPoint, SocketAddress> _serializedSendTargets = [];
@@ -311,7 +311,7 @@ public sealed partial class TransmissionEngine
     /// <param name="target">The remote endpoint to send to.</param>
     private void SendDirect(ArraySegment<byte> segment, IPEndPoint target)
     {
-        /* A connected socket sends through the endpoint-free Send call — the SendTo paths below serialize the target per
+        /* A connected socket sends through the endpoint-free Send call, the SendTo paths below serialize the target per
          * datagram (unavoidably so on Unity's Mono). Reference equality catches the steady state (every per-connection send
          * addresses the stored RemoteEndPoint instance); the value fallback covers a caller-built equal endpoint. */
         if (_connectedRemoteEndPoint is not null && (ReferenceEquals(target, _connectedRemoteEndPoint) || _connectedRemoteEndPoint.Equals(target)))

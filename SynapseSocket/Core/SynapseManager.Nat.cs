@@ -10,17 +10,17 @@ namespace SynapseSocket.Core;
 /// <summary>
 /// NAT traversal support for <see cref="SynapseManager"/>.
 /// <para>
-/// <b>FullCone mode:</b> both peers already know each other's external endpoint — typically
+/// <b>FullCone mode:</b> both peers already know each other's external endpoint, typically
 /// because they discovered each other through an out-of-band rendezvous service (see the
 /// <c>SynapseBeacon</c> sister project). <see cref="Connect"/> first waits
 /// <see cref="FullConeNatConfig.DirectAttemptMilliseconds"/> for a direct connection; if the
 /// connection is still pending it falls back to timed probe bursts that open NAT mappings on
-/// both sides simultaneously. The state machine is advanced by <see cref="Poll"/> — there is no
+/// both sides simultaneously. The state machine is advanced by <see cref="Poll"/>, there is no
 /// background task.
 /// </para>
 /// <para>
-/// Rendezvous/relay signaling itself is intentionally NOT implemented in SynapseSocket —
-/// external protocols should piggyback on the engine's UDP socket using the
+/// Rendezvous/relay signaling itself is intentionally NOT implemented in SynapseSocket.
+/// External protocols should piggyback on the engine's UDP socket using the
 /// <see cref="SynapseManager.SendRaw"/> and <see cref="SynapseManager.UnknownPacketReceived"/>
 /// extension API so the NAT mapping opened by talking to the rendezvous service is the same
 /// mapping used for peer-to-peer traffic.

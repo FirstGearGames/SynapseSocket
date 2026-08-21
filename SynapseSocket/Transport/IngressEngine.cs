@@ -180,7 +180,7 @@ internal sealed partial class IngressEngine
 
     /// <summary>
     /// Maximum UDP datagram size. The engine always receives into a buffer this large so that oversized datagrams
-    /// are not silently truncated by the kernel — the security layer must see them to raise an Oversized violation.
+    /// are not silently truncated by the kernel, the security layer must see them to raise an Oversized violation.
     /// </summary>
     private const int MaximumUdpDatagramSize = 65535;
     /// <summary>
@@ -194,7 +194,7 @@ internal sealed partial class IngressEngine
     /// <summary>
     /// The single remote the socket is OS-connected to when <see cref="SynapseConfig.ConnectedSocketEnabled"/> engaged, or null
     /// for the ordinary any-sender mode. A connected socket receives through the endpoint-free Receive call and every datagram
-    /// is attributed to this stable instance — no per-datagram endpoint serialization or materialization on any runtime.
+    /// is attributed to this stable instance, no per-datagram endpoint serialization or materialization on any runtime.
     /// </summary>
     private IPEndPoint? _connectedRemoteEndPoint;
 #if NET8_0_OR_GREATER
@@ -205,7 +205,7 @@ internal sealed partial class IngressEngine
     /// </summary>
     private SocketAddress? _receivedSocketAddress;
     /// <summary>
-    /// Template endpoint <see cref="_receivedSocketAddress"/> materializes unknown senders through — handshake and
+    /// Template endpoint <see cref="_receivedSocketAddress"/> materializes unknown senders through, handshake and
     /// violation paths still need a real <see cref="IPEndPoint"/>, and creating one is the exception, not the per-datagram rule.
     /// </summary>
     private IPEndPoint? _endPointTemplate;
@@ -264,14 +264,14 @@ internal sealed partial class IngressEngine
             try
             {
                 // Available (FIONREAD) reports the pending datagram bytes and is reliable across runtimes, whereas
-                // Socket.Poll(0, SelectRead) under Unity's Mono can report no data on a UDP socket that has some — the
+                // Socket.Poll(0, SelectRead) under Unity's Mono can report no data on a UDP socket that has some, the
                 // single-process loopback handshake stalls there while it connects under .NET. The socket stays in blocking
                 // mode, so sends are unaffected, and because the engine is single-threaded a positive Available guarantees
                 // ReceiveFrom will not block.
                 if (_socket.Available == 0)
                     break;
 
-                /* A connected socket receives through the endpoint-free Receive call — no endpoint is serialized or
+                /* A connected socket receives through the endpoint-free Receive call, no endpoint is serialized or
                  * materialized on any runtime, which is the only zero-allocation receive Unity's Mono has at all. The kernel
                  * already filtered the datagram to the connected remote, so attribution is the stable stored instance. */
                 if (_connectedRemoteEndPoint is not null)
@@ -327,7 +327,7 @@ internal sealed partial class IngressEngine
                 }
 #if NET8_0_OR_GREATER
                 /* A known sender resolves to its connection's stable endpoint without materializing anything; only an unknown
-                 * sender — a handshake, probe, or violation, never the steady state — pays for a fresh IPEndPoint. */
+                 * sender (a handshake, probe, or violation, never the steady state) pays for a fresh IPEndPoint. */
                 else
                 {
                     IPEndPoint fromEndPoint = _connections.TryGetBySocketAddress(_receivedSocketAddress!, out SynapseConnection? resolvedConnection)
@@ -353,7 +353,7 @@ internal sealed partial class IngressEngine
 
     /// <summary>
     /// Runs the lowest-level mitigations on one received datagram and dispatches it to the packet handlers.
-    /// Established connections skip signature recomputation and blacklist lookup — those only apply at handshake
+    /// Established connections skip signature recomputation and blacklist lookup, those only apply at handshake
     /// time. Size and rate-limit checks still run for all senders.
     /// </summary>
     /// <param name="buffer">The raw receive buffer containing the datagram.</param>
@@ -412,7 +412,7 @@ internal sealed partial class IngressEngine
     /// <param name = "nowTicks"></param>
     private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, SynapseConnection? synapseConnection, long nowTicks)
     {
-        // Fast path: unreliable unsegmented payload — the dominant case.
+        // Fast path: unreliable unsegmented payload, the dominant case.
         // PacketType.None = 0, header is exactly one byte. Filter guarantees length > 0.
         // Skip PacketHeader.Read entirely; no other fields are needed.
         if (buffer[0] == (byte)PacketType.None)
@@ -443,7 +443,7 @@ internal sealed partial class IngressEngine
             return;
         }
 
-        // Unknown packet type — byte outside the Synapse PacketType range.
+        // Unknown packet type, byte outside the Synapse PacketType range.
         // External protocols (e.g. beacon/rendezvous clients) piggyback here intentionally.
         byte typeByte = buffer[0];
 
@@ -490,7 +490,7 @@ internal sealed partial class IngressEngine
             return;
         }
 
-        // Connection-less packet types — handled before any connection lookup.
+        // Connection-less packet types, handled before any connection lookup.
         switch (type)
         {
             case PacketType.Handshake:
@@ -683,7 +683,7 @@ internal sealed partial class IngressEngine
         else
         {
             // Half-space comparison: if (sequence - NextExpectedSequence) wraps past the midpoint,
-            // the sequence is "behind" — a retransmit of an already-delivered packet. Discard it.
+            // the sequence is "behind", a retransmit of an already-delivered packet. Discard it.
             if (unchecked((ushort)(sequence - synapseConnection.NextExpectedSequence)) >= 32768)
             {
                 if (payload.Array is not null)
@@ -708,7 +708,7 @@ internal sealed partial class IngressEngine
         }
 
         // Deliver after the sequence/reorder bookkeeping is done so user handlers may safely re-enter the engine
-        // (e.g. SendReliable) from within the callback. No lock is needed — the engine is single-threaded.
+        // (e.g. SendReliable) from within the callback. No lock is needed, the engine is single-threaded.
         foreach (ArraySegment<byte> deliverPayload in toDeliver)
             PayloadDelivered?.Invoke(synapseConnection, deliverPayload, isReliable, isPayloadRented: true);
 
@@ -744,7 +744,7 @@ internal sealed partial class IngressEngine
 
         // Replay check: mix the handshake nonce into the cache key independently of the connection signature.
         // The connection signature is IP-based (stable across reconnects) so blacklisting survives reconnects.
-        // The replay key adds the nonce so each handshake is unique — reconnections from the same IP are
+        // The replay key adds the nonce so each handshake is unique, reconnections from the same IP are
         // not incorrectly rejected, and the nonce is meaningfully consumed.
         long nowTicks = DateTime.UtcNow.Ticks;
         ulong replayKey = MixHandshakeNonce(signature, handshakePayload);
@@ -799,7 +799,7 @@ internal sealed partial class IngressEngine
 
             // Send a handshake-ack only when this side did not initiate the connection.
             // If the connection was already in our table as Pending, we are the client waiting
-            // for the server's reply — echoing back would create an infinite ping-pong.
+            // for the server's reply, echoing back would create an infinite ping-pong.
             // We do respond for brand-new connections (!isExistingConnection) and for forced
             // reconnects where the peer was previously fully Connected (wasConnected).
             if (!isExistingConnection || wasConnected)

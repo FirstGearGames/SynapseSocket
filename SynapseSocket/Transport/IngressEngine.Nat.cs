@@ -73,7 +73,7 @@ internal sealed partial class IngressEngine
     /// <summary>
     /// Handles an inbound NatChallenge packet from an unrecognised endpoint.
     /// If the payload matches a token this engine issued, sends a handshake (completing the probe exchange).
-    /// Otherwise echoes the token back — this is the initiator side of a simultaneous P2P probe.
+    /// Otherwise echoes the token back, this is the initiator side of a simultaneous P2P probe.
     /// </summary>
     private void ProcessNatChallengeExchange(IPEndPoint fromEndPoint, ReadOnlySpan<byte> payload)
     {

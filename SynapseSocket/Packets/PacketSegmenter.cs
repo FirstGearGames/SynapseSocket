@@ -10,8 +10,8 @@ namespace SynapseSocket.Packets;
 /// <para>
 /// Two concrete subclasses cover the two sides of the pipeline:
 /// <list type="bullet">
-/// <item><see cref="PacketSplitter"/> — send side; splits outbound payloads into wire-ready segment packets.</item>
-/// <item><see cref="PacketReassembler"/> — receive side; feeds arriving segments into reassembly buffers.</item>
+/// <item><see cref="PacketSplitter"/>: send side; splits outbound payloads into wire-ready segment packets.</item>
+/// <item><see cref="PacketReassembler"/>: receive side; feeds arriving segments into reassembly buffers.</item>
 /// </list>
 /// </para>
 /// </summary>

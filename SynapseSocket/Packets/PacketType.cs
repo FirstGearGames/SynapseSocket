@@ -5,9 +5,9 @@ namespace SynapseSocket.Packets;
 /// Encoded as the first byte of every packet header.
 /// Optional header fields follow based on type:
 /// <list type="bullet">
-/// <item><see cref="Reliable"/>, <see cref="Ack"/>, <see cref="ReliableSegmented"/> — sequence number (2 bytes LE).</item>
-/// <item><see cref="Segmented"/> — segment ID (2 bytes LE), segment index (1 byte), segment count (1 byte).</item>
-/// <item><see cref="ReliableSegmented"/> — sequence number, then segment fields.</item>
+/// <item><see cref="Reliable"/>, <see cref="Ack"/>, <see cref="ReliableSegmented"/>: sequence number (2 bytes LE).</item>
+/// <item><see cref="Segmented"/>: segment ID (2 bytes LE), segment index (1 byte), segment count (1 byte).</item>
+/// <item><see cref="ReliableSegmented"/>: sequence number, then segment fields.</item>
 /// </list>
 /// All other types carry no additional header fields; any further bytes are payload.
 /// <para>

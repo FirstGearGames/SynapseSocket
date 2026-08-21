@@ -8,7 +8,7 @@ namespace SynapseSocket.Core;
 
 /// <summary>
 /// Background maintenance for <see cref="SynapseManager"/>: keep-alive sweeps, timeout detection, and reliable
-/// retransmission. Driven synchronously from <see cref="SynapseManager.Poll"/> on the host's thread — there are no
+/// retransmission. Driven synchronously from <see cref="SynapseManager.Poll"/> on the host's thread, there are no
 /// background loops.
 /// </summary>
 public sealed partial class SynapseManager

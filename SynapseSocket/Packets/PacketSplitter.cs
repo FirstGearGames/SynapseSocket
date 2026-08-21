@@ -20,9 +20,9 @@ public sealed class PacketSplitter : PacketSegmenter
 
     /// <summary>
     /// Splits a payload into one or more wire-ready segments packed into a single rented backing buffer.
-    /// Every element in the returned array is a slice of the same backing buffer — only <c>segments[0].Array</c> needs to be returned to <see cref="ArrayPool{T}.Shared"/>.
+    /// Every element in the returned array is a slice of the same backing buffer, only <c>segments[0].Array</c> needs to be returned to <see cref="ArrayPool{T}.Shared"/>.
     /// The outer <see cref="ArraySegment{T}"/> array is rented from <see cref="ArrayPool{T}"/> of <see cref="ArraySegment{T}"/> and must also be returned separately.
-    /// Use <paramref name="segmentCount"/> (not the array length) to iterate — the rented outer array may be larger than needed.
+    /// Use <paramref name="segmentCount"/> (not the array length) to iterate, the rented outer array may be larger than needed.
     /// </summary>
     /// <param name="payload">The application payload to split into segments.</param>
     /// <param name="isReliable">Whether the segments should be flagged for reliable delivery.</param>

@@ -7,10 +7,10 @@ namespace SynapseSocket.Packets;
 /// Wire-format header helpers for Synapse packets.
 /// Layout:
 ///   [0]      : PacketType (1 byte)
-///   [1..2]   : Sequence number (UInt16, little-endian) — only for <see cref="PacketType.Reliable"/>, <see cref="PacketType.Ack"/>, <see cref="PacketType.ReliableSegmented"/>
-///   [3..4]   : Segment Id (UInt16) — only for <see cref="PacketType.Segmented"/> and <see cref="PacketType.ReliableSegmented"/>
-///   [5]      : Segment Index (Byte) — only for <see cref="PacketType.Segmented"/> and <see cref="PacketType.ReliableSegmented"/>
-///   [6]      : Segment Count (Byte) — only for <see cref="PacketType.Segmented"/> and <see cref="PacketType.ReliableSegmented"/>
+///   [1..2]   : Sequence number (UInt16, little-endian), only for <see cref="PacketType.Reliable"/>, <see cref="PacketType.Ack"/>, <see cref="PacketType.ReliableSegmented"/>
+///   [3..4]   : Segment Id (UInt16), only for <see cref="PacketType.Segmented"/> and <see cref="PacketType.ReliableSegmented"/>
+///   [5]      : Segment Index (Byte), only for <see cref="PacketType.Segmented"/> and <see cref="PacketType.ReliableSegmented"/>
+///   [6]      : Segment Count (Byte), only for <see cref="PacketType.Segmented"/> and <see cref="PacketType.ReliableSegmented"/>
 ///   [...]    : Payload
 /// Explicit little-endian ordering is used for cross-platform consistency.
 /// </summary>

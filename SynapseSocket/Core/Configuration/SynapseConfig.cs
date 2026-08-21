@@ -55,8 +55,8 @@ public sealed class SynapseConfig
 
     /// <summary>
     /// Kernel-level UDP socket send buffer size (SO_SNDBUF) in bytes, applied on bind.
-    /// Defaults to <see cref="DisabledSocketBufferOverride"/> (leave the OS default untouched) —
-    /// send-side traffic is fan-out from a single process and paced by the app loop, so the
+    /// Defaults to <see cref="DisabledSocketBufferOverride"/> (leave the OS default untouched).
+    /// Send-side traffic is fan-out from a single process and paced by the app loop, so the
     /// typical OS default (~64 KiB) easily absorbs the small runs of segments a sender emits.
     /// Raise this only if you observe send-side back-pressure under genuine burst workloads.
     /// </summary>
@@ -91,7 +91,7 @@ public sealed class SynapseConfig
     /// </summary>
     /// <remarks>
     /// This is the client-mode allocation fix: ReceiveFrom serializes an endpoint and materializes the sender per datagram, and
-    /// SendTo re-serializes the target per datagram — on runtimes without the SocketAddress overloads (Unity's Mono) there is no
+    /// SendTo re-serializes the target per datagram, on runtimes without the SocketAddress overloads (Unity's Mono) there is no
     /// other way around either cost. A connected socket touches no endpoint at all in steady state, on every runtime.
     /// The OS also filters inbound datagrams to the connected remote, so this mode is only for an engine that talks to exactly
     /// one peer: it cannot host multiple remotes, and it cannot receive the third-party probes full-cone NAT traversal relies on

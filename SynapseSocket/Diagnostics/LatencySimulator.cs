@@ -14,7 +14,7 @@ namespace SynapseSocket.Diagnostics;
 /// In the synchronous/poll-driven engine this never blocks the sender: a packet that should be
 /// delayed is copied into a private buffer and parked on an internal queue, then released by
 /// <see cref="Flush"/> when its due time elapses. <see cref="Flush"/> is driven from the engine's
-/// poll, so the simulator runs entirely on the engine's single thread — no timers, no Tasks.
+/// poll, so the simulator runs entirely on the engine's single thread: no timers, no Tasks.
 /// </para>
 /// </summary>
 public sealed class LatencySimulator
@@ -74,7 +74,7 @@ public sealed class LatencySimulator
     /// <param name="sender">The underlying send function, invoked now for non-delayed packets.</param>
     public void Process(ArraySegment<byte> segment, IPEndPoint target, long nowTicks, Action<ArraySegment<byte>, IPEndPoint> sender)
     {
-        // Handshake and NAT setup packets bypass the sim — they represent connection
+        // Handshake and NAT setup packets bypass the sim, they represent connection
         // establishment, not in-session traffic, so loss/delay here would prevent
         // connection from ever succeeding rather than simulating realistic degradation.
         if (segment.Count > 0 && segment.Array != null)

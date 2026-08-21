@@ -20,7 +20,7 @@ public sealed class SecurityConfig
     /// Maximum received bytes per second allowed per signature.
     /// Paired with <see cref="MaximumPacketsPerSecond"/>: the packet count alone cannot catch
     /// a peer sending near the pps cap at maximum packet size, which would sustain
-    /// <c>MaximumPacketsPerSecond * MaximumPacketSize</c> bytes/sec — well above a realistic
+    /// <c>MaximumPacketsPerSecond * MaximumPacketSize</c> bytes/sec, well above a realistic
     /// realtime-game upstream. Defaults to 2 MiB/s, which allows comfortable legitimate headroom
     /// while cutting off bandwidth floods.
     /// Set to <see cref="DisabledMaximumBytesPerSecond"/> (0) to disable bytes rate limiting.

@@ -5,7 +5,7 @@ namespace SynapseSocket.Core.Events;
 
 /// <summary>
 /// Event arguments for <see cref="SynapseManager.PacketSent"/>.
-/// Fires after the send has completed — <see cref="Payload"/> is the original caller-supplied segment.
+/// Fires after the send has completed. <see cref="Payload"/> is the original caller-supplied segment.
 /// Do not retain this instance after the handler returns; it is returned to the pool immediately after.
 /// </summary>
 public struct PacketSentEventArgs
