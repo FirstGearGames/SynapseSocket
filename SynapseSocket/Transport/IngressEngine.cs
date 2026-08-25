@@ -122,9 +122,17 @@ internal sealed partial class IngressEngine
     /// </summary>
     private readonly uint _effectiveMaximumOutOfOrderReliablePackets;
     /// <summary>
-    /// Cached copy of <see cref="SynapseConfig.MaximumTransmissionUnit"/> to avoid repeated config dereferences on the receive path.
+    /// Effective MTU: <see cref="SynapseConfig.MaximumTransmissionUnit"/> less the
+    /// <see cref="IPacketTransform.ReservedBytes"/> of a configured <see cref="SynapseConfig.PacketTransform"/>, cached
+    /// to avoid repeated config dereferences on the receive path. Payloads are reversed through the transform before
+    /// any size accounting runs, so this is the ceiling an arriving segment payload is measured against.
     /// </summary>
     private readonly uint _effectiveMaximumTransmissionUnit;
+    /// <summary>
+    /// Optional layer that reverses each inbound payload before the packet is parsed, or null when
+    /// <see cref="SynapseConfig.PacketTransform"/> was left unset.
+    /// </summary>
+    private readonly IPacketTransform? _packetTransform;
     /// <summary>
     /// Effective reassembled packet size cap: <see cref="SecurityConfig.MaximumReassembledPacketSize"/> converted from
     /// 0 (disabled) to <see cref="SynapseConfig.EffectiveUnlimitedValueUInt32"/> so the hot-path check is a single
@@ -164,7 +172,8 @@ internal sealed partial class IngressEngine
         _isNatEnabled = _config.NatTraversal.Mode != NatTraversalMode.Disabled;
         _isAckBatchingEnabled = _config.Reliable.AckBatchingEnabled;
         _isSecurityEnabled = config.Security.Enabled;
-        _effectiveMaximumTransmissionUnit = config.MaximumTransmissionUnit;
+        _packetTransform = config.PacketTransform;
+        _effectiveMaximumTransmissionUnit = config.MaximumTransmissionUnit - (_packetTransform?.ReservedBytes ?? 0);
         _effectiveMaximumOutOfOrderReliablePackets = config.Security.MaximumOutOfOrderReliablePackets == 0
             ? SynapseConfig.EffectiveUnlimitedValueUInt32
             : config.Security.MaximumOutOfOrderReliablePackets;
@@ -187,6 +196,17 @@ internal sealed partial class IngressEngine
     /// Receive buffer rented for this engine's lifetime and reused across every <see cref="Drain"/>.
     /// </summary>
     private byte[]? _receiveBuffer;
+    /// <summary>
+    /// Buffer the reversed packet is assembled into, rented alongside <see cref="_receiveBuffer"/> and reused for every
+    /// datagram. Null when no <see cref="SynapseConfig.PacketTransform"/> is configured, so an engine without one
+    /// rents nothing extra.
+    /// </summary>
+    /// <remarks>
+    /// A reversed packet is handed to the packet handlers straight out of this buffer, which makes it exactly as stable
+    /// across a <see cref="SynapseManager.PacketReceived"/> handler as <see cref="_receiveBuffer"/> is under
+    /// <see cref="SynapseConfig.CopyReceivedPayloads"/> being false.
+    /// </remarks>
+    private byte[]? _transformBuffer;
     /// <summary>
     /// Wildcard source endpoint handed (by ref) to each blocking receive; the kernel overwrites it with the sender.
     /// </summary>
@@ -222,6 +242,10 @@ internal sealed partial class IngressEngine
         _endPointTemplate = (IPEndPoint)_anyEndPoint;
 #endif
         _receiveBuffer = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
+
+        if (_packetTransform is not null)
+            _transformBuffer = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
+
         IsRunning = true;
     }
 
@@ -243,6 +267,12 @@ internal sealed partial class IngressEngine
         {
             ArrayPool<byte>.Shared.Return(_receiveBuffer, clearArray: false);
             _receiveBuffer = null;
+        }
+
+        if (_transformBuffer is not null)
+        {
+            ArrayPool<byte>.Shared.Return(_transformBuffer, clearArray: false);
+            _transformBuffer = null;
         }
     }
 
@@ -378,8 +408,20 @@ internal sealed partial class IngressEngine
 
         if (filterResult is FilterResult.Allowed)
         {
+            // Counted before the transform runs so telemetry, the rate limiter, and the oversize check all measure the
+            // datagram as it actually crossed the wire.
             _telemetry.OnReceived(receivedLength);
+
+            if (_packetTransform is not null && !TryTransformInbound(fromEndPoint, ref buffer, ref receivedLength))
+            {
+                _telemetry.OnSecurityDroppedReceived();
+                ViolationOccurred?.Invoke(fromEndPoint, signature, ViolationReason.TransformRejected, receivedLength, null, ViolationAction.Drop);
+
+                return;
+            }
+
             ProcessPacket(buffer, receivedLength, fromEndPoint, synapseConnection, nowTicks);
+
             return;
         }
 
@@ -400,6 +442,49 @@ internal sealed partial class IngressEngine
         };
 
         ViolationOccurred?.Invoke(fromEndPoint, signature, violationReason, receivedLength, filterResult.ToString(), ViolationAction.KickAndBlacklist);
+    }
+
+    /// <summary>
+    /// Reverses the payload of an arriving packet through <see cref="_packetTransform"/> and repoints
+    /// <paramref name="buffer"/> and <paramref name="receivedLength"/> at the rebuilt packet, header first.
+    /// Datagrams whose leading byte is above <see cref="PacketType.NatChallenge"/> belong to an external protocol
+    /// piggybacking on the socket and pass through untouched, as do datagrams too short for the header they declare,
+    /// which <see cref="ProcessPacket"/> already reports as malformed.
+    /// </summary>
+    /// <param name="fromEndPoint">The source endpoint of the datagram.</param>
+    /// <param name="buffer">The receive buffer, replaced by the transform buffer when a payload was reversed.</param>
+    /// <param name="receivedLength">Number of valid bytes, updated to the reversed packet's length.</param>
+    /// <returns>True to keep processing the datagram, or false when the transform rejected it.</returns>
+    private bool TryTransformInbound(IPEndPoint fromEndPoint, ref byte[] buffer, ref int receivedLength)
+    {
+        if (receivedLength <= 0)
+            return true;
+
+        byte typeByte = buffer[0];
+
+        if (typeByte > (byte)PacketType.NatChallenge)
+            return true;
+
+        PacketType packetType = (PacketType)typeByte;
+        int headerSize = PacketHeader.ComputeHeaderSize(packetType);
+
+        if (receivedLength < headerSize)
+            return true;
+
+        byte[] transformBuffer = _transformBuffer!;
+        Buffer.BlockCopy(buffer, 0, transformBuffer, 0, headerSize);
+
+        bool isTransformed = _packetTransform!.TryTransform(PacketTransformDirection.Inbound, packetType, fromEndPoint, buffer.AsSpan(headerSize, receivedLength - headerSize), transformBuffer.AsSpan(headerSize), out int writtenLength);
+
+        // The unsigned compare also catches a negative length, so a transform that misreports what it wrote cannot
+        // hand the packet handlers a length that runs off the end of the buffer.
+        if (!isTransformed || (uint)writtenLength > (uint)(transformBuffer.Length - headerSize))
+            return false;
+
+        buffer = transformBuffer;
+        receivedLength = headerSize + writtenLength;
+
+        return true;
     }
 
     /// <summary>

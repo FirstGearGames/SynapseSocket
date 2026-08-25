@@ -94,6 +94,19 @@ public sealed partial class SynapseManager : IDisposable
     /// </summary>
     public SecurityProvider Security { get; }
     /// <summary>
+    /// The effective maximum transmission unit the engine packs wire packets against, which is
+    /// <see cref="SynapseConfig.MaximumTransmissionUnit"/> less the
+    /// <see cref="IPacketTransform.ReservedBytes"/> of a configured <see cref="SynapseConfig.PacketTransform"/>.
+    /// Reserving that headroom up front is what keeps a transformed datagram inside the configured MTU on the wire.
+    /// </summary>
+    public uint MaximumTransmissionUnit { get; }
+    /// <summary>
+    /// Maximum payload bytes that fit in a single unsegmented packet, derived from
+    /// <see cref="MaximumTransmissionUnit"/> minus header overhead.
+    /// Larger payloads are segmented, or rejected when segmentation is disabled.
+    /// </summary>
+    public int MaximumPayloadSize { get; }
+    /// <summary>
     /// True if <see cref="StartAsync"/> has completed successfully and the engine has not been stopped or disposed.
     /// </summary>
     public bool IsRunning => _isStarted && !_isDisposed;
@@ -113,10 +126,6 @@ public sealed partial class SynapseManager : IDisposable
     /// True when reliable or unreliable segmentation is enabled; controls the segmented send path.
     /// </summary>
     private readonly bool _isSegmentingEnabled;
-    /// <summary>
-    /// Maximum payload bytes that fit in a single unsegmented packet, derived from MTU minus header overhead.
-    /// </summary>
-    private readonly int _maximumUnsegmentedPayload;
     /// <summary>
     /// Bound UDP sockets, one per configured endpoint. Shared with the ingress engines.
     /// </summary>
@@ -145,6 +154,13 @@ public sealed partial class SynapseManager : IDisposable
         if (Config.Segment.AssemblyTimeoutMilliseconds is > 0 and > 300_000)
             throw new ArgumentOutOfRangeException(nameof(config), "Segment.AssemblyTimeoutMilliseconds must not exceed 300000 (5 minutes).");
 
+        uint reservedBytes = Config.PacketTransform?.ReservedBytes ?? 0;
+
+        if (reservedBytes + PacketHeader.MaxHeaderSize >= Config.MaximumTransmissionUnit)
+            throw new ArgumentOutOfRangeException(nameof(config), $"PacketTransform.ReservedBytes ({reservedBytes}) leaves no room under MaximumTransmissionUnit ({Config.MaximumTransmissionUnit}) for a packet header ({PacketHeader.MaxHeaderSize} bytes).");
+
+        MaximumTransmissionUnit = Config.MaximumTransmissionUnit - reservedBytes;
+
         ISignatureProvider signatureProvider = Config.Security.SignatureProvider ?? new DefaultSignatureProvider();
         Security = new(signatureProvider, Config.Security.MaximumPacketsPerSecond, Config.Security.MaximumBytesPerSecond, Config.MaximumPacketSize, Config.Security.Enabled);
         Connections = new();
@@ -155,7 +171,7 @@ public sealed partial class SynapseManager : IDisposable
          * of order, which would require different maximum payload sizes between reliable
          * and unreliable segmented. Rather than add additional complexity and branching
          * the rare byte cost is consumed. */
-        _maximumUnsegmentedPayload = (int)Config.MaximumTransmissionUnit - PacketHeader.TypeSize - PacketHeader.SequenceSize;
+        MaximumPayloadSize = (int)MaximumTransmissionUnit - PacketHeader.TypeSize - PacketHeader.SequenceSize;
 
         /* Maintenance. */
         _connectionKeepAliveTicks = TimeSpan.FromMilliseconds(Config.Connection.KeepAliveIntervalMilliseconds).Ticks;
@@ -331,7 +347,7 @@ public sealed partial class SynapseManager : IDisposable
     {
         EnsureRunning();
 
-        if (payload.Count <= _maximumUnsegmentedPayload)
+        if (payload.Count <= MaximumPayloadSize)
         {
             if (isReliable)
                 _transmissionEngine!.SendReliableUnsegmented(synapseConnection, payload);
@@ -347,7 +363,7 @@ public sealed partial class SynapseManager : IDisposable
 
         // Segmenting is disabled entirely.
         if (!_isSegmentingEnabled)
-            throw new InvalidOperationException($"Payload ({payload.Count} bytes) exceeds the MTU-based limit ({_maximumUnsegmentedPayload} bytes). Enable segmentation via Segment.ReliableEnabled or Segment.UnreliableMode.");
+            throw new InvalidOperationException($"Payload ({payload.Count} bytes) exceeds the MTU-based limit ({MaximumPayloadSize} bytes). Enable segmentation via Segment.ReliableEnabled or Segment.UnreliableMode.");
 
         // An additional check on segmentation is required for unreliable sending.
         if (!isReliable)
@@ -355,7 +371,7 @@ public sealed partial class SynapseManager : IDisposable
             UnreliableSegmentMode unreliableSegmentMode = Config.Segment.UnreliableMode;
 
             if (unreliableSegmentMode is UnreliableSegmentMode.Disabled)
-                throw new InvalidOperationException($"Unreliable payload ({payload.Count} bytes) exceeds the MTU-based limit ({_maximumUnsegmentedPayload} bytes). Set Segment.UnreliableMode or reduce payload size.");
+                throw new InvalidOperationException($"Unreliable payload ({payload.Count} bytes) exceeds the MTU-based limit ({MaximumPayloadSize} bytes). Set Segment.UnreliableMode or reduce payload size.");
 
             // Make reliable if the unreliableSegmentMode permits.
             isReliable = unreliableSegmentMode is UnreliableSegmentMode.SegmentReliable;
@@ -600,7 +616,7 @@ public sealed partial class SynapseManager : IDisposable
 
         PacketSplitter rented = ResettableObjectPool<PacketSplitter>.Rent();
         uint effectiveMax = Config.Segment.MaximumSegments == 0 ? 255u : Config.Segment.MaximumSegments;
-        rented.Initialize(Config.MaximumTransmissionUnit, effectiveMax);
+        rented.Initialize(MaximumTransmissionUnit, effectiveMax);
 
         PacketSplitter? existing = Interlocked.CompareExchange(ref synapseConnection.Splitter, rented, null);
 

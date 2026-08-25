@@ -1,5 +1,6 @@
 ﻿using System.Collections.Generic;
 using System.Net;
+using SynapseSocket.Packets;
 
 namespace SynapseSocket.Core.Configuration;
 
@@ -26,8 +27,18 @@ public sealed class SynapseConfig
     /// <summary>
     /// Maximum transmission unit used for segmentation.
     /// Should be less than or equal to <see cref="MaximumPacketSize"/>.
+    /// When a <see cref="PacketTransform"/> is supplied its <see cref="SynapseSocket.Packets.IPacketTransform.ReservedBytes"/>
+    /// are deducted from this value, so the engine packs packets against the smaller
+    /// <see cref="SynapseManager.MaximumTransmissionUnit"/> and a transformed datagram still fits this size on the wire.
     /// </summary>
     public uint MaximumTransmissionUnit = 1200;
+
+    /// <summary>
+    /// Optional layer that rewrites the payload of every Synapse packet on its way to and from the socket, for
+    /// encryption, compression, obfuscation, or a custom integrity check.
+    /// Leave null (the default) to send and receive packets exactly as the engine builds them.
+    /// </summary>
+    public IPacketTransform? PacketTransform = null;
 
     /// <summary>
     /// Maximum number of simultaneous connections the engine will accept.

@@ -47,6 +47,37 @@ The `ISignatureProvider` interface controls how peer identities are computed. Th
 ### Optional signature validator
 `ISignatureValidator` allows handshake payloads to be inspected before a connection is accepted — useful for token-based admission without a separate authentication round-trip.
 
+### Pluggable packet transform
+`IPacketTransform` is a single hook for rewriting the bytes of every Synapse packet as it enters or leaves the socket: encryption, compression, obfuscation, or a custom integrity check, with no change to any send or receive call site. Assign an implementation to `SynapseConfig.PacketTransform` and both directions are covered.
+
+A transform only ever sees the payload region. The Synapse header is copied through verbatim, which is what lets the receiving side identify a packet before reversing the transform and lets external protocols that piggyback on the socket (`SendRaw` / `UnknownPacketReceived`) keep flowing untouched. Returning `false` from an inbound `TryTransform` discards the packet and raises a `TransformRejected` violation.
+
+**Reserved MTU.** A transform that adds bytes would otherwise push packets past the MTU. `IPacketTransform.ReservedBytes` declares that growth up front and the engine deducts it from the configured MTU before packing anything:
+
+```csharp
+config.MaximumTransmissionUnit = 1400;   // the wire ceiling
+config.PacketTransform = new MyEncryption();  // ReservedBytes => 20
+
+engine.MaximumTransmissionUnit;  // 1380: what the engine packs against
+engine.MaximumPayloadSize;       // 1377: largest unsegmented payload
+```
+
+Every wire datagram therefore lands at or under the 1400 that was configured. Both peers must run an equivalent transform.
+
+### Worked example: `ExampleXorPacketTransform`
+
+> **This example is not secure and must never protect real traffic.** It XOR-masks each payload with a four-byte value and then writes that value into the packet in front of the masked bytes, so anyone reading the packet can undo it with no key and no effort. It authenticates nothing either: a tampered packet yields garbage, not an error. It exists to show the shape of a transform and, more importantly, the length accounting. Replace it with a real authenticated cipher before shipping.
+
+```csharp
+config.MaximumTransmissionUnit = 1400;
+config.PacketTransform = new ExampleXorPacketTransform();   // ReservedBytes => 4
+
+engine.MaximumTransmissionUnit;  // 1396
+engine.MaximumPayloadSize;       // 1393  → 1396 + 4 = 1400 on the wire
+```
+
+The mask makes every payload exactly four bytes longer, `ReservedBytes` declares those four bytes, and the engine deducts them up front, so a masked datagram can never outgrow the configured MTU. A fresh mask is drawn per packet, so identical payloads produce different datagrams; that is visible on the wire but buys no secrecy, because the mask ships beside the data it masks.
+
 ### Object pool architecture
 SynapseSocket is allocation-minimal on the hot path. Packet buffers, event-args objects, packet splitters, reassemblers, and segment assemblies are all rented from `ResettableObjectPool<T>` or `ArrayPool<byte>` and returned after use. No per-packet heap pressure in steady state.
 
@@ -115,7 +146,8 @@ await client.DisconnectAsync(connection);
 |---|---|---|
 | `BindEndPoints` | *(required)* | Local endpoints to bind — supports dual-stack (IPv4 + IPv6 simultaneously) |
 | `MaximumPacketSize` | 1400 | Maximum inbound datagram size; larger packets raise an `Oversized` violation |
-| `MaximumTransmissionUnit` | 1200 | Per-segment wire size used for segmentation |
+| `MaximumTransmissionUnit` | 1200 | Per-segment wire size used for segmentation; a `PacketTransform`'s `ReservedBytes` are deducted from it |
+| `PacketTransform` | `null` | Optional `IPacketTransform` rewriting every packet payload in both directions; its `ReservedBytes` shrink the effective MTU |
 | `MaximumPacketsPerSecond` | 2000 | Rate limit per peer signature; 0 disables |
 | `MaximumSegments` | disabled | Maximum segments a payload may be split into; 0 disables segmentation |
 | `MaximumConcurrentSegmentAssembliesPerConnection` | 16 | Cap on in-flight segment assemblies per connection |

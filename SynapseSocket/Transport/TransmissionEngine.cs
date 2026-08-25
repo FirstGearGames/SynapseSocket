@@ -49,6 +49,20 @@ public sealed partial class TransmissionEngine
     /// </summary>
     private readonly Action<ArraySegment<byte>, IPEndPoint> _sendDirect;
     /// <summary>
+    /// Optional layer that rewrites each outbound payload immediately before the socket write, or null when
+    /// <see cref="SynapseConfig.PacketTransform"/> was left unset.
+    /// </summary>
+    private readonly IPacketTransform? _packetTransform;
+    /// <summary>
+    /// Scratch buffer the transformed packet is assembled into, allocated once and reused for every send.
+    /// Null when no transform is configured, so an engine without one allocates nothing.
+    /// </summary>
+    /// <remarks>
+    /// The engine is single-threaded and the buffer is consumed by the socket write that immediately follows the
+    /// transform, so one buffer for the whole engine is enough.
+    /// </remarks>
+    private readonly byte[]? _transformBuffer;
+    /// <summary>
     /// The single remote the engine's socket is OS-connected to when <see cref="SynapseConfig.ConnectedSocketEnabled"/> engaged,
     /// or null for the ordinary any-target mode. Sends to it go through the endpoint-free Send call, no per-datagram target
     /// serialization on any runtime.
@@ -90,6 +104,12 @@ public sealed partial class TransmissionEngine
         _latencySimulator = latency;
         _isLatencySimulatorEnabled = _latencySimulator.IsEnabled;
         _sendDirect = SendDirect;
+        _packetTransform = config.PacketTransform;
+
+        // Sized for the largest packet the engine can legally frame plus the headroom the transform reserved,
+        // so a transformed packet never runs out of destination.
+        if (_packetTransform is not null)
+            _transformBuffer = new byte[Math.Max(config.MaximumPacketSize, config.MaximumTransmissionUnit) + _packetTransform.ReservedBytes];
     }
 
     /// <summary>
@@ -311,6 +331,9 @@ public sealed partial class TransmissionEngine
     /// <param name="target">The remote endpoint to send to.</param>
     private void SendDirect(ArraySegment<byte> segment, IPEndPoint target)
     {
+        if (_packetTransform is not null && !TryTransformOutbound(ref segment, target))
+            return;
+
         /* A connected socket sends through the endpoint-free Send call, the SendTo paths below serialize the target per
          * datagram (unavoidably so on Unity's Mono). Reference equality catches the steady state (every per-connection send
          * addresses the stored RemoteEndPoint instance); the value fallback covers a caller-built equal endpoint. */
@@ -342,6 +365,46 @@ public sealed partial class TransmissionEngine
         int bytesSent = socket.SendTo(segment.Array!, segment.Offset, segment.Count, SocketFlags.None, target);
 #endif
         _telemetry.OnSent(bytesSent);
+    }
+
+    /// <summary>
+    /// Rewrites the payload of an outbound packet through <see cref="_packetTransform"/> and repoints
+    /// <paramref name="segment"/> at the result. The header is copied through byte for byte, so the receiving side can
+    /// still identify the packet before it reverses the transform.
+    /// Datagrams whose leading byte is above <see cref="PacketType.NatChallenge"/> belong to an external protocol
+    /// piggybacking on the socket via <see cref="SendRaw"/> and pass through untouched.
+    /// </summary>
+    /// <param name="segment">The wire-ready bytes to send, replaced by the transformed packet when one was produced.</param>
+    /// <param name="target">The remote endpoint the packet is addressed to.</param>
+    /// <returns>True to send <paramref name="segment"/>, or false when the transform discarded the packet.</returns>
+    private bool TryTransformOutbound(ref ArraySegment<byte> segment, IPEndPoint target)
+    {
+        byte typeByte = segment.Array![segment.Offset];
+
+        if (typeByte > (byte)PacketType.NatChallenge)
+            return true;
+
+        PacketType packetType = (PacketType)typeByte;
+        int headerSize = PacketHeader.ComputeHeaderSize(packetType);
+
+        // A caller-supplied packet too short for the header it declares is left alone rather than throwing here;
+        // it is not something the engine's own framing can produce.
+        if (segment.Count < headerSize)
+            return true;
+
+        byte[] transformBuffer = _transformBuffer!;
+        Buffer.BlockCopy(segment.Array, segment.Offset, transformBuffer, 0, headerSize);
+
+        bool isTransformed = _packetTransform!.TryTransform(PacketTransformDirection.Outbound, packetType, target, segment.AsSpan(headerSize), transformBuffer.AsSpan(headerSize), out int writtenLength);
+
+        // The unsigned compare also catches a negative length, so a transform that misreports what it wrote cannot
+        // push the socket into reading past the end of the buffer.
+        if (!isTransformed || (uint)writtenLength > (uint)(transformBuffer.Length - headerSize))
+            return false;
+
+        segment = new(transformBuffer, 0, headerSize + writtenLength);
+
+        return true;
     }
 
     /// <summary>

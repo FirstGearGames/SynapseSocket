@@ -42,5 +42,13 @@ public enum ViolationReason : byte
     /// and <see cref="SynapseSocket.Core.Configuration.SecurityConfig.AllowUnknownPackets"/> is false,
     /// or the <see cref="SynapseManager.UnknownPacketReceived"/> delegate explicitly rejected the packet.
     /// </summary>
-    UnknownPacket
+    UnknownPacket,
+
+    /// <summary>
+    /// The configured <see cref="SynapseSocket.Packets.IPacketTransform"/> rejected an inbound payload, which normally
+    /// means the packet failed its integrity or authentication check.
+    /// Raised with an initial action of <see cref="ViolationAction.Drop"/> because the transform is application code,
+    /// so the packet is discarded and any escalation is left to a <see cref="SynapseManager.ViolationDetected"/> subscriber.
+    /// </summary>
+    TransformRejected
 }
