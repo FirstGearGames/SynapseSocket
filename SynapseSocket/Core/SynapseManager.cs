@@ -107,6 +107,16 @@ public sealed partial class SynapseManager : IDisposable
     /// </summary>
     public int MaximumPayloadSize { get; }
     /// <summary>
+    /// The endpoints the engine actually bound, in the order the sockets were bound. The list is empty until
+    /// <see cref="Start"/> has bound at least one endpoint, and is emptied again when the engine stops or is disposed.
+    /// </summary>
+    /// <remarks>
+    /// These are the endpoints read back from the bound sockets, not the ones <see cref="SynapseConfig.BindEndPoints"/>
+    /// asked for. A configuration that requests port zero leaves the operating system to choose an ephemeral port, and
+    /// this property is how a caller learns which port that turned out to be.
+    /// </remarks>
+    public IReadOnlyList<IPEndPoint> BoundEndPoints => _boundEndPoints;
+    /// <summary>
     /// True if <see cref="StartAsync"/> has completed successfully and the engine has not been stopped or disposed.
     /// </summary>
     public bool IsRunning => _isStarted && !_isDisposed;
@@ -130,6 +140,15 @@ public sealed partial class SynapseManager : IDisposable
     /// Bound UDP sockets, one per configured endpoint. Shared with the ingress engines.
     /// </summary>
     private readonly List<Socket> _sockets = [];
+    /// <summary>
+    /// The endpoint the socket at the same index within <see cref="_sockets"/> actually bound.
+    /// </summary>
+    /// <remarks>
+    /// Each entry is read back from the socket after the bind succeeds rather than copied from
+    /// <see cref="SynapseConfig.BindEndPoints"/>, because a configuration commonly asks for port zero and the
+    /// port the operating system chose is only knowable once the socket is bound.
+    /// </remarks>
+    private readonly List<IPEndPoint> _boundEndPoints = [];
     /// <summary>
     /// Ingress engines, one per socket. Each is drained on every <see cref="Poll"/>.
     /// </summary>
@@ -229,6 +248,8 @@ public sealed partial class SynapseManager : IDisposable
             }
 
             _sockets.Add(socket);
+            // Read the endpoint back from the socket; a bind endpoint of port zero does not name the bound port.
+            _boundEndPoints.Add((IPEndPoint)socket.LocalEndPoint!);
 
             if (bindEndPoint.AddressFamily == AddressFamily.InterNetworkV6)
                 ipv6Socket = socket;
@@ -539,6 +560,7 @@ public sealed partial class SynapseManager : IDisposable
         }
 
         _sockets.Clear();
+        _boundEndPoints.Clear();
     }
 
     /// <summary>
