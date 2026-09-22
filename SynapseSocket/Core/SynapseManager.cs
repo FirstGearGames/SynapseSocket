@@ -173,6 +173,19 @@ public sealed partial class SynapseManager : IDisposable
         if (Config.Segment.AssemblyTimeoutMilliseconds is > 0 and > 300_000)
             throw new ArgumentOutOfRangeException(nameof(config), "Segment.AssemblyTimeoutMilliseconds must not exceed 300000 (5 minutes).");
 
+        uint handshakeTimeoutMilliseconds = Config.Connection.HandshakeTimeoutMilliseconds;
+
+        if (handshakeTimeoutMilliseconds is not ConnectionConfig.UnsetHandshakeTimeoutMilliseconds && Config.NatTraversal.Mode is NatTraversalMode.FullCone)
+        {
+            NatTraversalConfig natTraversalConfig = Config.NatTraversal;
+            /* A punch declares NatTraversalFailed one interval after its last attempt. A handshake timeout short of that
+             * tears the pending connection down mid-punch, so the later attempts never run and the failure is never raised. */
+            ulong punchScheduleMilliseconds = natTraversalConfig.FullCone.DirectAttemptMilliseconds + (ulong)natTraversalConfig.MaximumAttempts * natTraversalConfig.IntervalMilliseconds;
+
+            if (handshakeTimeoutMilliseconds < punchScheduleMilliseconds)
+                throw new ArgumentOutOfRangeException(nameof(config), $"Connection.HandshakeTimeoutMilliseconds [{handshakeTimeoutMilliseconds}] ends before the full-cone hole-punch schedule of [{punchScheduleMilliseconds}] milliseconds can finish. It must be at least NatTraversal.FullCone.DirectAttemptMilliseconds plus NatTraversal.MaximumAttempts times NatTraversal.IntervalMilliseconds.");
+        }
+
         uint reservedBytes = Config.PacketTransform?.ReservedBytes ?? 0;
 
         if (reservedBytes + PacketHeader.MaxHeaderSize >= Config.MaximumTransmissionUnit)
@@ -195,6 +208,7 @@ public sealed partial class SynapseManager : IDisposable
         /* Maintenance. */
         _connectionKeepAliveTicks = TimeSpan.FromMilliseconds(Config.Connection.KeepAliveIntervalMilliseconds).Ticks;
         _connectionTimeoutTicks = TimeSpan.FromMilliseconds(Config.Connection.TimeoutMilliseconds).Ticks;
+        _handshakeTimeoutTicks = handshakeTimeoutMilliseconds is ConnectionConfig.UnsetHandshakeTimeoutMilliseconds ? _connectionTimeoutTicks : TimeSpan.FromMilliseconds(handshakeTimeoutMilliseconds).Ticks;
         _reliableResendTicks = TimeSpan.FromMilliseconds(Config.Reliable.ResendMilliseconds).Ticks;
         _maximumReliableRetries = Config.Reliable.MaximumRetries;
         _isAckBatchingEnabled = Config.Reliable.AckBatchingEnabled;

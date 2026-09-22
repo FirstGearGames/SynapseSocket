@@ -67,6 +67,17 @@ public sealed partial class SynapseConnection : IPoolResettable
     [PoolResettableMember]
     public long LastKeepAliveSentTicks { get; internal set; }
     /// <summary>
+    /// UTC ticks at which this connection was created, which is when its handshake began: sent by an outgoing connect, or
+    /// received for an inbound one. Drives the handshake timeout while the connection is <see cref="ConnectionState.Pending"/>.
+    /// </summary>
+    /// <remarks>
+    /// The handshake timeout is measured from here rather than from <see cref="LastReceivedTicks"/> because a pending
+    /// connection still takes inbound traffic of other kinds. A peer whose handshake reply was lost considers the session
+    /// connected and keeps sending, which would otherwise refresh the pending connection indefinitely.
+    /// </remarks>
+    [PoolResettableMember]
+    internal long HandshakeStartedTicks { get; private set; }
+    /// <summary>
     /// Number of consecutive keep-alives sent since the last received packet.
     /// Used to compute exponential backoff on the keep-alive send interval.
     /// Reset to zero whenever any inbound packet is received from this peer.
@@ -144,6 +155,7 @@ public sealed partial class SynapseConnection : IPoolResettable
         State = ConnectionState.Pending;
 
         long nowTicks = DateTime.UtcNow.Ticks;
+        HandshakeStartedTicks = nowTicks;
         LastReceivedTicks = nowTicks;
         // Seeded so a brand-new connection does not owe a keep-alive on its very first maintenance sweep.
         LastSentTicks = nowTicks;
@@ -295,6 +307,7 @@ public sealed partial class SynapseConnection : IPoolResettable
         ConnectionsIndex = UnsetConnectionsIndex;
         State = ConnectionState.Disconnected;
 
+        HandshakeStartedTicks = 0;
         LastReceivedTicks = 0;
         LastSentTicks = 0;
         LastKeepAliveSentTicks = 0;

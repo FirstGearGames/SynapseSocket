@@ -163,6 +163,7 @@ await client.DisconnectAsync(connection);
 | `Reliable.MaximumRetries` | 10 | Max retransmit attempts before the connection is terminated |
 | `Connection.KeepAliveIntervalMilliseconds` | — | Keep-alive heartbeat interval |
 | `Connection.TimeoutMilliseconds` | — | Idle timeout before a connection is declared lost |
+| `Connection.HandshakeTimeoutMilliseconds` | 0 | Time a pending connection may wait on its handshake, measured from when the handshake began; 0 falls back to `Connection.TimeoutMilliseconds` |
 | `NatTraversal.Mode` | `Disabled` | `FullCone` or `Server` to enable hole-punching |
 
 ---

@@ -23,6 +23,13 @@ public sealed partial class SynapseManager
     /// </summary>
     private readonly long _connectionTimeoutTicks;
     /// <summary>
+    /// Ticks a <see cref="ConnectionState.Pending"/> connection may spend waiting on its handshake, measured from
+    /// <see cref="SynapseConnection.HandshakeStartedTicks"/>. Derived from
+    /// <see cref="SynapseSocket.Core.Configuration.ConnectionConfig.HandshakeTimeoutMilliseconds"/>, and equal to
+    /// <see cref="_connectionTimeoutTicks"/> when that is <see cref="SynapseSocket.Core.Configuration.ConnectionConfig.UnsetHandshakeTimeoutMilliseconds"/>.
+    /// </summary>
+    private readonly long _handshakeTimeoutTicks;
+    /// <summary>
     /// Ticks between reliable packet retransmission attempts, derived from <see cref="SynapseSocket.Core.Configuration.ReliableConfig.ResendMilliseconds"/>.
     /// </summary>
     private readonly long _reliableResendTicks;
@@ -118,6 +125,7 @@ public sealed partial class SynapseManager
 
     /// <summary>
     /// Keep-alive: detects timed-out peers and emits heartbeats with exponential backoff.
+    /// A connection still waiting on its handshake is held to the handshake timeout instead of the idle timeout.
     /// </summary>
     /// <returns>True if the connection is still valid. False if the connection was disconnected (timed out).</returns>
     private bool PerformKeepAlive(long nowTicks, SynapseConnection synapseConnection)
@@ -125,12 +133,20 @@ public sealed partial class SynapseManager
         if (_transmissionEngine is null)
             return false;
 
-        if (synapseConnection.State == ConnectionState.Disconnected)
+        ConnectionState connectionState = synapseConnection.State;
+
+        if (connectionState is ConnectionState.Disconnected)
             return false;
 
-        // Timeout check - treated as a (benign) violation.
+        // A pending handshake is timed out from when it began: a pending connection still takes other inbound traffic, which
+        // would otherwise refresh it indefinitely. An answered one is timed out from the last packet received.
+        bool isTimedOut = connectionState is ConnectionState.Pending
+            ? nowTicks - synapseConnection.HandshakeStartedTicks > _handshakeTimeoutTicks
+            : nowTicks - synapseConnection.LastReceivedTicks > _connectionTimeoutTicks;
+
+        // Either timeout is treated as a (benign) violation.
         // Default initial action is Kick (disconnect without blacklisting); a listener can escalate or downgrade.
-        if (nowTicks - synapseConnection.LastReceivedTicks > _connectionTimeoutTicks)
+        if (isTimedOut)
         {
             synapseConnection.State = ConnectionState.Disconnected;
             Connections.Remove(synapseConnection.RemoteEndPoint, out _);
