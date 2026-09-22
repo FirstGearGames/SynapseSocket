@@ -2,8 +2,31 @@
 
 **Date:** 2026-08-17
 **Scope:** Full sweep of `SynapseSocket`, `SynapseBeacon`, and the CodeBoost pooling primitives they depend on, across six requested axes: incorrect socket timeouts, memory-flooding vulnerabilities, socket identity spoofing, CPU-loop vulnerabilities, memory leaks, and general memory/GC/CPU performance.
-**Status:** **Fixes applied and landed on `main`** (commit `3b5ffcc`, 2026-09-22). This document is the record of the sweep that produced them, not an open work list. It is written throughout in the present tense of 2026-08-17, when nothing had been fixed yet; read a finding's description as the state *before* that commit. 25 of the 46 findings now have a test asserting the corrected behaviour in `SynapseSocket.Tests/Security/SweepFindingTests.cs`; the rest were either fixed without dedicated coverage, refuted (C2), or judged not worth acting on. A finding without a test is not evidence that it was fixed.
+**Status:** **Fixes applied and landed on `main`** (commit `3b5ffcc`, 2026-09-22). This document is the record of the sweep that produced them, not an open work list. It is written throughout in the present tense of 2026-08-17, when nothing had been fixed yet; read a finding's description as the state *before* that commit. Every finding's current state is in the status table immediately below.
 **Method:** Manual trace of every hot path, plus a seven-dimension parallel audit with one adversarial verifier per top finding and a completeness critic. 67 raw findings → deduplicated and consolidated to the 54 below.
+
+---
+
+## Status of every finding
+
+Added 2026-09-22, when the remaining findings were triaged one by one. Every ID below has a state; nothing is
+left implicit. "Fixed, no test" means the fix was read in the current source and named here, not that it was
+merely intended. Where a finding is genuinely not worth a test, or cannot be tested from this harness, the reason
+is given rather than left blank.
+
+| Status | Findings | Evidence |
+|---|---|---|
+| **Fixed, with a test** | C1, C3, C4, H1, H2, H3, H4, H5, H6, H7, H9, H10, H11, H12, H13, M1, M2, M3, M4, M5, M9, M12, M13, M14, M15, M16, M17, M18 | `SweepFindingTests`, plus `NatTraversalTests` for the NAT exchange (M9) |
+| **Refuted, with a test** | C2 | Windows reports `Available == 1` for a queued zero-length datagram; see "C2 was wrong" below. Still unverified on Linux |
+| **Fixed, no test** | M10, M11, M19, M20, M22, M23, M24 | M10 `RemoveExpiredProbeLimitEntries` from maintenance; M11 `Core/Clock.cs`; M19 the two HMAC instances are built once in the ingress constructor; M20 `ParkPendingReliable`; M22 `MixHandshakeNonce` folds at most `HandshakeNonceSize` bytes; M23 the sweep moved off the receive path into `RunMaintenance`; M24 the sweep is bounded by `MaximumConcurrentConnections` |
+| **Accepted risk, by design** | H8, M6, M7, M8 | Datagram attribution is source-IP only and per-packet authentication is deliberately not paid for. Stated in `IngressEngine.ProcessPacket` at the point where it bites: damage is bounded to a held connection slot, and anyone able to forge there can already inject payloads as that peer |
+| **Open, not triaged** | H11b/M21, L1, L2, L3, L4, L5, L6, L7, L8, L9, L12, L13 | Low/info-severity performance and tidiness items, plus the unauthenticated beacon join. H11's crypto-random 32-bit ID space removed the sweepable-ID half of H11b; joining with a known ID is still unauthenticated by design, since the beacon has no identity to authenticate against |
+
+Why some fixes carry no test: M11 needs the system clock stepped underneath a running engine; M20 needs the 16-bit
+sequence space to wrap with an entry still unacknowledged; M19, M23 and M24 are allocation and cost properties
+whose only honest assertion is a timing or allocation measurement that would be flaky in CI. Each was verified by
+reading the current source, which is weaker evidence than a test, and is labelled as such rather than counted as
+covered.
 
 ---
 

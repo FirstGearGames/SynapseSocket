@@ -1492,6 +1492,106 @@ public sealed class SweepFindingTests
             "endpoint was permanently blacklisted by a single oversized datagram and can no longer connect");
     }
 
+    /// <summary>
+    /// H3: a blacklist entry must expire. The original had no TTL and no bound, so every address that ever
+    /// misbehaved was barred for the life of the process and the table only ever grew.
+    /// </summary>
+    /// <remarks>
+    /// Driven through the real ingress path rather than the <see cref="SynapseSocket.Security.SecurityProvider"/>
+    /// API, so what is asserted is that a barred peer can genuinely connect again once its entry ages out.
+    /// </remarks>
+    [Fact]
+    public void H3_BlacklistEntries_ExpireInsteadOfBarringAnEndpointForever()
+    {
+        const uint ViolationsBeforeBlacklist = 2;
+        const uint BlacklistDurationMilliseconds = 600;
+
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port, config =>
+        {
+            config.Security.ViolationsBeforeBlacklist = ViolationsBeforeBlacklist;
+            config.Security.BlacklistDurationMilliseconds = BlacklistDurationMilliseconds;
+        }));
+
+        TestHarness.EventRecorder serverEvents = new();
+        serverEvents.Attach(server);
+        server.Start();
+
+        IPEndPoint target = new(IPAddress.Loopback, port);
+        using Socket attacker = TestHarness.CreateRawSocket();
+
+        // Enough oversized datagrams to exhaust the violation allowance and earn a blacklist entry.
+        for (int i = 0; i < ViolationsBeforeBlacklist + 1; i++)
+        {
+            attacker.SendTo(new byte[1401], target);
+            TestHarness.PumpFor(60, server);
+        }
+
+        attacker.SendTo(BuildHandshake(), target);
+        TestHarness.PumpFor(300, server);
+
+        Assert.True(server.Connections.Count == 0, "the endpoint was never blacklisted, so this proves nothing about expiry");
+
+        /* Retry the handshake on an interval rather than sending one and waiting. A raw socket does not
+         * retransmit, and a banned endpoint that keeps sending pushes its own entry out, so a single shot timed
+         * against the nominal expiry is a race the test would lose intermittently. A real client retries on
+         * ConnectionConfig.HandshakeRetryIntervalMilliseconds for exactly this reason. */
+        /* Nothing here may read the blacklist through SecurityProvider. IsBlacklisted drops a lapsed entry as a
+         * side effect of the read, so a test that polls it performs the very expiry it is meant to be checking,
+         * and would pass against a receive path that ignores expiry entirely. Only the wire is consulted. */
+        bool reconnected = false;
+        long deadlineMilliseconds = Environment.TickCount64 + 5000;
+
+        while (Environment.TickCount64 < deadlineMilliseconds)
+        {
+            attacker.SendTo(BuildHandshake(), target);
+            TestHarness.PumpFor(150, server);
+
+            if (server.Connections.Count == 1)
+            {
+                reconnected = true;
+                break;
+            }
+        }
+
+        Assert.True(
+            reconnected,
+            $"a blacklisted endpoint was still barred after its entry should have expired. failures: [{string.Join(", ", serverEvents.FailureReasons)}]");
+    }
+
+    /// <summary>
+    /// M2: connecting again to an endpoint that already has a session must reclaim the replaced connection rather
+    /// than dropping it on the floor, which orphaned its pooled buffers, its splitter and its reassembler.
+    /// </summary>
+    [Fact]
+    public void M2_ReconnectingToTheSameEndpoint_ReclaimsTheReplacedConnection()
+    {
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port));
+        using SynapseManager client = new(TestHarness.ClientConfig());
+
+        TestHarness.EventRecorder serverEvents = new();
+        serverEvents.Attach(server);
+
+        server.Start();
+        client.Start();
+
+        IPEndPoint target = new(IPAddress.Loopback, port);
+
+        SynapseConnection first = client.Connect(target);
+        Assert.True(
+            TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 1, 3000, server, client),
+            "the first handshake did not complete");
+
+        // Connect again to the same endpoint. The first instance must be torn down, not silently discarded.
+        SynapseConnection second = client.Connect(target);
+        TestHarness.PumpFor(300, server, client);
+
+        Assert.False(ReferenceEquals(first, second), "the second Connect reused the first connection instance");
+        Assert.True(client.Connections.Count == 1, $"reconnecting left [{client.Connections.Count}] client connections for one endpoint");
+        Assert.True(first.RemoteEndPoint is null, "the replaced connection was discarded without being reset and returned to the pool");
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // H4: legitimate traffic tripping the rate limit
     // ─────────────────────────────────────────────────────────────────────────

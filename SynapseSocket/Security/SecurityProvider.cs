@@ -248,7 +248,12 @@ public sealed class SecurityProvider
             return FilterResult.SignatureFailure;
         }
 
-        if (_blacklist.ContainsKey(signature))
+        /* IsBlacklisted, not a bare ContainsKey: the entry carries an expiry and only that accessor honours it.
+         * Reading the key directly made every ban permanent on the one path that enforces bans, so
+         * BlacklistDurationMilliseconds governed nothing an arriving datagram could observe, and an endpoint kicked
+         * for a transient violation could never reconnect. It is also what drains lapsed entries, since the table
+         * has no sweep of its own. */
+        if (IsBlacklisted(signature))
             return FilterResult.Blacklisted;
 
         if (packetLength <= 0 || packetLength > _maximumPacketSize)
@@ -256,7 +261,6 @@ public sealed class SecurityProvider
 
         return FilterResult.Allowed;
     }
-
 
     /// <summary>
     /// Inserts a blacklist entry, keeping the table within <see cref="MaximumBlacklistEntries"/>.

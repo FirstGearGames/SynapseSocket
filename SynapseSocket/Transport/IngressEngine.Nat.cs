@@ -68,6 +68,11 @@ internal sealed partial class IngressEngine
     /// the initiator side of a simultaneous P2P probe; the stamp is what stops two engines that cannot verify each
     /// other's tokens from bouncing the same bytes forever.
     /// </summary>
+    /// <remarks>
+    /// The verified branch deliberately runs before the per-address rate limit. See the comment on it: the limit
+    /// and the exchange measure the same address over the same round trip, so gating the proof behind the limit
+    /// made the proof unreachable.
+    /// </remarks>
     private void ProcessNatChallengeExchange(IPEndPoint fromEndPoint, ReadOnlySpan<byte> payload)
     {
         if (!_isNatEnabled)
@@ -88,6 +93,22 @@ internal sealed partial class IngressEngine
         if (_connections.ConnectionsByEndPoint.TryGetValue(fromEndPoint, out SynapseConnection? _))
             return;
 
+        /* Checked before the rate limit, because a token this engine minted for this address, coming back from
+         * that address, IS the return-routability proof the rate limit exists to stand in for. Gating it behind
+         * the limit broke the exchange outright: answering the probe stamps the address, and the echo arrives one
+         * round trip later, so every echo under IntervalMilliseconds of latency was dropped by the response to
+         * the probe that caused it. The token round trip could never complete on any normal link, and the punch
+         * only appeared to work because each probe burst also carries a handshake.
+         *
+         * Skipping the limit here is not an amplification hole: to hold a valid token for an address you must
+         * have received our challenge AT that address, so a spoofed source cannot produce one. The limit still
+         * governs every unverified path below, which is where forgeable bytes get a reply. */
+        if (VerifyEndpointToken(_natChallengeHmac, fromEndPoint, payload[..NatTokenSize]))
+        {
+            _sender.SendHandshake(fromEndPoint);
+            return;
+        }
+
         long nowTicks = Clock.Ticks;
         long minIntervalTicks = _config.NatTraversal.IntervalMilliseconds * TimeSpan.TicksPerMillisecond;
         IpKey addressKey = IpKey.From(fromEndPoint.Address);
@@ -98,12 +119,6 @@ internal sealed partial class IngressEngine
             return;
 
         _natProbeLastResponseTicks[addressKey] = nowTicks;
-
-        if (VerifyEndpointToken(_natChallengeHmac, fromEndPoint, payload[..NatTokenSize]))
-        {
-            _sender.SendHandshake(fromEndPoint);
-            return;
-        }
 
         /* Unrecognised token. Echoing it back is what lets the initiator side of a simultaneous P2P probe complete,
          * but an unconditional echo means two engines that cannot verify each other's tokens bounce the same bytes

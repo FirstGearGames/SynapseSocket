@@ -255,6 +255,7 @@ SynapseSocket ships a full xUnit integration test suite that spins up real engin
 | `SignatureValidatorTests` | Custom validator gates connection admission |
 | `TelemetryAndLatencyTests` | Counters increment correctly; latency simulator delays delivery measurably |
 | `EngineLifecycleTests` | Start/stop/restart; double-start throws; dispose cleans up resources |
+| `NatTraversalTests` | The full-cone punch over real sockets: a probe drawing a challenge rather than a handshake, the echoed token drawing the handshake that completes the exchange, a forged token drawing an echo instead, an already-echoed token drawing nothing, per-address probe rate limiting, and two engines punching simultaneously |
 | `SweepFindingTests` | The robustness-sweep findings, each asserting the corrected behaviour: connections-list integrity across removals, handshake reset loops, unbounded connections from unauthenticated handshakes, pending-handshake wedges, one-packet blacklisting, rate-limit false positives, and a forged beacon `PeerReady` failing to complete a join |
 
 ---
