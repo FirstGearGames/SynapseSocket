@@ -1,10 +1,10 @@
 using System;
 using System.Buffers;
 using System.Collections.Concurrent;
-using System.Runtime.InteropServices;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using CodeBoost.Performance;
@@ -37,6 +37,12 @@ internal sealed partial class IngressEngine
     /// Raised when a remote peer sends a disconnect packet.
     /// </summary>
     internal event ConnectionHandler? ConnectionClosed;
+    /// <summary>
+    /// Raised when the ingress path has determined a connection is finished and the manager should run its single
+    /// teardown. The manager owns teardown because only it can retire NAT punches and schedule the pool return;
+    /// the ingress engine must not touch the connection after raising this.
+    /// </summary>
+    internal event ConnectionHandler? TeardownRequested;
     /// <summary>
     /// Raised when a connection attempt is rejected before it can be established.
     /// </summary>
@@ -87,26 +93,46 @@ internal sealed partial class IngressEngine
     /// </summary>
     private readonly ConcurrentDictionary<IpKey, long> _natProbeLastResponseTicks = [];
     /// <summary>
-    /// UTC ticks of the last stale-entry eviction pass for <see cref="_natProbeLastResponseTicks"/>.
+    /// Monotonic <see cref="Clock.Ticks"/> of the last stale-entry eviction pass for <see cref="_natProbeLastResponseTicks"/>.
     /// </summary>
     private long _lastProbeEvictionTicks;
     /// <summary>
-    /// Replay cache mapping handshake signature to first-seen UTC ticks.
+    /// Replay cache mapping handshake signature to the first-seen <see cref="Clock.Ticks"/> value.
     /// Prevents replayed handshakes from re-establishing connections after the original session ends.
     /// </summary>
     private readonly ConcurrentDictionary<ulong, long> _seenHandshakes = [];
     /// <summary>
-    /// UTC ticks of the last stale-entry eviction pass for <see cref="_seenHandshakes"/>.
+    /// Monotonic <see cref="Clock.Ticks"/> of the last stale-entry eviction pass for <see cref="_seenHandshakes"/>.
     /// </summary>
     private long _lastHandshakeEvictionTicks;
     /// <summary>
-    /// True when to copy received payloads for dispatched events.
+    /// Live entry count of the handshake replay cache. Diagnostic surface for verifying the cache stays bounded.
+    /// </summary>
+    internal int ReplayCacheCount => _seenHandshakes.Count;
+    /// <summary>
+    /// How long a replay-cache entry stays meaningful. Sized off the connection timeout so a handshake cannot be
+    /// replayed within any window where the original session could still be alive.
+    /// </summary>
+    private long ReplayCacheEntryLifetimeTicks => _config.Connection.TimeoutMilliseconds * TimeSpan.TicksPerMillisecond * 2;
+
+    /// <summary>
+    /// True when received payloads are copied before being dispatched to event handlers.
     /// </summary>
     private readonly bool _copyReceivedPayloads;
     /// <summary>
-    /// Server secret used to sign NAT challenge tokens. Generated once at construction and never transmitted.
+    /// Keyed HMAC signing NAT challenge tokens. The key is generated once at construction and never transmitted.
     /// </summary>
-    private readonly byte[] _natChallengeSecret = new byte[32];
+    private readonly System.Security.Cryptography.HMACSHA256 _natChallengeHmac;
+    /// <summary>
+    /// Keyed HMAC signing handshake return-routability tokens. Keyed separately from
+    /// <see cref="_natChallengeHmac"/> so a token minted for one exchange cannot be replayed into the other.
+    /// </summary>
+    private readonly System.Security.Cryptography.HMACSHA256 _handshakeChallengeHmac;
+    /// <summary>
+    /// Live connection count at or above which unknown endpoints must prove return-routability before any state is
+    /// allocated for them, or <see cref="SynapseConfig.EffectiveUnlimitedValueUInt32"/> when the gate is disabled.
+    /// </summary>
+    private readonly uint _handshakeChallengeThreshold;
     /// <summary>
     /// True when Ack batching is enabled and the interval is not unset.
     /// </summary>
@@ -145,9 +171,30 @@ internal sealed partial class IngressEngine
     /// comparison with no zero guard.
     /// </summary>
     private readonly uint _effectiveMaximumConcurrentConnections;
+    /// <summary>
+    /// Effective per-poll receive budget: <see cref="SynapseConfig.MaximumReceivesPerPoll"/> converted from
+    /// 0 (disabled) to <see cref="SynapseConfig.EffectiveUnlimitedValueUInt32"/>.
+    /// </summary>
+    private readonly uint _effectiveMaximumReceivesPerPoll;
 
+    /// <summary>
+    /// Window within which an inbound handshake is read as the peer's answer to one we just sent, rather than as a
+    /// fresh request that would reset the session. Must comfortably exceed a real round trip.
+    /// </summary>
+    private const long HandshakeAnswerWindowTicks = TimeSpan.TicksPerSecond;
+
+    /// <summary>
+    /// Violation detail reported when a peer declares a reassembled size above the configured ceiling.
+    /// </summary>
     private const string ViolationSegmentAssemblyOversized = "Declared segment assembly size exceeds MaximumReassembledPacketSize.";
+    /// <summary>
+    /// Violation detail reported when a segment reappears with a different segment count or reliability flag than
+    /// the assembly it belongs to was opened with.
+    /// </summary>
     private const string ViolationSegmentMismatch = "Segment resent with mismatched segment count or reliability flag.";
+    /// <summary>
+    /// Violation detail reported when a peer holds more out-of-order reliable packets than the reorder buffer allows.
+    /// </summary>
     private const string ViolationReorderBufferExceeded = "Reorder buffer capacity exceeded.";
 
     /// <summary>
@@ -174,17 +221,19 @@ internal sealed partial class IngressEngine
         _isSecurityEnabled = config.Security.Enabled;
         _packetTransform = config.PacketTransform;
         _effectiveMaximumTransmissionUnit = config.MaximumTransmissionUnit - (_packetTransform?.ReservedBytes ?? 0);
-        _effectiveMaximumOutOfOrderReliablePackets = config.Security.MaximumOutOfOrderReliablePackets == 0
-            ? SynapseConfig.EffectiveUnlimitedValueUInt32
-            : config.Security.MaximumOutOfOrderReliablePackets;
-        _effectiveMaximumReassembledPacketSize = config.Security.MaximumReassembledPacketSize == 0
-            ? SynapseConfig.EffectiveUnlimitedValueUInt32
-            : config.Security.MaximumReassembledPacketSize;
-        _effectiveMaximumConcurrentConnections = config.MaximumConcurrentConnections == 0
-            ? SynapseConfig.EffectiveUnlimitedValueUInt32
-            : config.MaximumConcurrentConnections;
+        _effectiveMaximumOutOfOrderReliablePackets = SynapseConfig.ToEffectiveLimit(config.Security.MaximumOutOfOrderReliablePackets);
+        _effectiveMaximumReassembledPacketSize = SynapseConfig.ToEffectiveLimit(config.Security.MaximumReassembledPacketSize);
+        _effectiveMaximumConcurrentConnections = SynapseConfig.ToEffectiveLimit(config.MaximumConcurrentConnections);
+        _effectiveMaximumReceivesPerPoll = SynapseConfig.ToEffectiveLimit(config.MaximumReceivesPerPoll);
+        _handshakeChallengeThreshold = SynapseConfig.ToEffectiveLimit(config.Security.HandshakeChallengeThreshold);
 
-        System.Security.Cryptography.RandomNumberGenerator.Fill(_natChallengeSecret);
+        Span<byte> secret = stackalloc byte[32];
+
+        System.Security.Cryptography.RandomNumberGenerator.Fill(secret);
+        _natChallengeHmac = new(secret.ToArray());
+
+        System.Security.Cryptography.RandomNumberGenerator.Fill(secret);
+        _handshakeChallengeHmac = new(secret.ToArray());
     }
 
     /// <summary>
@@ -207,6 +256,19 @@ internal sealed partial class IngressEngine
     /// <see cref="SynapseConfig.CopyReceivedPayloads"/> being false.
     /// </remarks>
     private byte[]? _transformBuffer;
+    /// <summary>
+    /// Caller-owned sockaddr the native receive fills per datagram, reused for the engine's lifetime. Replaces the
+    /// SocketAddress, IPEndPoint and IPAddress that the managed any-sender receive creates every time.
+    /// </summary>
+    private byte[]? _receiveSockAddr;
+#if !NET8_0_OR_GREATER
+    /// <summary>
+    /// True when this engine takes the native receive path. Engaged where the managed API cannot receive from an
+    /// unspecified sender without allocating, which is every runtime lacking the SocketAddress overloads.
+    /// Absent on net8.0, whose SocketAddress overloads already receive without allocating.
+    /// </summary>
+    private bool _isNativeReceiveEnabled;
+#endif
     /// <summary>
     /// Wildcard source endpoint handed (by ref) to each blocking receive; the kernel overwrites it with the sender.
     /// </summary>
@@ -246,6 +308,13 @@ internal sealed partial class IngressEngine
         if (_packetTransform is not null)
             _transformBuffer = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
 
+        _receiveSockAddr = new byte[NativeSocket.SockAddrSize];
+
+        /* Only worth engaging where the managed receive allocates. On NET8 the SocketAddress overload already
+         * costs nothing, so the syscall binding buys nothing and is left alone. */
+#if !NET8_0_OR_GREATER
+        _isNativeReceiveEnabled = _config.NativeReceiveEnabled && NativeSocket.IsSupported;
+#endif
         IsRunning = true;
     }
 
@@ -274,6 +343,10 @@ internal sealed partial class IngressEngine
             ArrayPool<byte>.Shared.Return(_transformBuffer, clearArray: false);
             _transformBuffer = null;
         }
+
+        // The manager builds fresh ingress engines on every Start, so a stopped engine is never reused.
+        _natChallengeHmac.Dispose();
+        _handshakeChallengeHmac.Dispose();
     }
 
     /// <summary>
@@ -281,18 +354,43 @@ internal sealed partial class IngressEngine
     /// to the packet handlers inline. Called once per engine poll on the host's thread; returns when the socket
     /// has nothing more to read. The kernel receive buffer (SO_RCVBUF) bounds how much can accumulate between polls.
     /// </summary>
-    public void Drain()
+    /// <param name="nowTicks">
+    /// The tick this poll started at, reused for every datagram in the batch rather than re-read per datagram.
+    /// <see cref="Clock.Ticks"/> is a QPC/vDSO call at roughly 20-30ns, an order of magnitude above anything else
+    /// on this path, and a drain completes in microseconds, so per-datagram precision buys nothing against a 15s
+    /// timeout or a 250ms resend interval.
+    /// </param>
+    public void Drain(long nowTicks)
     {
         if (_receiveBuffer is null)
             return;
 
+        uint receivesThisPoll = 0;
         while (true)
         {
+            /* Bounded work per poll. Without this the loop runs until the socket is empty, so traffic arriving
+             * faster than the engine processes it keeps the loop fed and Poll never returns. The host frame loop
+             * stalls for the duration of the flood. Counting every iteration rather than every successful receive
+             * also guarantees forward progress: an error path that continues without consuming its datagram can no
+             * longer spin here indefinitely. Whatever is left stays queued for the next poll.
+             */
+            if (receivesThisPoll >= _effectiveMaximumReceivesPerPoll)
+                break;
+
+            receivesThisPoll++;
             int receivedLength;
+#if !NET8_0_OR_GREATER
+            int nativeSockAddrLength = 0;
+#endif
             EndPoint remoteEndPoint = _anyEndPoint!;
 
             try
             {
+                /* Kept deliberately, despite costing a syscall per datagram on top of the receive. The alternative
+                 * (non-blocking mode with WouldBlock as the exit condition) would halve the syscalls, but
+                 * Blocking is a socket-wide property: every send would then have to handle WouldBlock too, turning
+                 * a guaranteed send into a partial one under buffer pressure. The per-poll receive budget already
+                 * bounds this loop, which was the actual hazard. */
                 // Available (FIONREAD) reports the pending datagram bytes and is reliable across runtimes, whereas
                 // Socket.Poll(0, SelectRead) under Unity's Mono can report no data on a UDP socket that has some, the
                 // single-process loopback handshake stalls there while it connects under .NET. The socket stays in blocking
@@ -317,6 +415,15 @@ internal sealed partial class IngressEngine
                     receivedLength = _socket.ReceiveFrom(_receiveBuffer.AsSpan(0, MaximumUdpDatagramSize), SocketFlags.None, _receivedSocketAddress!);
                 }
 #else
+                else if (_isNativeReceiveEnabled)
+                {
+                    /* recvfrom writes the sender into our own buffer, so nothing is created per datagram. The
+                     * managed overload below allocates a SocketAddress, an IPEndPoint and an IPAddress every time. */
+                    receivedLength = NativeSocket.ReceiveFrom(_socket, _receiveBuffer, MaximumUdpDatagramSize, _receiveSockAddr!, out nativeSockAddrLength);
+
+                    if (receivedLength < 0)
+                        break;
+                }
                 else
                 {
                     receivedLength = _socket.ReceiveFrom(_receiveBuffer, 0, MaximumUdpDatagramSize, SocketFlags.None, ref remoteEndPoint);
@@ -353,7 +460,7 @@ internal sealed partial class IngressEngine
             {
                 if (_connectedRemoteEndPoint is not null)
                 {
-                    HandleDatagram(_receiveBuffer, receivedLength, _connectedRemoteEndPoint);
+                    HandleDatagram(_receiveBuffer, receivedLength, _connectedRemoteEndPoint, nowTicks);
                 }
 #if NET8_0_OR_GREATER
                 /* A known sender resolves to its connection's stable endpoint without materializing anything; only an unknown
@@ -364,12 +471,25 @@ internal sealed partial class IngressEngine
                         ? resolvedConnection!.RemoteEndPoint
                         : (IPEndPoint)_endPointTemplate!.Create(_receivedSocketAddress!);
 
-                    HandleDatagram(_receiveBuffer, receivedLength, fromEndPoint);
+                    HandleDatagram(_receiveBuffer, receivedLength, fromEndPoint, nowTicks, resolvedConnection);
                 }
 #else
+                else if (_isNativeReceiveEnabled)
+                {
+                    /* An established peer resolves straight from the raw address the kernel filled. Only an unknown
+                     * sender (a handshake, probe or violation, never the steady state) pays to materialise one. */
+                    ulong addressKey = NativeSocket.ComputeAddressKey(_receiveSockAddr!, nativeSockAddrLength);
+
+                    IPEndPoint? nativeEndPoint = _connections.TryGetByAddressKey(addressKey, out SynapseConnection? nativeConnection)
+                        ? nativeConnection!.RemoteEndPoint
+                        : NativeSocket.ToEndPoint(_receiveSockAddr!);
+
+                    if (nativeEndPoint is not null)
+                        HandleDatagram(_receiveBuffer, receivedLength, nativeEndPoint, nowTicks, nativeConnection);
+                }
                 else
                 {
-                    HandleDatagram(_receiveBuffer, receivedLength, (IPEndPoint)remoteEndPoint);
+                    HandleDatagram(_receiveBuffer, receivedLength, (IPEndPoint)remoteEndPoint, nowTicks);
                 }
 #endif
             }
@@ -382,6 +502,27 @@ internal sealed partial class IngressEngine
     }
 
     /// <summary>
+    /// Periodic upkeep for this engine, driven from <see cref="SynapseManager.Poll"/>.
+    /// Runs the replay-cache and NAT probe-table sweeps here rather than from the receive path: both are O(n) scans
+    /// over tables an attacker sizes, and running them inline meant the pause landed on a timer the attacker chose.
+    /// </summary>
+    /// <param name="nowTicks">Current time in <see cref="DateTime.Ticks"/>.</param>
+    internal void RunMaintenance(long nowTicks)
+    {
+        if (nowTicks - _lastHandshakeEvictionTicks > TimeSpan.TicksPerSecond)
+        {
+            _lastHandshakeEvictionTicks = nowTicks;
+            RemoveExpiredHandshakeEntries(nowTicks, ReplayCacheEntryLifetimeTicks);
+        }
+
+        if (_isNatEnabled && nowTicks - _lastProbeEvictionTicks > TimeSpan.TicksPerSecond)
+        {
+            _lastProbeEvictionTicks = nowTicks;
+            RemoveExpiredProbeLimitEntries(nowTicks, _config.NatTraversal.IntervalMilliseconds * TimeSpan.TicksPerMillisecond * 10);
+        }
+    }
+
+    /// <summary>
     /// Runs the lowest-level mitigations on one received datagram and dispatches it to the packet handlers.
     /// Established connections skip signature recomputation and blacklist lookup, those only apply at handshake
     /// time. Size and rate-limit checks still run for all senders.
@@ -389,14 +530,17 @@ internal sealed partial class IngressEngine
     /// <param name="buffer">The raw receive buffer containing the datagram.</param>
     /// <param name="receivedLength">Number of valid bytes in <paramref name="buffer"/>.</param>
     /// <param name="fromEndPoint">The source endpoint of the datagram.</param>
-    private void HandleDatagram(byte[] buffer, int receivedLength, IPEndPoint fromEndPoint)
+    /// <param name="nowTicks">Monotonic timestamp for the current poll, resolved once by the caller.</param>
+    /// <param name="resolvedConnection">Connection the caller already resolved for <paramref name="fromEndPoint"/>, or null to resolve it here.</param>
+    private void HandleDatagram(byte[] buffer, int receivedLength, IPEndPoint fromEndPoint, long nowTicks, SynapseConnection? resolvedConnection = null)
     {
-        long nowTicks = DateTime.UtcNow.Ticks;
-
         FilterResult filterResult;
         ulong signature;
 
-        bool isEstablished = _connections.ConnectionsByEndPoint.TryGetValue(fromEndPoint, out SynapseConnection? synapseConnection);
+        /* The drain may already have resolved the sender while avoiding an endpoint materialisation; reuse that
+         * rather than hashing the endpoint a second time for the same datagram. */
+        SynapseConnection? synapseConnection = resolvedConnection;
+        bool isEstablished = synapseConnection is not null || _connections.ConnectionsByEndPoint.TryGetValue(fromEndPoint, out synapseConnection);
 
         if (isEstablished)
         {
@@ -441,7 +585,14 @@ internal sealed partial class IngressEngine
             _ => ViolationReason.Malformed
         };
 
-        ViolationOccurred?.Invoke(fromEndPoint, signature, violationReason, receivedLength, filterResult.ToString(), ViolationAction.KickAndBlacklist);
+        /* Rate limiting sheds load; it does not ban. Banning on a single threshold crossing turns a legitimate
+         * burst into a lockout, and because the source address of an unauthenticated datagram is attacker-chosen it
+         * also hands over a way to evict any endpoint that can be forged. Excess is dropped and nothing more. */
+        ViolationAction violationAction = violationReason == ViolationReason.RateLimitExceeded
+            ? ViolationAction.Drop
+            : ViolationAction.KickAndBlacklist;
+
+        ViolationOccurred?.Invoke(fromEndPoint, signature, violationReason, receivedLength, filterResult.ToString(), violationAction);
     }
 
     /// <summary>
@@ -493,8 +644,8 @@ internal sealed partial class IngressEngine
     /// <param name="buffer">The raw receive buffer containing the datagram.</param>
     /// <param name="length">Number of valid bytes in <paramref name="buffer"/>.</param>
     /// <param name="fromEndPoint">The source endpoint of the datagram.</param>
-    /// <param name = "synapseConnection"></param>
-    /// <param name = "nowTicks"></param>
+    /// <param name="synapseConnection">The connection this datagram was resolved to, or null when the sender is not an established peer.</param>
+    /// <param name="nowTicks">Monotonic timestamp for the current poll, resolved once by the caller.</param>
     private void ProcessPacket(byte[] buffer, int length, IPEndPoint fromEndPoint, SynapseConnection? synapseConnection, long nowTicks)
     {
         // Fast path: unreliable unsegmented payload, the dominant case.
@@ -508,7 +659,11 @@ internal sealed partial class IngressEngine
                 return;
             }
 
+            /* Stamped whatever the state, so this stays a truthful record of the last packet seen. A pending
+             * session cannot be held open by that: its timeout is measured from
+             * <see cref="SynapseConnection.HandshakeStartedTicks"/>, which inbound traffic never refreshes. */
             synapseConnection.LastReceivedTicks = nowTicks;
+
             int fastPayloadLength = length - PacketHeader.TypeSize;
 
             if (!_copyReceivedPayloads)
@@ -532,7 +687,7 @@ internal sealed partial class IngressEngine
         // External protocols (e.g. beacon/rendezvous clients) piggyback here intentionally.
         byte typeByte = buffer[0];
 
-        if (typeByte > (byte)PacketType.NatChallenge)
+        if (typeByte > (byte)PacketType.SegmentAck)
         {
             /* AllowUnknownPackets value is not cached
              * because this condition is rare. */
@@ -563,11 +718,7 @@ internal sealed partial class IngressEngine
         byte segmentCount;
         int headerSize;
 
-        try
-        {
-            headerSize = PacketHeader.Read(buffer.AsSpan(0, length), out type, out sequence, out segmentId, out segmentIndex, out segmentCount);
-        }
-        catch
+        if (!PacketHeader.TryRead(buffer.AsSpan(0, length), out headerSize, out type, out sequence, out segmentId, out segmentIndex, out segmentCount))
         {
             _telemetry.OnSecurityDroppedReceived();
             ulong signature = _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
@@ -597,26 +748,66 @@ internal sealed partial class IngressEngine
             return;
         }
 
+        /* See the note on the fast path for why this is stamped in every state.
+         *
+         * A forged packet from a spoofed source does refresh this, holding a session alive after the real peer is
+         * gone. That is not specific to KeepAlive. Every accepted type reaches this line, so authenticating one
+         * type would move the vector rather than close it. Closing it means authenticating every packet, which is
+         * accepted risk by design: this transport does not spend bytes per datagram. Damage is bounded to a held
+         * connection slot, and anyone able to forge here can already inject payloads as that peer. */
         synapseConnection.LastReceivedTicks = nowTicks;
 
         switch (type)
         {
             case PacketType.Disconnect:
-                synapseConnection.State = ConnectionState.Disconnected;
-                _connections.Remove(fromEndPoint, out _);
-                ConnectionClosed?.Invoke(synapseConnection);
-                ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.PeerDisconnect, 0, null, ViolationAction.Ignore);
+            {
+                // Capture identity before teardown: TeardownRequested queues the instance for the pool, and OnReturn
+                // clears Signature and RemoteEndPoint.
+                ulong disconnectSignature = synapseConnection.Signature;
+
+                TeardownRequested?.Invoke(synapseConnection);
+                ViolationOccurred?.Invoke(fromEndPoint, disconnectSignature, ViolationReason.PeerDisconnect, packetSize: 0, details: null, ViolationAction.Ignore);
+
                 return;
+            }
 
             case PacketType.KeepAlive:
                 return;
 
-            case PacketType.Ack:
-                // Remove immediately (stops retransmission and frees backpressure) and return the buffer now.
-                // The engine is single-threaded, so no retransmit can be reading the buffer concurrently.
-                if (synapseConnection.PendingReliableQueue.Remove(sequence, out SynapseConnection.PendingReliable? acked))
-                    SynapseConnection.ReleasePendingReliable(acked);
+            case PacketType.SegmentAck:
+            {
+                /* Selective acknowledgement: the peer is telling us which segments of this message it already
+                 * holds, so the retransmit sweep can skip them instead of resending the whole thing. */
+                if (synapseConnection.PendingReliableQueue.TryGetValue(sequence, out SynapseConnection.PendingReliable? partiallyAcked))
+                {
+                    int bitmapLength = length - headerSize;
+
+                    if (bitmapLength > 0 && partiallyAcked.ApplyAckedBitmap(buffer.AsSpan(headerSize, bitmapLength)))
+                    {
+                        // Every segment confirmed: the message is delivered, so drop it like a full ack would.
+                        synapseConnection.PendingReliableQueue.Remove(sequence);
+                        SynapseConnection.ReleasePendingReliable(partiallyAcked);
+                    }
+                }
+
                 return;
+            }
+
+            case PacketType.Ack:
+            {
+                /* An ack datagram carries one or more sequences packed back to back after the type byte. Remove
+                 * each immediately (stopping retransmission and freeing backpressure) and return its buffer now:
+                 * the engine is single-threaded, so no retransmit can be reading it concurrently. */
+                for (int offset = PacketHeader.TypeSize; offset + PacketHeader.SequenceSize <= length; offset += PacketHeader.SequenceSize)
+                {
+                    ushort ackedSequence = (ushort)(buffer[offset] | (buffer[offset + 1] << 8));
+
+                    if (synapseConnection.PendingReliableQueue.Remove(ackedSequence, out SynapseConnection.PendingReliable? acked))
+                        SynapseConnection.ReleasePendingReliable(acked);
+                }
+
+                return;
+            }
         }
 
         int payloadLength = length - headerSize;
@@ -630,7 +821,10 @@ internal sealed partial class IngressEngine
 
         if (type is PacketType.Segmented or PacketType.ReliableSegmented)
         {
-            if (_isSecurityEnabled && segmentCount * _effectiveMaximumTransmissionUnit > _effectiveMaximumReassembledPacketSize)
+            /* Ungated: a bound on memory a remote peer controls is not a switchable feature. The product is a
+             * sound upper bound only because TryReassemble now refuses any segment larger than the MTU; widened
+             * to ulong so a large configured MTU cannot wrap the multiplication. */
+            if ((ulong)segmentCount * _effectiveMaximumTransmissionUnit > _effectiveMaximumReassembledPacketSize)
             {
                 _telemetry.OnSecurityDroppedReceived();
                 ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Oversized, length, ViolationSegmentAssemblyOversized, ViolationAction.KickAndBlacklist);
@@ -657,25 +851,34 @@ internal sealed partial class IngressEngine
             {
                 if (_config.Segment.ReliableEnabled)
                 {
-                    byte[] payloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
-                    Buffer.BlockCopy(buffer, headerSize, payloadBuffer, 0, payloadLength);
-                    ArraySegment<byte> payload = new(payloadBuffer, 0, payloadLength);
+                    /* Read straight out of the receive buffer. TryReassemble copies each segment into the
+                     * assembly's own storage anyway, so renting an intermediate buffer just to copy into it and
+                     * immediately return it was a second copy and a pool round-trip per segment. */
                     PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
 
-                    if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, payload, isReliable: true, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
+                    if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, buffer.AsSpan(headerSize, payloadLength), isReliable: true, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation, out bool isDuplicateSegment))
                     {
                         EnqueueOrSendAck(synapseConnection, sequence);
                         DeliverOrdered(synapseConnection, sequence, assembledPayload, isReliable: true);
+                    }
+                    else if (isDuplicateSegment || segmentIndex == segmentCount - 1)
+                    {
+                        /* Report what we hold, so the sender repairs the gap instead of resending the message.
+                         *
+                         * Two triggers. The last segment arriving while the assembly is still incomplete means the
+                         * burst finished and something was lost. Reporting immediately avoids the sender's first
+                         * blind retransmit of everything. A duplicate segment covers the case where the last one
+                         * was itself lost, so the only signal is the sender retransmitting. */
+                        Span<byte> receivedBitmap = stackalloc byte[PacketHeader.SegmentAckBitmapSize];
+
+                        if (reassembler.TryWriteReceivedBitmap(segmentId, receivedBitmap, out _))
+                            _sender.SendSegmentAck(synapseConnection, sequence, receivedBitmap);
                     }
                     else if (isProtocolViolation)
                     {
                         _telemetry.OnSecurityDroppedReceived();
                         ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Malformed, length, ViolationSegmentMismatch, ViolationAction.KickAndBlacklist);
-                        ArrayPool<byte>.Shared.Return(payloadBuffer);
-                        return;
                     }
-
-                    ArrayPool<byte>.Shared.Return(payloadBuffer);
                 }
 
                 return;
@@ -685,11 +888,10 @@ internal sealed partial class IngressEngine
             {
                 if (_config.Segment.UnreliableMode != UnreliableSegmentMode.Disabled)
                 {
-                    byte[] segmentPayloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
-                    Buffer.BlockCopy(buffer, headerSize, segmentPayloadBuffer, 0, payloadLength);
+                    // See the reliable case: the assembly copies internally, so the intermediate rental was dead weight.
                     PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
 
-                    if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, new(segmentPayloadBuffer, 0, payloadLength), isReliable: false, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation))
+                    if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, buffer.AsSpan(headerSize, payloadLength), isReliable: false, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation, out _))
                     {
                         PayloadDelivered?.Invoke(synapseConnection, assembledPayload, isReliable: false, isPayloadRented: true);
                     }
@@ -697,11 +899,7 @@ internal sealed partial class IngressEngine
                     {
                         _telemetry.OnSecurityDroppedReceived();
                         ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Malformed, length, ViolationSegmentMismatch, ViolationAction.KickAndBlacklist);
-                        ArrayPool<byte>.Shared.Return(segmentPayloadBuffer);
-                        return;
                     }
-
-                    ArrayPool<byte>.Shared.Return(segmentPayloadBuffer);
                 }
 
                 return;
@@ -749,23 +947,7 @@ internal sealed partial class IngressEngine
     /// </remarks>
     private void DeliverOrdered(SynapseConnection synapseConnection, ushort sequence, ArraySegment<byte> payload, bool isReliable)
     {
-        List<ArraySegment<byte>>? toDeliver = null;
-
-        if (sequence == synapseConnection.NextExpectedSequence)
-        {
-            synapseConnection.NextExpectedSequence++;
-
-            toDeliver = ListPool<ArraySegment<byte>>.Rent();
-            toDeliver.Add(payload);
-
-            while (synapseConnection.ReorderBuffer.TryGetValue(synapseConnection.NextExpectedSequence, out ArraySegment<byte> nextPayload))
-            {
-                synapseConnection.ReorderBuffer.Remove(synapseConnection.NextExpectedSequence);
-                synapseConnection.NextExpectedSequence++;
-                toDeliver.Add(nextPayload);
-            }
-        }
-        else
+        if (sequence != synapseConnection.NextExpectedSequence)
         {
             // Half-space comparison: if (sequence - NextExpectedSequence) wraps past the midpoint,
             // the sequence is "behind", a retransmit of an already-delivered packet. Discard it.
@@ -777,7 +959,10 @@ internal sealed partial class IngressEngine
             }
 
             // Out of order - buffer (only if not already received).
-            if (_isSecurityEnabled && synapseConnection.ReorderBuffer.Count >= _effectiveMaximumOutOfOrderReliablePackets)
+            /* Ungated for the same reason as the assembly bound above: with Security.Enabled false the half-space
+             * check still admits sequences up to 32,767 ahead, so one peer could pin that many pooled payload
+             * buffers by never sending the gap. */
+            if (synapseConnection.ReorderBuffer.Count >= _effectiveMaximumOutOfOrderReliablePackets)
             {
                 if (payload.Array is not null)
                     ArrayPool<byte>.Shared.Return(payload.Array);
@@ -792,12 +977,42 @@ internal sealed partial class IngressEngine
             return;
         }
 
-        // Deliver after the sequence/reorder bookkeeping is done so user handlers may safely re-enter the engine
-        // (e.g. SendReliable) from within the callback. No lock is needed, the engine is single-threaded.
-        foreach (ArraySegment<byte> deliverPayload in toDeliver)
-            PayloadDelivered?.Invoke(synapseConnection, deliverPayload, isReliable, isPayloadRented: true);
+        synapseConnection.NextExpectedSequence++;
 
-        ListPool<ArraySegment<byte>>.Return(toDeliver);
+        /* Loss-free case, which is the overwhelming majority: nothing was buffered behind this packet, so there is
+         * no batch to assemble. Renting a pooled list to carry exactly one element and returning it immediately is
+         * pure overhead on the dominant path. The sequence bookkeeping is already complete here, so a handler that
+         * re-enters the engine still sees consistent state. */
+        if (!synapseConnection.ReorderBuffer.TryGetValue(synapseConnection.NextExpectedSequence, out ArraySegment<byte> nextPayload))
+        {
+            PayloadDelivered?.Invoke(synapseConnection, payload, isReliable, isPayloadRented: true);
+            return;
+        }
+
+        /* This packet closed a gap, so drain everything now contiguous. The batch is assembled before any handler
+         * runs, so the reorder buffer and sequence are fully settled if a callback re-enters the engine. */
+        List<ArraySegment<byte>> toDeliver = ListPool<ArraySegment<byte>>.Rent();
+        toDeliver.Add(payload);
+
+        do
+        {
+            synapseConnection.ReorderBuffer.Remove(synapseConnection.NextExpectedSequence);
+            synapseConnection.NextExpectedSequence++;
+            toDeliver.Add(nextPayload);
+        }
+        while (synapseConnection.ReorderBuffer.TryGetValue(synapseConnection.NextExpectedSequence, out nextPayload));
+
+        // Deliver after the sequence/reorder bookkeeping is done so user handlers may safely re-enter the engine
+        // (e.g. SendReliable) from within the callback. No lock is needed. The engine is single-threaded.
+        try
+        {
+            foreach (ArraySegment<byte> deliverPayload in toDeliver)
+                PayloadDelivered?.Invoke(synapseConnection, deliverPayload, isReliable, isPayloadRented: true);
+        }
+        finally
+        {
+            ListPool<ArraySegment<byte>>.Return(toDeliver);
+        }
     }
 
     /// <summary>
@@ -810,6 +1025,8 @@ internal sealed partial class IngressEngine
     /// <param name="length">Total number of valid bytes in <paramref name="buffer"/>.</param>
     private void ProcessHandshake(IPEndPoint fromEndPoint, byte[] buffer, int headerSize, int length)
     {
+        long entryTicks = Clock.Ticks;
+
         ReadOnlySpan<byte> handshakePayload = buffer.AsSpan(headerSize, length - headerSize);
         ulong signature = _security.ComputeSignature(fromEndPoint, handshakePayload);
 
@@ -820,8 +1037,39 @@ internal sealed partial class IngressEngine
             return;
         }
 
+        /* A handshake shorter than a nonce is malformed. Rejecting it here also denies the cheapest reflection
+         * shape: a 1-byte datagram that would otherwise draw a full challenge in reply. */
+        if (handshakePayload.Length < PacketHeader.HandshakeNonceSize)
+            return;
+
+        bool hasConnection = _connections.ConnectionsByEndPoint.TryGetValue(fromEndPoint, out SynapseConnection? existingConnection);
+
+        /* We initiated to this peer and it is asking us to prove we can receive at the address we claimed. Echo the
+         * challenge back verbatim and stay Pending; the peer allocates nothing until this proof lands. */
+        if (hasConnection && existingConnection!.State == ConnectionState.Pending && handshakePayload.Length == PacketHeader.HandshakeChallengeSize)
+        {
+            _sender.SendHandshakePayload(fromEndPoint, handshakePayload);
+            return;
+        }
+
+        /* Return-routability gate. Above the occupancy threshold an unknown endpoint gets a stateless token instead
+         * of a connection: no table entry, no replay-cache entry, no keep-alive stream aimed at an address that may
+         * not be theirs. A spoofed source never receives the challenge and so can never consume a slot. Endpoints we
+         * already hold a connection for skip this. We chose to talk to them. */
+        if (!hasConnection && _connections.Count >= _handshakeChallengeThreshold)
+        {
+            bool isProven = handshakePayload.Length == PacketHeader.HandshakeChallengeSize
+                && VerifyEndpointToken(_handshakeChallengeHmac, fromEndPoint, handshakePayload[PacketHeader.HandshakeNonceSize..]);
+
+            if (!isProven)
+            {
+                SendHandshakeChallenge(fromEndPoint, handshakePayload);
+                return;
+            }
+        }
+
         // Connection cap: reject new peers when the engine is full.
-        if (_connections.Count >= _effectiveMaximumConcurrentConnections && !_connections.ConnectionsByEndPoint.TryGetValue(fromEndPoint, out _))
+        if (!hasConnection && _connections.Count >= _effectiveMaximumConcurrentConnections)
         {
             ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.ServerFull, "Connection limit reached");
             return;
@@ -831,23 +1079,26 @@ internal sealed partial class IngressEngine
         // The connection signature is IP-based (stable across reconnects) so blacklisting survives reconnects.
         // The replay key adds the nonce so each handshake is unique, reconnections from the same IP are
         // not incorrectly rejected, and the nonce is meaningfully consumed.
-        long nowTicks = DateTime.UtcNow.Ticks;
+        long nowTicks = Clock.Ticks;
         ulong replayKey = MixHandshakeNonce(signature, handshakePayload);
+
+        /* Bounded. The key folds in the peer-supplied nonce, so one peer mints a fresh entry per handshake it
+         * sends; without a ceiling the table grows for as long as the flood lasts. Expired entries are swept
+         * first, and only if that recovers nothing is the table cleared. Briefly re-admitting replays under
+         * active flood is a far smaller problem than unbounded growth. */
+        if (_seenHandshakes.Count >= SynapseManager.MaximumReplayCacheEntries)
+        {
+            RemoveExpiredHandshakeEntries(nowTicks, ReplayCacheEntryLifetimeTicks);
+
+            if (_seenHandshakes.Count >= SynapseManager.MaximumReplayCacheEntries)
+                _seenHandshakes.Clear();
+        }
 
         if (!_seenHandshakes.TryAdd(replayKey, nowTicks))
         {
             // Exact same bytes received again - replay.
             ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.SignatureRejected, "Handshake replay detected");
             return;
-        }
-
-        // Periodic eviction: keep the replay cache from growing without bound.
-        long lastHandshakeEvict = Volatile.Read(ref _lastHandshakeEvictionTicks);
-
-        if (nowTicks - lastHandshakeEvict > TimeSpan.TicksPerMinute)
-        {
-            if (Interlocked.CompareExchange(ref _lastHandshakeEvictionTicks, nowTicks, lastHandshakeEvict) == lastHandshakeEvict)
-                RemoveExpiredHandshakeEntries(nowTicks, _config.Connection.TimeoutMilliseconds * TimeSpan.TicksPerMillisecond * 2);
         }
 
         if (_config.Security.SignatureValidator is not null && !_config.Security.SignatureValidator.Validate(fromEndPoint, signature, handshakePayload))
@@ -858,11 +1109,20 @@ internal sealed partial class IngressEngine
 
         SynapseConnection synapseConnection = _connections.GetOrAdd(fromEndPoint, signature, out bool isExistingConnection);
 
+        /* A handshake arriving hard on the heels of one we just sent to this peer is that peer's answer, not a fresh
+         * request. Treating it as a request would reset the live session and emit yet another handshake, which the
+         * peer (running this same code) would answer in kind. That is a self-sustaining reset loop: one injected
+         * handshake against an established pair leaves both sides wiping their sequence spaces forever. Recognising
+         * our own answer terminates the exchange after a single round. */
+        bool isAnswerToOurHandshake = isExistingConnection
+            && synapseConnection.LastHandshakeSentTicks != 0
+            && entryTicks - synapseConnection.LastHandshakeSentTicks < HandshakeAnswerWindowTicks;
+
         // True when the peer reconnected without a clean disconnect. We need to respond with a
         // handshake-ack in this case just as we would for a brand-new connection.
-        bool wasConnected = isExistingConnection && synapseConnection.State == ConnectionState.Connected;
+        bool isReconnecting = isExistingConnection && synapseConnection.State == ConnectionState.Connected && !isAnswerToOurHandshake;
 
-        if (wasConnected)
+        if (isReconnecting)
         {
             // Peer reconnected without a clean disconnect (e.g. dropped disconnect packet).
             // Reset per-session state so the new session starts with fresh sequence numbers
@@ -873,7 +1133,7 @@ internal sealed partial class IngressEngine
 
         if (!isExistingConnection || synapseConnection.State != ConnectionState.Connected)
         {
-            long establishedTicks = DateTime.UtcNow.Ticks;
+            long establishedTicks = Clock.Ticks;
 
             synapseConnection.State = ConnectionState.Connected;
             synapseConnection.LastReceivedTicks = establishedTicks;
@@ -886,9 +1146,12 @@ internal sealed partial class IngressEngine
             // If the connection was already in our table as Pending, we are the client waiting
             // for the server's reply, echoing back would create an infinite ping-pong.
             // We do respond for brand-new connections (!isExistingConnection) and for forced
-            // reconnects where the peer was previously fully Connected (wasConnected).
-            if (!isExistingConnection || wasConnected)
+            // reconnects where the peer was previously fully Connected (isReconnecting).
+            if (!isExistingConnection || isReconnecting)
+            {
                 _sender.SendHandshake(fromEndPoint);
+                synapseConnection.LastHandshakeSentTicks = Clock.Ticks;
+            }
 
             ConnectionEstablished?.Invoke(synapseConnection);
         }
@@ -912,9 +1175,13 @@ internal sealed partial class IngressEngine
         const ulong FnvPrime = 1099511628211UL;
         ulong key = signature;
 
-        foreach (byte b in payload)
+        /* Only the nonce the protocol defines is folded in. Hashing the whole payload let a peer decide how much
+         * work each of its handshakes cost, on a path that runs before any rate limit applies. */
+        int mixLength = Math.Min(payload.Length, PacketHeader.HandshakeNonceSize);
+
+        for (int i = 0; i < mixLength; i++)
         {
-            key ^= b;
+            key ^= payload[i];
             key *= FnvPrime;
         }
 

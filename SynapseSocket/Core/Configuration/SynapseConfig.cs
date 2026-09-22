@@ -14,7 +14,7 @@ public sealed class SynapseConfig
 
     /// <summary>
     /// Local endpoints to bind.
-    /// At least one must be supplied before calling <see cref="SynapseManager.StartAsync"/>.
+    /// At least one must be supplied before calling <see cref="SynapseManager.Start"/>.
     /// </summary>
     public List<IPEndPoint> BindEndPoints = [];
 
@@ -44,8 +44,49 @@ public sealed class SynapseConfig
     /// Maximum number of simultaneous connections the engine will accept.
     /// Handshakes from new peers are rejected with <see cref="Core.Events.ConnectionRejectedReason.ServerFull"/>
     /// when the limit is reached. Set to <see cref="DisabledMaximumConcurrentConnections"/> (0) to disable.
+    /// <para>
+    /// Defaults to 4096 rather than unlimited. A handshake is unauthenticated, so every datagram bearing an unseen
+    /// source endpoint allocates a connection object and its associated tables; with no cap that growth is bounded
+    /// only by the attacker's send rate. The cap is the one bound that holds regardless of how much the attacker
+    /// varies its source addresses, which is why it (not a per-address rate limit) is the defence here. It is set
+    /// well above the engine's tested concurrency so legitimate fan-in, including many peers behind one NAT, is
+    /// unaffected.
+    /// </para>
+    /// <para>
+    /// This bounds the damage; it does not prevent it. A complete fix requires proving return-routability before
+    /// allocating any state. Responding to a first handshake with a token bound to the source and a time bucket,
+    /// and only creating a connection when that token comes back. The NAT challenge path already implements exactly
+    /// that pattern.
+    /// </para>
     /// </summary>
-    public uint MaximumConcurrentConnections = 0;
+    public uint MaximumConcurrentConnections = 4096;
+
+    /// <summary>
+    /// Maximum datagrams a single <see cref="SynapseManager.Poll"/> will take from each socket before returning.
+    /// Defaults to 4096.
+    /// <para>
+    /// The drain loop otherwise runs until the socket is empty, so traffic arriving faster than the engine processes
+    /// it keeps the loop fed and <c>Poll</c> never returns. The host frame loop stalls for as long as the flood
+    /// lasts. A budget turns that livelock into ordinary packet loss, which is what the kernel receive buffer is
+    /// for; whatever is left stays queued for the next poll.
+    /// </para>
+    /// <para>
+    /// 4096 per socket per poll is roughly 245k datagrams/second at 60 Hz (far above any realistic session) so the
+    /// bound only engages under abuse. Set to <see cref="DisabledMaximumReceivesPerPoll"/> (0) to drain without limit.
+    /// </para>
+    /// </summary>
+    public uint MaximumReceivesPerPoll = 4096;
+
+    /// <summary>
+    /// Receives datagrams through a direct <c>recvfrom</c> binding on runtimes whose managed socket API cannot
+    /// receive from an unspecified sender without allocating. Defaults to true; has no effect on .NET 8+, which
+    /// already has an allocation-free overload.
+    /// <para>
+    /// Measured on Unity Mono 6.13, the managed any-sender receive costs 6 managed allocations per datagram and
+    /// the native path costs none. Set to false to stay on the managed API everywhere.
+    /// </para>
+    /// </summary>
+    public bool NativeReceiveEnabled = true;
 
     /// <summary>
     /// Payload segmentation settings: enable/disable per channel, segment limits, and assembly timeouts.
@@ -145,6 +186,11 @@ public sealed class SynapseConfig
     public const uint DisabledMaximumConcurrentConnections = 0;
 
     /// <summary>
+    /// Sentinel value: pass as <see cref="MaximumReceivesPerPoll"/> to drain each socket without a per-poll bound.
+    /// </summary>
+    public const uint DisabledMaximumReceivesPerPoll = 0;
+
+    /// <summary>
     /// Sentinel value: pass as <see cref="SocketReceiveBufferBytes"/> or <see cref="SocketSendBufferBytes"/>
     /// to leave the OS default untouched.
     /// </summary>
@@ -159,4 +205,14 @@ public sealed class SynapseConfig
     /// Stored in place of 0 so hot-path checks can use a single comparison without a separate zero guard.
     /// </summary>
     internal const uint EffectiveUnlimitedValueInt32 = int.MaxValue;
+
+    /// <summary>
+    /// Converts a configured <c>uint</c> limit into the value stored for runtime checks, replacing 0 (disabled)
+    /// with <see cref="EffectiveUnlimitedValueUInt32"/>.
+    /// Every call site is constructor or initialisation code, so the conversion is paid once per engine, provider or
+    /// connection; each later check is then a single comparison against the stored limit with no separate zero guard.
+    /// </summary>
+    /// <param name="configuredLimit">The configured limit, where 0 means unlimited.</param>
+    /// <returns><paramref name="configuredLimit"/>, or <see cref="EffectiveUnlimitedValueUInt32"/> when it is 0.</returns>
+    internal static uint ToEffectiveLimit(uint configuredLimit) => configuredLimit == 0 ? EffectiveUnlimitedValueUInt32 : configuredLimit;
 }

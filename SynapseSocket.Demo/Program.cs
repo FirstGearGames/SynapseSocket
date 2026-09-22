@@ -126,7 +126,7 @@ internal static class Program
             string decodedText = Encoding.UTF8.GetString(packetReceivedEventArgs.Payload);
             Console.WriteLine($"[server] received ({(packetReceivedEventArgs.IsReliable ? "reliable" : "unreliable")}) from {packetReceivedEventArgs.Connection.RemoteEndPoint}: {decodedText}");
 
-            // Echo back on the same channel (re-entrant send from the receive callback is safe — single-threaded).
+            // Echo back on the same channel (re-entrant send from the receive callback is safe, single-threaded).
             byte[] replyPayload = Encoding.UTF8.GetBytes($"echo: {decodedText}");
             try
             {

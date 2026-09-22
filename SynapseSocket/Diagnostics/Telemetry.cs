@@ -4,8 +4,13 @@ namespace SynapseSocket.Diagnostics;
 
 /// <summary>
 /// Optional high-performance counters.
-/// Uses <see cref="Interlocked"/> to avoid locks on hot paths.
 /// All counters are 64-bit.
+/// <para>
+/// The engine writes these from its single poll thread, but the properties are public and applications routinely
+/// read them from elsewhere, a UI thread, a stats sampler. <see cref="Interlocked"/> is therefore kept rather than
+/// dropped as redundant: a 64-bit read is not atomic on 32-bit targets, and Unity still ships those. The cost is a
+/// single uncontended interlocked op per counted event, and nothing at all when telemetry is disabled.
+/// </para>
 /// </summary>
 public sealed class Telemetry
 {

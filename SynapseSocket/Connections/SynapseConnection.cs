@@ -6,9 +6,15 @@ using System.Threading;
 using CodeBoost.CodeAnalysis;
 using CodeBoost.Extensions;
 using CodeBoost.Performance;
+using SynapseSocket.Core;
 using SynapseSocket.Packets;
 using SynapseSocket.Security;
 using SynapseSocket.Transport;
+
+/* ReturnAndNullifyReference takes the field by ref and writes null back into it, which the nullable annotations
+ * on a non-nullable pool type cannot express. The nulling is the point: it is what stops a returned instance from
+ * being reachable through a connection that has gone back to the pool. */
+#pragma warning disable CS8601
 
 namespace SynapseSocket.Connections;
 
@@ -47,12 +53,12 @@ public sealed partial class SynapseConnection : IPoolResettable
     [PoolResettableMember]
     public ConnectionState State { get; internal set; }
     /// <summary>
-    /// UTC ticks of the last received packet from this peer. Drives timeout detection.
+    /// Monotonic ticks of the last received packet from this peer. Drives timeout detection.
     /// </summary>
     [PoolResettableMember]
     public long LastReceivedTicks { get; internal set; }
     /// <summary>
-    /// UTC ticks of the last packet of any type sent to this peer, stamped by every connection-addressed send.
+    /// Monotonic ticks of the last packet of any type sent to this peer, stamped by every connection-addressed send.
     /// Drives keep-alive scheduling: every datagram we send refreshes the peer's timeout, so a heartbeat is only owed
     /// by a side that has gone quiet. Scheduling off this rather than <see cref="LastReceivedTicks"/> is what keeps a
     /// receive-only peer emitting heartbeats. Such a peer takes a steady inbound stream and transmits nothing of its
@@ -62,12 +68,12 @@ public sealed partial class SynapseConnection : IPoolResettable
     [PoolResettableMember]
     public long LastSentTicks { get; internal set; }
     /// <summary>
-    /// UTC ticks of the last sent keep-alive to this peer.
+    /// Monotonic ticks of the last sent keep-alive to this peer.
     /// </summary>
     [PoolResettableMember]
     public long LastKeepAliveSentTicks { get; internal set; }
     /// <summary>
-    /// UTC ticks at which this connection was created, which is when its handshake began: sent by an outgoing connect, or
+    /// Monotonic ticks at which this connection was created, which is when its handshake began: sent by an outgoing connect, or
     /// received for an inbound one. Drives the handshake timeout while the connection is <see cref="ConnectionState.Pending"/>.
     /// </summary>
     /// <remarks>
@@ -77,6 +83,15 @@ public sealed partial class SynapseConnection : IPoolResettable
     /// </remarks>
     [PoolResettableMember]
     internal long HandshakeStartedTicks { get; private set; }
+
+    /// <summary>
+    /// Monotonic ticks of the last handshake this side sent to the peer. An inbound handshake arriving within a short
+    /// window of this stamp is the peer's answer rather than a fresh request, and must not reset the session or
+    /// draw another handshake in reply, otherwise two peers running this code answer each other indefinitely.
+    /// </summary>
+    [PoolResettableMember]
+    public long LastHandshakeSentTicks { get; internal set; }
+
     /// <summary>
     /// Number of consecutive keep-alives sent since the last received packet.
     /// Used to compute exponential backoff on the keep-alive send interval.
@@ -108,6 +123,13 @@ public sealed partial class SynapseConnection : IPoolResettable
     /// <summary>
     /// Out-of-order reliable packets awaiting delivery.
     /// </summary>
+    /// <remarks>
+    /// Keyed rather than a ring buffer over the sequence space. The space is 16-bit but the live window is capped at
+    /// <see cref="SynapseSocket.Core.Configuration.SecurityConfig.MaximumOutOfOrderReliablePackets"/>, 64 by
+    /// default, and is sparse, since entries exist only for sequences past a gap. A ring sized to the sequence
+    /// space would be 65,536 slots to hold at most 64 live ones; a ring sized to the window needs wrap handling for
+    /// no measurable gain at this size.
+    /// </remarks>
     [PoolResettableMember]
     internal readonly Dictionary<ushort, ArraySegment<byte>> ReorderBuffer = [];
     /// <summary>
@@ -131,10 +153,26 @@ public sealed partial class SynapseConnection : IPoolResettable
     [PoolResettableMember]
     internal TransmissionEngine? TransmissionEngine;
     /// <summary>
+    /// True once this connection has been torn down and queued for return to the pool, but before the return has
+    /// actually happened. Guards against a second teardown queueing the same instance twice, which would hand one
+    /// object to two future renters.
+    /// </summary>
+    [PoolResettableMember]
+    internal bool IsPendingPoolReturn;
+    /// <summary>
+    /// Handshake attempts made while this connection has been Pending, including the initial one from Connect.
+    /// </summary>
+    [PoolResettableMember]
+    internal uint HandshakeAttempts;
+    /// <summary>
     /// Value used when ConnectionsIndex is not set.
     /// </summary>
     public const int UnsetConnectionsIndex = -1;
 
+    /// <summary>
+    /// Creates an uninitialised instance. Connections are rented from a pool and configured by
+    /// <see cref="Initialize"/>, so the constructor deliberately does nothing.
+    /// </summary>
     // ReSharper disable once EmptyConstructor
     public SynapseConnection() { }
 
@@ -143,7 +181,7 @@ public sealed partial class SynapseConnection : IPoolResettable
     /// </summary>
     /// <param name="remoteEndPoint">The peer's remote endpoint.</param>
     /// <param name="signature">The 64-bit signature that uniquely identifies this peer.</param>
-    /// <param name = "connectionsIndex"></param>
+    /// <param name="connectionsIndex">Index this connection occupies in the manager's connection list, or <see cref="UnsetConnectionsIndex"/> when it holds no slot.</param>
     public void Initialize(IPEndPoint remoteEndPoint, ulong signature, int connectionsIndex)
     {
         RemoteEndPoint = remoteEndPoint ?? throw new ArgumentNullException(nameof(remoteEndPoint));
@@ -154,8 +192,10 @@ public sealed partial class SynapseConnection : IPoolResettable
         ConnectionsIndex = connectionsIndex;
         State = ConnectionState.Pending;
 
-        long nowTicks = DateTime.UtcNow.Ticks;
+        long nowTicks = Clock.Ticks;
+
         HandshakeStartedTicks = nowTicks;
+
         LastReceivedTicks = nowTicks;
         // Seeded so a brand-new connection does not owe a keep-alive on its very first maintenance sweep.
         LastSentTicks = nowTicks;
@@ -167,9 +207,115 @@ public sealed partial class SynapseConnection : IPoolResettable
     /// </summary>
     internal void SendPendingAcks()
     {
-        while (PendingAcks.TryDequeue(out ushort sequence))
-            TransmissionEngine?.SendAck(this, sequence);
+        if (PendingAcks.Count == 0)
+            return;
+
+        TransmissionEngine?.SendAcks(this, PendingAcks);
     }
+
+    /// <summary>
+    /// Returns all pooled memory held by <paramref name="pendingReliable"/> back to <see cref="ArrayPool{T}.Shared"/>
+    /// and returns the <see cref="PendingReliable"/> instance itself to its <see cref="ResettableObjectPool{T}"/>.
+    /// Safe to call from any context (ingress ACK path, maintenance sweep, or on kick).
+    /// </summary>
+    internal static void ReleasePendingReliable(PendingReliable pendingReliable)
+    {
+        ResettableObjectPool<PendingReliable>.Return(pendingReliable);
+    }
+
+    /// <summary>
+    /// Resets all per-session state for a reconnecting peer without returning the connection to the pool.
+    /// Clears sequence numbers, the reorder buffer, pending ACKs, the pending reliable queue, and segmenters.
+    /// Sets <see cref="State"/> to <see cref="ConnectionState.Disconnected"/> so the caller
+    /// can re-initialise it through the normal handshake path.
+    /// </summary>
+    internal void ResetForReconnect()
+    {
+        ReleasePooledResources();
+
+        NextOutgoingSequence = 0;
+        NextExpectedSequence = 0;
+
+        UnansweredKeepAlives = 0;
+        LastKeepAliveSentTicks = 0;
+        LastHandshakeSentTicks = 0;
+        State = ConnectionState.Disconnected;
+    }
+
+    /// <summary>
+    /// Releases every pooled buffer and pooled helper this connection holds, leaving its identity
+    /// (<see cref="RemoteEndPoint"/>, <see cref="Signature"/>, <see cref="ConnectionsIndex"/>) intact so callers can
+    /// still remove it from the lookup tables and raise <c>ConnectionClosed</c> with it afterwards.
+    /// <para>
+    /// This is the single cleanup implementation. Every path that tears a connection down calls it, which is what
+    /// stops teardown paths from silently disagreeing about which of the three resource families they release.
+    /// Safe to call more than once: every collection is cleared and every pooled helper is nulled as it is returned.
+    /// </para>
+    /// </summary>
+    [PoolResettableMethod]
+    private void ReleasePooledResources()
+    {
+        PendingAcks.Clear();
+
+        foreach (KeyValuePair<ushort, PendingReliable> entry in PendingReliableQueue)
+            ReleasePendingReliable(entry.Value);
+
+        PendingReliableQueue.Clear();
+
+        foreach (ArraySegment<byte> reorderSegment in ReorderBuffer.Values)
+            reorderSegment.PoolArrayIntoShared();
+
+        ReorderBuffer.Clear();
+
+        ResettableObjectPool<PacketSplitter>.ReturnAndNullifyReference(ref Splitter);
+        ResettableObjectPool<PacketReassembler>.ReturnAndNullifyReference(ref Reassembler);
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The single place a connection is cleared. Every teardown funnels through
+    /// <c>SynapseManager.TeardownConnection</c>, which queues the instance for return; the pool then calls this.
+    /// <para>
+    /// The engine guarantees only that <b>nothing inside Synapse</b> still references the instance when it is
+    /// returned. Table entries are removed, NAT punches retired, and the actual return deferred to the end of
+    /// <c>Poll</c> so no in-flight engine frame is holding it. An application that keeps the reference handed to it by
+    /// <c>Connect</c>, <c>PacketReceivedEventArgs.Connection</c> or <c>ConnectionEventArgs.Connection</c> past the
+    /// close notification is holding a recycled object, and that is the application's responsibility.
+    /// </para>
+    /// </remarks>
+    public void OnReturn()
+    {
+        IsPendingPoolReturn = false;
+        HandshakeAttempts = 0;
+        RemoteEndPoint = null;
+#if NET8_0_OR_GREATER
+        RemoteSocketAddress = null;
+#endif
+        TransmissionEngine = null;
+        Signature = SecurityProvider.UnsetSignature;
+        ConnectionsIndex = UnsetConnectionsIndex;
+        State = ConnectionState.Disconnected;
+
+        HandshakeStartedTicks = 0;
+        LastReceivedTicks = 0;
+        LastSentTicks = 0;
+        LastKeepAliveSentTicks = 0;
+        LastHandshakeSentTicks = 0;
+        UnansweredKeepAlives = 0;
+
+        NextOutgoingSequence = 0;
+        NextExpectedSequence = 0;
+
+        ReleasePooledResources();
+
+        /* Security. */
+        _inboundRateCountersResetTick = 0;
+        _receivedByPacketCount = 0;
+        _receivedByBytesCount = 0;
+    }
+
+    /// <inheritdoc/>
+    public void OnRent() { }
 
     /// <summary>
     /// A reliable packet that has been sent but not yet acknowledged.
@@ -194,7 +340,7 @@ public sealed partial class SynapseConnection : IPoolResettable
         [PoolResettableMember]
         public byte[]? BackingArray { get; private set; }
         /// <summary>
-        /// UTC ticks when this packet was last sent or retransmitted.
+        /// Monotonic ticks when this packet was last sent or retransmitted.
         /// </summary>
         [PoolResettableMember]
         public long SentTicks;
@@ -203,29 +349,68 @@ public sealed partial class SynapseConnection : IPoolResettable
         /// </summary>
         [PoolResettableMember]
         public int Retries;
+        /// <summary>
+        /// One bit per segment index the peer has confirmed. Allocated once with the instance and reused, so
+        /// selective retransmission costs no allocation.
+        /// </summary>
+        [PoolResettableMember]
+        public readonly byte[] AckedSegments = new byte[PacketHeader.SegmentAckBitmapSize];
+        /// <summary>
+        /// Segments this entry carries; 1 for an unsegmented send.
+        /// </summary>
+        [PoolResettableMember]
+        public int SegmentCount;
 
         /// <summary>
         /// Initialises this instance for a reliable send.
         /// </summary>
         /// <param name="segments">Rented list of wire-ready slices of <paramref name="backingArray"/>.</param>
         /// <param name="backingArray">The single rented buffer backing all entries in <paramref name="segments"/>.</param>
-        /// <param name="sentTicks">UTC ticks at the time of the initial send.</param>
+        /// <param name="sentTicks">Monotonic ticks at the time of the initial send.</param>
         [PoolResettableMethod]
         public void Initialize(List<ArraySegment<byte>> segments, byte[] backingArray, long sentTicks)
         {
             Segments = segments;
             BackingArray = backingArray;
             SentTicks = sentTicks;
+            SegmentCount = segments.Count;
+
+            Array.Clear(AckedSegments, 0, AckedSegments.Length);
         }
 
-        /// <inheritdoc/>
-        public void OnRent() { }
+        /// <summary>
+        /// True when the peer has confirmed the segment at <paramref name="index"/>.
+        /// </summary>
+        public bool IsSegmentAcked(int index) => (AckedSegments[index >> 3] & (1 << (index & 7))) != 0;
+
+        /// <summary>
+        /// Marks confirmed segments from a peer bitmap.
+        /// </summary>
+        /// <returns>True when every segment is now confirmed.</returns>
+        public bool ApplyAckedBitmap(ReadOnlySpan<byte> bitmap)
+        {
+            int copyLength = Math.Min(bitmap.Length, AckedSegments.Length);
+
+            for (int i = 0; i < copyLength; i++)
+                AckedSegments[i] |= bitmap[i];
+
+            for (int i = 0; i < SegmentCount; i++)
+            {
+                if (!IsSegmentAcked(i))
+                    return false;
+            }
+
+            return true;
+        }
 
         /// <inheritdoc/>
         public void OnReturn()
         {
             Retries = 0;
             SentTicks = 0;
+            SegmentCount = 0;
+
+            Array.Clear(AckedSegments, 0, AckedSegments.Length);
 
             if (BackingArray is not null)
             {
@@ -239,103 +424,9 @@ public sealed partial class SynapseConnection : IPoolResettable
                 Segments = null;
             }
         }
+
+        /// <inheritdoc/>
+        public void OnRent() { }
     }
-
-    /// <summary>
-    /// Returns all pooled memory held by <paramref name="pendingReliable"/> back to <see cref="ArrayPool{T}.Shared"/>
-    /// and returns the <see cref="PendingReliable"/> instance itself to its <see cref="ResettableObjectPool{T}"/>.
-    /// Safe to call from any context (ingress ACK path, maintenance sweep, or on kick).
-    /// </summary>
-    internal static void ReleasePendingReliable(PendingReliable pendingReliable)
-    {
-        ResettableObjectPool<PendingReliable>.Return(pendingReliable);
-    }
-
-    /// <summary>
-    /// Drains the pending reliable queue of <paramref name="synapseConnection"/>, returning every entry's pooled
-    /// buffers immediately. Safe because the engine is single-threaded: no retransmit can be reading these buffers
-    /// concurrently. Call on connection teardown to avoid leaking rented buffers.
-    /// </summary>
-    internal static void DrainPendingReliableQueue(SynapseConnection synapseConnection)
-    {
-        foreach (KeyValuePair<ushort, PendingReliable> entry in synapseConnection.PendingReliableQueue)
-            ReleasePendingReliable(entry.Value);
-
-        synapseConnection.PendingReliableQueue.Clear();
-    }
-
-    /// <summary>
-    /// Resets all per-session state for a reconnecting peer without returning the connection to the pool.
-    /// Clears sequence numbers, the reorder buffer, pending ACKs, the pending reliable queue, and segmenters.
-    /// Sets <see cref="State"/> to <see cref="ConnectionState.Disconnected"/> so the caller
-    /// can re-initialise it through the normal handshake path.
-    /// </summary>
-    internal void ResetForReconnect()
-    {
-        PacketSplitter? splitter = Interlocked.Exchange(ref Splitter, null);
-        if (splitter is not null)
-            ResettableObjectPool<PacketSplitter>.Return(splitter);
-
-        PacketReassembler? reassembler = Interlocked.Exchange(ref Reassembler, null);
-        if (reassembler is not null)
-            ResettableObjectPool<PacketReassembler>.Return(reassembler);
-
-        DrainPendingReliableQueue(this);
-        PendingAcks.Clear();
-
-        foreach (ArraySegment<byte> segment in ReorderBuffer.Values)
-            segment.PoolArrayIntoShared();
-
-        ReorderBuffer.Clear();
-        NextOutgoingSequence = 0;
-        NextExpectedSequence = 0;
-
-        UnansweredKeepAlives = 0;
-        LastKeepAliveSentTicks = 0;
-        State = ConnectionState.Disconnected;
-    }
-
-    /// <inheritdoc/>
-    public void OnReturn()
-    {
-        RemoteEndPoint = null;
-#if NET8_0_OR_GREATER
-        RemoteSocketAddress = null;
-#endif
-        TransmissionEngine = null;
-        Signature = SecurityProvider.UnsetSignature;
-        ConnectionsIndex = UnsetConnectionsIndex;
-        State = ConnectionState.Disconnected;
-
-        HandshakeStartedTicks = 0;
-        LastReceivedTicks = 0;
-        LastSentTicks = 0;
-        LastKeepAliveSentTicks = 0;
-        UnansweredKeepAlives = 0;
-
-        NextOutgoingSequence = 0;
-        NextExpectedSequence = 0;
-        PendingAcks.Clear();
-
-        foreach (KeyValuePair<ushort, PendingReliable> entry in PendingReliableQueue)
-            ReleasePendingReliable(entry.Value);
-
-        PendingReliableQueue.Clear();
-
-        foreach (ArraySegment<byte> reorderSegment in ReorderBuffer.Values)
-            reorderSegment.PoolArrayIntoShared();
-
-        ReorderBuffer.Clear();
-
-        ResettableObjectPool<PacketSplitter>.ReturnAndNullifyReference(ref Splitter);
-        ResettableObjectPool<PacketReassembler>.ReturnAndNullifyReference(ref Reassembler);
-        
-        /* Security. */
-        _inboundRateCountersResetTick = 0;
-        _receivedByPacketCount = 0;
-        _receivedByBytesCount = 0;
-    }
-
-    /// <inheritdoc/>
-    public void OnRent() { }
 }
+

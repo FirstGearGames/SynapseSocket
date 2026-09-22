@@ -136,7 +136,7 @@ public sealed class BeaconServer : IDisposable
         switch (type)
         {
             case BeaconPacketType.RequestSession:
-                HandleRequestSession(from);
+                HandleRequestSession(data, from);
                 break;
 
             case BeaconPacketType.JoinSession:
@@ -157,23 +157,23 @@ public sealed class BeaconServer : IDisposable
     /// Creates a new session for the requesting host and sends back a <see cref="BeaconPacketType.SessionCreated"/> response,
     /// or <see cref="BeaconPacketType.ServerAtCapacity"/> if the concurrent session limit has been reached.
     /// </summary>
-    private void HandleRequestSession(IPEndPoint from)
+    private void HandleRequestSession(byte[] data, IPEndPoint from)
     {
         if (!_registry.TryCreateSession(from, out uint sessionId))
         {
-            _log?.Invoke($"[BeaconServer] session limit reached — rejecting request from {from}.");
+            _log?.Invoke($"[BeaconServer] session limit reached. Rejecting request from {from}.");
             SendServerAtCapacity(from);
             return;
         }
 
         _log?.Invoke($"[BeaconServer] created session '{sessionId}' for host {from}.");
-        SendSessionCreated(from, sessionId);
+        SendSessionCreated(from, sessionId, ReadNonce(data));
     }
 
     /// <summary>
     /// Registers a joining peer against an existing session. Sends <see cref="BeaconPacketType.PeerReady"/> to both
-    /// the joiner and the host on success. Registrations targeting an unknown or closed session are silently dropped so
-    /// that rejected joiners cannot clog the server with retry-driven responses.
+    /// the joiner and the host on success, and <see cref="BeaconPacketType.SessionNotFound"/> when the id is unknown.
+    /// The joiner's copy echoes the nonce it sent, so a reply forged from the server's address cannot be accepted.
     /// </summary>
     private void HandleRegister(byte[] data, IPEndPoint from)
     {
@@ -184,7 +184,7 @@ public sealed class BeaconServer : IDisposable
 
         if (notFound)
         {
-            _log?.Invoke($"[BeaconServer] session '{sessionId}' not found — notifying {from}.");
+            _log?.Invoke($"[BeaconServer] session '{sessionId}' not found, notifying {from}.");
             SendSessionNotFound(from);
             return;
         }
@@ -193,8 +193,9 @@ public sealed class BeaconServer : IDisposable
             return;
 
         _log?.Invoke($"[BeaconServer] matched session '{sessionId}': host {host} <-> joiner {joiner}");
-        SendPeerReady(joiner!, host!);
-        SendPeerReady(host!, joiner!);
+        // The joiner's copy carries its nonce back so it can tell this reply from a forged one.
+        SendPeerReady(joiner!, host!, ReadNonce(data, BeaconWireFormat.SessionIdBytes));
+        SendPeerReady(host!, joiner!, ReadOnlySpan<byte>.Empty);
     }
 
     /// <summary>
@@ -228,20 +229,36 @@ public sealed class BeaconServer : IDisposable
     /// <summary>
     /// Sends a <see cref="BeaconPacketType.SessionCreated"/> packet carrying the server-assigned session ID.
     /// </summary>
-    private void SendSessionCreated(IPEndPoint to, uint sessionId)
+    private void SendSessionCreated(IPEndPoint to, uint sessionId, ReadOnlySpan<byte> nonce)
     {
-        const int Size = 1 + BeaconWireFormat.SessionIdBytes;
-        byte[] packet = ArrayPool<byte>.Shared.Rent(Size);
+        int size = 1 + BeaconWireFormat.SessionIdBytes + nonce.Length;
+        byte[] packet = ArrayPool<byte>.Shared.Rent(size);
+
         BeaconWireFormat.WriteTypeAndSessionId(packet.AsSpan(), BeaconPacketType.SessionCreated, sessionId);
-        _ = SendAndReturnAsync(packet, Size, to);
+        nonce.CopyTo(packet.AsSpan(1 + BeaconWireFormat.SessionIdBytes));
+
+        _ = SendAndReturnAsync(packet, size, to);
+    }
+
+    /// <summary>
+    /// Extracts the client nonce that follows the fixed part of a request, or an empty span when absent.
+    /// </summary>
+    private static ReadOnlySpan<byte> ReadNonce(byte[] data, int fixedPayloadBytes = 0)
+    {
+        int offset = 1 + fixedPayloadBytes;
+
+        if (data.Length < offset + BeaconWireFormat.NonceBytes)
+            return ReadOnlySpan<byte>.Empty;
+
+        return data.AsSpan(offset, BeaconWireFormat.NonceBytes);
     }
 
     /// <summary>
     /// Sends a <see cref="BeaconPacketType.PeerReady"/> packet to <paramref name="to"/> carrying <paramref name="peer"/>'s external endpoint.
     /// </summary>
-    private void SendPeerReady(IPEndPoint to, IPEndPoint peer)
+    private void SendPeerReady(IPEndPoint to, IPEndPoint peer, ReadOnlySpan<byte> nonce)
     {
-        int bufferSize = 1 + BeaconWireFormat.MaxPeerEndPointBytes;
+        int bufferSize = 1 + BeaconWireFormat.MaxPeerEndPointBytes + nonce.Length;
         byte[] packet = ArrayPool<byte>.Shared.Rent(bufferSize);
 
         packet[0] = (byte)BeaconPacketType.PeerReady;
@@ -253,7 +270,9 @@ public sealed class BeaconServer : IDisposable
             return;
         }
 
-        _ = SendAndReturnAsync(packet, 1 + payloadLength, to);
+        nonce.CopyTo(packet.AsSpan(1 + payloadLength));
+
+        _ = SendAndReturnAsync(packet, 1 + payloadLength + nonce.Length, to);
     }
 
     /// <summary>

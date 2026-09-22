@@ -81,7 +81,7 @@ public class TelemetryAndLatencyTests
         server.Start();
         client.Start();
 
-        // Handshake is exempt — connect first, then measure a data packet's trip time.
+        // Handshake is exempt. Connect first, then measure a data packet's trip time.
         SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => eventRecorder.ConnectionsEstablished >= 1, 2000, server, client));
 
@@ -188,7 +188,7 @@ public class TelemetryAndLatencyTests
         server.Start();
         client.Start();
 
-        // Handshake is exempt — connect first, then measure a data packet's trip time.
+        // Handshake is exempt. Connect first, then measure a data packet's trip time.
         SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => recorder.ConnectionsEstablished >= 1, 2000, server, client));
 
@@ -198,7 +198,7 @@ public class TelemetryAndLatencyTests
         double elapsedMs = (DateTime.UtcNow - sent).TotalMilliseconds;
 
         Assert.True(elapsedMs >= BaseLatencyMs * 0.8,
-            $"elapsed {elapsedMs:F0}ms was less than base latency {BaseLatencyMs}ms — sim may not be active");
+            $"elapsed {elapsedMs:F0}ms was less than base latency {BaseLatencyMs}ms. Sim may not be active");
         Assert.True(elapsedMs < BaseLatencyMs + JitterMs + 500,
             $"elapsed {elapsedMs:F0}ms greatly exceeded base+jitter ceiling of {BaseLatencyMs + JitterMs}ms");
     }
@@ -315,7 +315,7 @@ public class TelemetryAndLatencyTests
 
         SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => recorder.ConnectionsEstablished >= 1, 3000, server, client),
-            "connection should establish — handshake is exempt from the sim");
+            "connection should establish. Handshake is exempt from the sim");
 
         ArraySegment<byte> payload = new(new byte[] { 0xFF });
         for (int i = 0; i < PacketCount; i++)
@@ -324,7 +324,7 @@ public class TelemetryAndLatencyTests
         TestHarness.PumpFor(500, server, client);
 
         Assert.True(recorder.PacketsReceived > 60 && recorder.PacketsReceived < 195,
-            $"received {recorder.PacketsReceived}/{PacketCount} packets under {LossChance * 100}% loss — expected partial delivery");
+            $"received {recorder.PacketsReceived}/{PacketCount} packets under {LossChance * 100}% loss, expected partial delivery");
     }
 
     [Fact]
@@ -361,6 +361,6 @@ public class TelemetryAndLatencyTests
         TestHarness.PumpFor(500, server, client);
 
         Assert.True(clientReceivedCount > 60 && clientReceivedCount < 195,
-            $"received {clientReceivedCount}/{PacketCount} packets under {LossChance * 100}% loss — expected partial delivery");
+            $"received {clientReceivedCount}/{PacketCount} packets under {LossChance * 100}% loss, expected partial delivery");
     }
 }

@@ -30,10 +30,14 @@ public class PayloadIntegrityStressTests
 
     public PayloadIntegrityStressTests(ITestOutputHelper output) => _output = output;
 
-    /// <summary>Payload sizes per message; mixes unsegmented (&lt;=MTU) and multi-segment payloads.</summary>
+    /// <summary>
+    /// Payload sizes per message; mixes unsegmented (&lt;=MTU) and multi-segment payloads.
+    /// </summary>
     private static readonly int[] PayloadSizes = [16, 200, 1_100, 1_500, 3_000, 5_000, 800, 2_400];
 
-    /// <summary>Payload sizes that all stay under the MTU, so every send takes the unsegmented unreliable fast path.</summary>
+    /// <summary>
+    /// Payload sizes that all stay under the MTU, so every send takes the unsegmented unreliable fast path.
+    /// </summary>
     private static readonly int[] UnsegmentedPayloadSizes = [16, 200, 512, 800, 1_100];
 
     /// <summary>
@@ -68,10 +72,14 @@ public class PayloadIntegrityStressTests
             buffer[i] = (byte)((seed + (uint)i) & 0xFF);
     }
 
-    /// <summary>Returns a description of the first pattern violation in <paramref name="payload"/>, or null when it is intact.</summary>
+    /// <summary>
+    /// Returns a description of the first pattern violation in <paramref name="payload"/>, or null when it is intact.
+    /// </summary>
     private static string? ValidatePattern(byte[] payload) => ValidatePattern(payload, payload.Length);
 
-    /// <summary>Validates the first <paramref name="length"/> bytes of <paramref name="payload"/> against the seed-derived pattern.</summary>
+    /// <summary>
+    /// Validates the first <paramref name="length"/> bytes of <paramref name="payload"/> against the seed-derived pattern.
+    /// </summary>
     private static string? ValidatePattern(byte[] payload, int length)
     {
         if (length < 4)
@@ -533,7 +541,9 @@ public class PayloadIntegrityStressTests
         Assert.True(duplicateCount == 0, $"the shared pool handed out {duplicateCount} duplicate datagram buffer(s), so the ingress receive buffer was returned to it more than once");
     }
 
-    /// <summary>Rents and patterns a batch of shared-pool buffers in size classes that overlap the engine's wire/payload buffers.</summary>
+    /// <summary>
+    /// Rents and patterns a batch of shared-pool buffers in size classes that overlap the engine's wire/payload buffers.
+    /// </summary>
     private static List<(byte[] buffer, int length, uint seed)> RentCanaries(int cycle)
     {
         int[] sizes = [64, 256, 512, 1_200, 1_500, 2_048, 4_096];
@@ -575,7 +585,9 @@ public class PayloadIntegrityStressTests
         return canaries;
     }
 
-    /// <summary>Re-verifies each canary's pattern; a mismatch means another owner wrote into a buffer we still hold.</summary>
+    /// <summary>
+    /// Re-verifies each canary's pattern; a mismatch means another owner wrote into a buffer we still hold.
+    /// </summary>
     private static void VerifyCanaries(List<(byte[] buffer, int length, uint seed)> canaries, int cycle, ConcurrentBag<string> corruptions)
     {
         foreach ((byte[] buffer, int length, uint seed) in canaries)

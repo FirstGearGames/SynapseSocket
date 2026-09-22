@@ -176,7 +176,7 @@ public static class TestHarness
     }
 
     /// <summary>
-    /// Captures background-loop exceptions (via <c>SynapseManager.UnhandledException</c>) and
+    /// Captures engine exceptions (via <c>SynapseManager.UnhandledException</c>) and
     /// connection-rejection failures (via <c>ConnectionFailed</c>), plus any exception thrown by a send routed
     /// through <see cref="RunSend"/>. Sends are synchronous now, so a failed send throws at the call site;
     /// <see cref="RunSend"/> records it instead of aborting the test mid-loop.
@@ -187,10 +187,14 @@ public static class TestHarness
         private readonly ConcurrentBag<(SynapseManager Manager, UnhandledExceptionHandler Handler)> _unhandledSubscriptions = [];
         private readonly ConcurrentBag<(SynapseManager Manager, ConnectionFailedHandler Handler)> _failedSubscriptions = [];
 
-        /// <summary>True if any failure has been recorded.</summary>
+        /// <summary>
+        /// True if any failure has been recorded.
+        /// </summary>
         public bool HasFailures => !_failures.IsEmpty;
 
-        /// <summary>Snapshot of the recorded failure descriptions.</summary>
+        /// <summary>
+        /// Snapshot of the recorded failure descriptions.
+        /// </summary>
         public string[] Failures => [.. _failures];
 
         /// <summary>
@@ -241,7 +245,7 @@ public static class TestHarness
         }
 
         /// <summary>
-        /// Detaches every handler this observer attached. Does not assert on failures — call
+        /// Detaches every handler this observer attached. Does not assert on failures, call
         /// <see cref="AssertNoFailures"/> explicitly first if you want the test to fail.
         /// </summary>
         public void Dispose()

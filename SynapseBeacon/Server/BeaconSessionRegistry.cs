@@ -1,7 +1,9 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
+using System.Security.Cryptography;
 using CodeBoost.Performance;
 
 namespace SynapseBeacon.Server;
@@ -15,28 +17,12 @@ namespace SynapseBeacon.Server;
 /// </summary>
 internal sealed class BeaconSessionRegistry
 {
+
     /// <summary>
-    /// Holds the state for a single active rendezvous session.
+    /// Attempts to find a free identifier before giving up. The generator previously retried until it succeeded,
+    /// which never terminates once the space is saturated, and the space was small enough to saturate cheaply.
     /// </summary>
-    private sealed class Entry
-    {
-        /// <summary>
-        /// External endpoint of the host that created this session.
-        /// </summary>
-        internal readonly IPEndPoint Host;
-
-        /// <summary>
-        /// UTC ticks of the last heartbeat received from the host. Used to evict stale sessions.
-        /// </summary>
-        internal long LastHeartbeatTicks;
-
-        internal Entry(IPEndPoint host)
-        {
-            Host = host;
-            LastHeartbeatTicks = DateTime.UtcNow.Ticks;
-        }
-    }
-
+    private const int MaximumIdentifierAttempts = 64;
     /// <summary>
     /// Active sessions keyed by server-assigned session ID.
     /// </summary>
@@ -51,19 +37,11 @@ internal sealed class BeaconSessionRegistry
     /// Maximum number of sessions allowed simultaneously. Zero means unlimited.
     /// </summary>
     private readonly int _maximumConcurrentSessions;
-
     /// <summary>
-    /// Per-thread <see cref="Random"/> instance used for session ID generation.
-    /// Avoids locking under concurrent requests.
+    /// Modulus applied to generated identifiers, or 0 to use the full 32-bit range. Non-zero values exist so a
+    /// caller can deliberately constrain the space; production uses the full range.
     /// </summary>
-    [ThreadStatic]
-    private static Random? _threadRandom;
-
-    /// <summary>
-    /// Lazily initializes and returns a per-thread <see cref="Random"/> instance.
-    /// Avoids locking when generating session IDs under concurrent requests.
-    /// </summary>
-    private static Random ThreadRandom => _threadRandom ??= new(unchecked(Environment.TickCount * 397) ^ Environment.CurrentManagedThreadId);
+    private readonly uint _identifierSpace;
 
     /// <summary>
     /// Milliseconds of heartbeat silence before a session is evicted.
@@ -75,8 +53,10 @@ internal sealed class BeaconSessionRegistry
     /// </summary>
     /// <param name="sessionTimeoutMilliseconds">Milliseconds of heartbeat silence before a session is evicted.</param>
     /// <param name="maximumConcurrentSessions">Maximum number of sessions that may be open simultaneously. 0 = unlimited.</param>
-    internal BeaconSessionRegistry(uint sessionTimeoutMilliseconds, int maximumConcurrentSessions)
+    /// <param name="identifierSpace">Modulus for generated identifiers, or 0 for the full 32-bit range.</param>
+    internal BeaconSessionRegistry(uint sessionTimeoutMilliseconds, int maximumConcurrentSessions, uint identifierSpace = 0)
     {
+        _identifierSpace = identifierSpace;
         SessionTimeoutMilliseconds = sessionTimeoutMilliseconds;
         _timeoutTicks = TimeSpan.FromMilliseconds(sessionTimeoutMilliseconds).Ticks;
         _maximumConcurrentSessions = maximumConcurrentSessions;
@@ -97,7 +77,7 @@ internal sealed class BeaconSessionRegistry
 
         Entry entry = new(host);
 
-        while (true)
+        for (int attempt = 0; attempt < MaximumIdentifierAttempts; attempt++)
         {
             uint candidate = GenerateId();
 
@@ -107,6 +87,10 @@ internal sealed class BeaconSessionRegistry
                 return true;
             }
         }
+
+        // Space saturated. Refusing is the only safe answer; retrying forever hangs the receive loop.
+        sessionId = 0;
+        return false;
     }
 
     /// <summary>
@@ -177,7 +161,46 @@ internal sealed class BeaconSessionRegistry
     }
 
     /// <summary>
-    /// Generates a random session ID in the range [100000, 1000000).
+    /// Generates a session identifier from a cryptographic source across the full 32-bit range.
     /// </summary>
-    private static uint GenerateId() => (uint)ThreadRandom.Next(100000, 1000000);
+    /// <remarks>
+    /// The previous six-digit range held ~900,000 values and came from <see cref="Random"/> seeded off the tick
+    /// count. JoinSession discloses the host endpoint for any identifier that hits, so a small predictable space
+    /// lets an attacker sweep it end to end and harvest every host the beacon knows.
+    /// </remarks>
+    private uint GenerateId()
+    {
+        Span<byte> identifierBytes = stackalloc byte[sizeof(uint)];
+        RandomNumberGenerator.Fill(identifierBytes);
+
+        uint identifier = BinaryPrimitives.ReadUInt32LittleEndian(identifierBytes);
+
+        if (_identifierSpace != 0)
+            identifier %= _identifierSpace;
+
+        // 0 is the failure sentinel on this API, so never hand it out as a live identifier.
+        return identifier == 0 && _identifierSpace != 1 ? 1u : identifier;
+    }
+
+    /// <summary>
+    /// Holds the state for a single active rendezvous session.
+    /// </summary>
+    private sealed class Entry
+    {
+        /// <summary>
+        /// External endpoint of the host that created this session.
+        /// </summary>
+        internal readonly IPEndPoint Host;
+
+        /// <summary>
+        /// UTC ticks of the last heartbeat received from the host. Used to evict stale sessions.
+        /// </summary>
+        internal long LastHeartbeatTicks;
+
+        internal Entry(IPEndPoint host)
+        {
+            Host = host;
+            LastHeartbeatTicks = DateTime.UtcNow.Ticks;
+        }
+    }
 }

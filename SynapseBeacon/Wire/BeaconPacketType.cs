@@ -4,9 +4,9 @@ namespace SynapseBeacon.Wire;
 /// Identifies the type of a SynapseBeacon wire packet.
 /// Encoded as the first byte of every packet.
 /// <para>
-/// All values are &gt; 0x7F so they do not collide with any SynapseSocket <c>PacketType</c> —
-/// when a beacon client piggybacks on the Synapse UDP socket, the ingress path routes beacon
-/// packets through <c>SynapseManager.UnknownPacketReceived</c>.
+/// All values are &gt; 0x7F so they do not collide with any SynapseSocket <c>PacketType</c>. When a beacon client
+/// piggybacks on the Synapse UDP socket, the ingress path routes beacon packets through
+/// <c>SynapseManager.UnknownPacketReceived</c>.
 /// </para>
 /// </summary>
 public enum BeaconPacketType : byte

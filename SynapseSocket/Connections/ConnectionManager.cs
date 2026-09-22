@@ -35,6 +35,14 @@ public sealed class ConnectionManager
     /// SocketAddress equality and hashing read the address buffer, so the reusable receive instance works as a lookup key.
     /// </summary>
     private readonly Dictionary<SocketAddress, SynapseConnection> _connectionsBySocketAddress = [];
+#else
+    /// <summary>
+    /// Maps a hash of a connection's raw address bytes and port to its <see cref="SynapseConnection"/>, so a
+    /// native receive can resolve an established peer straight from the <c>sockaddr</c> the kernel filled, with no
+    /// managed endpoint materialised. The netstandard2.1 counterpart to the SocketAddress table, which that runtime
+    /// has no ReceiveFrom overload for. Only the native receive path reads it, so the modern build does not build it.
+    /// </summary>
+    private readonly Dictionary<ulong, SynapseConnection> _connectionsByAddressKey = [];
 #endif
     /// <summary>
     /// Maps a connection's 64-bit signature to its <see cref="SynapseConnection"/>.
@@ -53,7 +61,7 @@ public sealed class ConnectionManager
     /// </summary>
     /// <param name="endPoint">The remote endpoint identifying the peer.</param>
     /// <param name="signature">The 64-bit signature associated with the peer.</param>
-    /// <param name="isFound"></param>
+    /// <param name="isFound">Receives true when a connection already existed for <paramref name="endPoint"/>, false when one was created.</param>
     /// <returns>The existing connection for the endpoint, or the newly created one.</returns>
     public SynapseConnection GetOrAdd(IPEndPoint endPoint, ulong signature, out bool isFound)
     {
@@ -69,6 +77,8 @@ public sealed class ConnectionManager
             _connectionsByEndPoint[endPoint] = synapseConnection;
 #if NET8_0_OR_GREATER
             _connectionsBySocketAddress[synapseConnection.RemoteSocketAddress] = synapseConnection;
+#else
+            _connectionsByAddressKey[Transport.NativeSocket.ComputeAddressKey(endPoint)] = synapseConnection!;
 #endif
             _connections.Add(synapseConnection);
         }
@@ -98,6 +108,8 @@ public sealed class ConnectionManager
         {
 #if NET8_0_OR_GREATER
             _connectionsBySocketAddress.Remove(old.RemoteSocketAddress);
+#else
+            _connectionsByAddressKey.Remove(Transport.NativeSocket.ComputeAddressKey(endPoint));
 #endif
             RemoveFromConnections(old);
 
@@ -111,6 +123,8 @@ public sealed class ConnectionManager
         _connectionsByEndPoint[endPoint] = synapseConnection;
 #if NET8_0_OR_GREATER
         _connectionsBySocketAddress[synapseConnection.RemoteSocketAddress] = synapseConnection;
+#else
+        _connectionsByAddressKey[Transport.NativeSocket.ComputeAddressKey(endPoint)] = synapseConnection;
 #endif
         _connections.Add(synapseConnection);
 
@@ -134,6 +148,8 @@ public sealed class ConnectionManager
         {
 #if NET8_0_OR_GREATER
             _connectionsBySocketAddress.Remove(removedSynapseConnection.RemoteSocketAddress);
+#else
+            _connectionsByAddressKey.Remove(Transport.NativeSocket.ComputeAddressKey(endPoint));
 #endif
             _connectionsBySignature.TryRemove(removedSynapseConnection.Signature, out _);
 
@@ -152,6 +168,8 @@ public sealed class ConnectionManager
         _connectionsByEndPoint.Clear();
 #if NET8_0_OR_GREATER
         _connectionsBySocketAddress.Clear();
+#else
+        _connectionsByAddressKey.Clear();
 #endif
         _connectionsBySignature.Clear();
         _connections.Clear();
@@ -167,7 +185,7 @@ public sealed class ConnectionManager
     public bool TryGetBySocketAddress(SocketAddress socketAddress, out SynapseConnection? synapseConnection) => _connectionsBySocketAddress.TryGetValue(socketAddress, out synapseConnection);
 #endif
 
-/// <summary>
+    /// <summary>
     /// Unlinks a connection from the dense connections list with a swap-remove, keeping every surviving entry's <see cref="SynapseConnection.ConnectionsIndex"/> equal to its own slot and clearing the removed connection's.
     /// </summary>
     /// <param name="synapseConnection">The connection to unlink.</param>
@@ -195,4 +213,15 @@ public sealed class ConnectionManager
         // Cleared unconditionally: a tail removal left the outgoing connection carrying a live-looking index, and nothing resets it.
         synapseConnection.ConnectionsIndex = SynapseConnection.UnsetConnectionsIndex;
     }
+
+#if !NET8_0_OR_GREATER
+    /// <summary>
+    /// Resolves a connection from the hash of a raw sender address, without materialising an endpoint.
+    /// Only the netstandard2.1 native receive path resolves senders this way.
+    /// </summary>
+    /// <param name="addressKey">Key produced by <see cref="Transport.NativeSocket.ComputeAddressKey(byte[], int)"/>.</param>
+    /// <param name="synapseConnection">When this returns true, the resolved connection.</param>
+    /// <returns>True when a connection is registered for the address.</returns>
+    internal bool TryGetByAddressKey(ulong addressKey, out SynapseConnection? synapseConnection) => _connectionsByAddressKey.TryGetValue(addressKey, out synapseConnection);
+#endif
 }

@@ -3,6 +3,7 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using SynapseBeacon.Wire;
@@ -14,15 +15,15 @@ namespace SynapseBeacon.Client;
 /// <summary>
 /// Client-side counterpart to <see cref="Server.BeaconServer"/>. Piggybacks on a
 /// <see cref="SynapseManager"/>'s UDP socket via its extension API
-/// (<see cref="SynapseManager.SendRawAsync"/> + <see cref="SynapseManager.UnknownPacketReceived"/>)
+/// (<see cref="SynapseManager.EnqueueRaw"/> + <see cref="SynapseManager.UnknownPacketReceived"/>)
 /// so that the NAT mapping opened to the beacon server is the same mapping used for
 /// peer-to-peer traffic after hole-punching.
 /// <para>
 /// Typical usage:
 /// <list type="bullet">
-/// <item><c>var client = new BeaconClient(synapse, config);</c></item>
-/// <item>Host: <c>using var session = await client.HostAsync(ct);</c> — share <c>session.SessionId</c> and listen for <c>PeerReady</c>.</item>
-/// <item>Join: <c>IPEndPoint host = await client.JoinAsync(sessionId, ct);</c> — then call <c>synapse.ConnectAsync(host, ct)</c> in FullCone mode.</item>
+/// <item><c>BeaconClient client = new(synapse, config);</c></item>
+/// <item>Host: <c>using BeaconHostSession session = await client.HostAsync(ct);</c>, then share <c>session.SessionId</c> and listen for <c>PeerReady</c>.</item>
+/// <item>Join: <c>IPEndPoint host = await client.JoinAsync(sessionId, ct);</c>, then call <c>synapse.Connect(host)</c> in FullCone mode.</item>
 /// </list>
 /// </para>
 /// </summary>
@@ -55,6 +56,14 @@ public sealed class BeaconClient : IDisposable
     /// <see cref="BeaconPacketType.SessionNotFound"/> if the ID does not exist on the server.
     /// </summary>
     private readonly ConcurrentDictionary<uint, TaskCompletionSource<IPEndPoint>> _pendingRegistrations = new();
+    /// <summary>
+    /// Nonce sent with the in-flight <see cref="BeaconPacketType.RequestSession"/>, echoed by the reply.
+    /// </summary>
+    private readonly byte[] _sessionRequestNonce = new byte[BeaconWireFormat.NonceBytes];
+    /// <summary>
+    /// Nonce sent with each in-flight <see cref="BeaconPacketType.JoinSession"/>, keyed by session id.
+    /// </summary>
+    private readonly ConcurrentDictionary<uint, byte[]> _pendingRegistrationNonces = new();
 
     /// <summary>
     /// Active host sessions keyed by session ID. Used to route <see cref="BeaconPacketType.PeerReady"/>
@@ -69,15 +78,15 @@ public sealed class BeaconClient : IDisposable
 
     /// <summary>
     /// Creates a new client bound to <paramref name="synapseManager"/>'s UDP socket.
+    /// Throws <see cref="InvalidOperationException"/> when <paramref name="synapseManager"/> has
+    /// <see cref="SynapseSocket.Core.Configuration.SecurityConfig.AllowUnknownPackets"/> set to false, because every beacon
+    /// reply arrives as an unknown packet and the ingress path raises a violation instead of delivering it.
     /// </summary>
     /// <param name="synapseManager">
     /// A running <see cref="SynapseManager"/> whose <see cref="SynapseSocket.Core.Configuration.SecurityConfig.AllowUnknownPackets"/>
     /// is set to true. All beacon traffic is sent and received via this engine's socket.
     /// </param>
     /// <param name="config">Client configuration, including the rendezvous server endpoint.</param>
-    /// <exception cref="InvalidOperationException">
-    /// Thrown when <see cref="SynapseSocket.Core.Configuration.SecurityConfig.AllowUnknownPackets"/> is false on <paramref name="synapseManager"/>.
-    /// </exception>
     public BeaconClient(SynapseManager synapseManager, BeaconClientConfig config)
     {
         _synapse = synapseManager ?? throw new ArgumentNullException(nameof(synapseManager));
@@ -122,9 +131,11 @@ public sealed class BeaconClient : IDisposable
 
     /// <summary>
     /// Registers as a joiner against an existing session and awaits the host's matched endpoint.
-    /// Call <c>synapseManager.ConnectAsync(returnedEndPoint, ct)</c> afterwards to initiate hole-punching.
+    /// Call <c>synapseManager.Connect(returnedEndPoint)</c> afterwards to initiate hole-punching.
+    /// Throws <see cref="InvalidOperationException"/> when a registration for <paramref name="sessionId"/> is already in
+    /// flight, or when the server reports the session as unknown or expired, and <see cref="TimeoutException"/> when no
+    /// reply arrives within <see cref="BeaconClientConfig.ResponseTimeoutMilliseconds"/>.
     /// </summary>
-    /// <exception cref="InvalidOperationException">Thrown when the session is not found or is already full.</exception>
     public async Task<IPEndPoint> JoinAsync(uint sessionId, CancellationToken cancellationToken)
     {
         EnsureNotDisposed();
@@ -142,6 +153,7 @@ public sealed class BeaconClient : IDisposable
         finally
         {
             _pendingRegistrations.TryRemove(sessionId, out _);
+            _pendingRegistrationNonces.TryRemove(sessionId, out _);
         }
     }
 
@@ -172,7 +184,7 @@ public sealed class BeaconClient : IDisposable
     /// <summary>
     /// Routes an inbound unknown packet from <see cref="SynapseManager.UnknownPacketReceived"/>
     /// if it originated from the configured beacon server. Returns <see cref="FilterResult.Allowed"/>
-    /// unconditionally — the beacon protocol does not police other unknown-packet sources.
+    /// unconditionally. The beacon protocol does not police other unknown-packet sources.
     /// </summary>
     private FilterResult OnUnknownPacketReceived(IPEndPoint fromEndPoint, ArraySegment<byte> packet)
     {
@@ -204,7 +216,7 @@ public sealed class BeaconClient : IDisposable
                 break;
 
             case BeaconPacketType.HeartbeatAck:
-                /* no-op — keep-alive acknowledgement */
+                /* no-op, keep-alive acknowledgement */
                 break;
         }
 
@@ -217,6 +229,11 @@ public sealed class BeaconClient : IDisposable
     private void HandleSessionCreated(ReadOnlySpan<byte> payload)
     {
         if (!BeaconWireFormat.TryReadSessionId(payload, out uint sessionId))
+            return;
+
+        /* Accepted only if it echoes the nonce we sent. The source address alone is not evidence: it is forgeable,
+         * and this handler runs on packets the Synapse layer deliberately does not authenticate. */
+        if (!EchoesNonce(payload[BeaconWireFormat.SessionIdBytes..], _sessionRequestNonce))
             return;
 
         TaskCompletionSource<uint>? tcs = Volatile.Read(ref _pendingSessionRequest);
@@ -245,20 +262,28 @@ public sealed class BeaconClient : IDisposable
     /// Routes a <c>PeerReady</c> packet. On the joiner side it completes the pending registration;
     /// on the host side it raises the session's <see cref="BeaconHostSession.PeerReady"/> event.
     /// Because the host does not know the joiner's session ID from the packet alone, any active
-    /// host session is a valid target — only a joiner's registration carries a session ID we can
+    /// host session is a valid target, only a joiner's registration carries a session ID we can
     /// match against. The server only sends <c>PeerReady</c> to the host in response to a specific
     /// joiner's <c>JoinSession</c>, so we dispatch to all host sessions; in practice at most one will
     /// be active per joiner endpoint.
     /// </summary>
     private void HandlePeerReady(ReadOnlySpan<byte> payload)
     {
+        /* A forged PeerReady would otherwise point the joiner's hole-punch and subsequent Connect at whatever
+         * endpoint the attacker names. The joiner's copy carries its own nonce back, so one that does not echo it
+         * cannot complete a pending registration. */
         IPEndPoint? peer = BeaconWireFormat.TryReadPeerEndPoint(payload);
         if (peer is null)
             return;
 
-        /* Joiner path: complete any pending registration expecting a peer. */
+        int endPointLength = BeaconWireFormat.MeasurePeerEndPoint(payload);
+
+        /* Joiner path: complete a pending registration only when the reply echoes that registration's nonce. */
         foreach (KeyValuePair<uint, TaskCompletionSource<IPEndPoint>> kvp in _pendingRegistrations)
         {
+            if (!RegistrationNonceMatches(kvp.Key, payload, endPointLength))
+                continue;
+
             if (kvp.Value.TrySetResult(peer))
                 return;
         }
@@ -275,9 +300,14 @@ public sealed class BeaconClient : IDisposable
     /// </summary>
     private Task SendRequestSessionAsync(CancellationToken cancellationToken)
     {
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(1);
+        RandomNumberGenerator.Fill(_sessionRequestNonce);
+
+        int size = 1 + BeaconWireFormat.NonceBytes;
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(size);
         buffer[0] = (byte)BeaconPacketType.RequestSession;
-        return SendAndReturnAsync(buffer, 1, cancellationToken);
+        _sessionRequestNonce.CopyTo(buffer, 1);
+
+        return SendAndReturnAsync(buffer, size, cancellationToken);
     }
 
     /// <summary>
@@ -285,7 +315,42 @@ public sealed class BeaconClient : IDisposable
     /// </summary>
     private Task SendJoinSessionAsync(uint sessionId, CancellationToken cancellationToken)
     {
-        return SendTypeAndSessionIdAsync(BeaconPacketType.JoinSession, sessionId, cancellationToken);
+        byte[] nonce = new byte[BeaconWireFormat.NonceBytes];
+        RandomNumberGenerator.Fill(nonce);
+        _pendingRegistrationNonces[sessionId] = nonce;
+
+        int size = 1 + BeaconWireFormat.SessionIdBytes + BeaconWireFormat.NonceBytes;
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(size);
+
+        BeaconWireFormat.WriteTypeAndSessionId(buffer.AsSpan(), BeaconPacketType.JoinSession, sessionId);
+        nonce.CopyTo(buffer, 1 + BeaconWireFormat.SessionIdBytes);
+
+        return SendAndReturnAsync(buffer, size, cancellationToken);
+    }
+
+    /// <summary>
+    /// True when <paramref name="payload"/> ends with the nonce that was sent for <paramref name="sessionId"/>.
+    /// </summary>
+    /// <param name="sessionId">Session whose pending registration nonce is checked.</param>
+    /// <param name="payload">Received payload, beginning with the encoded peer endpoint.</param>
+    /// <param name="endPointLength">Byte length of the encoded endpoint that precedes the nonce.</param>
+    private bool RegistrationNonceMatches(uint sessionId, ReadOnlySpan<byte> payload, int endPointLength)
+    {
+        if (!_pendingRegistrationNonces.TryGetValue(sessionId, out byte[]? nonce))
+            return false;
+
+        return EchoesNonce(payload[endPointLength..], nonce);
+    }
+
+    /// <summary>
+    /// True when <paramref name="trailing"/> begins with <paramref name="expected"/>. Used to confirm that a reply
+    /// echoed back the nonce this client sent, which is what binds the reply to the request that asked for it.
+    /// </summary>
+    /// <param name="trailing">Bytes following the encoded endpoint in the received payload.</param>
+    /// <param name="expected">The nonce that was sent with the request.</param>
+    private static bool EchoesNonce(ReadOnlySpan<byte> trailing, ReadOnlySpan<byte> expected)
+    {
+        return trailing.Length >= expected.Length && trailing[..expected.Length].SequenceEqual(expected);
     }
 
     /// <summary>
@@ -308,7 +373,9 @@ public sealed class BeaconClient : IDisposable
         {
             // SynapseManager.SendRaw is synchronous (the engine is poll-driven); the surrounding beacon API stays
             // async because it awaits server responses elsewhere.
-            _synapse.SendRaw(_serverEndPoint, new(buffer, 0, length));
+            // Queued rather than sent inline: this runs on a heartbeat timer thread, and the engine send path keeps
+            // unsynchronised per-engine state that only the poll thread may touch.
+            _synapse.EnqueueRaw(_serverEndPoint, new(buffer, 0, length));
         }
         finally
         {
@@ -373,6 +440,7 @@ public sealed class BeaconClient : IDisposable
             kvp.Value.TrySetCanceled();
 
         _pendingRegistrations.Clear();
+        _pendingRegistrationNonces.Clear();
 
         TaskCompletionSource<uint>? pendingRequest = Interlocked.Exchange(ref _pendingSessionRequest, null);
         pendingRequest?.TrySetCanceled();

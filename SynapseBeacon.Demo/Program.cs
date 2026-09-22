@@ -18,7 +18,7 @@ namespace SynapseBeacon.Demo;
 /// The Synapse engines are poll-driven: this single-threaded demo pumps every engine with <see cref="PumpUntil"/>,
 /// including <em>while awaiting</em> the beacon client's async operations (whose responses are delivered through the
 /// engine's socket and therefore only arrive when the engine is polled). The beacon rendezvous server runs its own
-/// UDP loop on a background task — it is a plain socket server, not a <see cref="SynapseManager"/>.
+/// UDP loop on a background task. It is a plain socket server, not a <see cref="SynapseManager"/>.
 /// </para>
 /// </summary>
 internal static class Program
@@ -73,7 +73,7 @@ internal static class Program
 
         /* --- Host requests a session (pump the host while the beacon response is in flight) --- */
         using BeaconHostSession hostBeaconSession = PumpAwait(hostBeaconClient.HostAsync(CancellationToken.None), 5_000, hostSynapseManager);
-        Console.WriteLine($"[host] session created: '{hostBeaconSession.SessionId}' — accepting up to {JoinerCount} joiners");
+        Console.WriteLine($"[host] session created: '{hostBeaconSession.SessionId}'. Accepting up to {JoinerCount} joiners");
 
         hostBeaconSession.PeerReady += joinerEndPoint =>
             Console.WriteLine($"[host] beacon matched joiner at {joinerEndPoint}");
@@ -113,7 +113,7 @@ internal static class Program
                 BeaconClient joinerBeaconClient = new(joinerSynapseManager, joinerBeaconClientConfig);
                 joinerBeaconClients.Add(joinerBeaconClient);
 
-                /* JoinAsync resolves once the beacon server returns the host's endpoint — pump host + joiner so the
+                /* JoinAsync resolves once the beacon server returns the host's endpoint. Pump host + joiner so the
                  * beacon response is delivered through the joiner's socket. */
                 IPEndPoint hostEndPointFromBeacon = PumpAwait(joinerBeaconClient.JoinAsync(hostBeaconSession.SessionId, CancellationToken.None), 5_000, [.. activeEngines]);
                 Console.WriteLine($"[joiner {joinerIndex}] beacon matched host at {hostEndPointFromBeacon}");
@@ -131,18 +131,18 @@ internal static class Program
 
             if (!allConnected)
             {
-                Console.WriteLine($"[error] host only accepted {acceptedPeerCount}/{JoinerCount} joiners within 5s — aborting demo.");
+                Console.WriteLine($"[error] host only accepted {acceptedPeerCount}/{JoinerCount} joiners within 5s, aborting demo.");
                 return;
             }
 
-            Console.WriteLine($"[host] reached joiner cap ({JoinerCount}) — closing session so no further joiners can match.");
+            Console.WriteLine($"[host] reached joiner cap ({JoinerCount}). Closing session so no further joiners can match.");
             PumpAwait(hostBeaconSession.CloseAsync(CancellationToken.None), 5_000, engines);
             Console.WriteLine($"[host] session '{hostBeaconSession.SessionId}' closed.");
 
             /* Give any in-flight greeting messages a moment to land before teardown. */
             PumpUntil(() => false, 250, engines);
 
-            Console.WriteLine("[demo] SUCCESS — all joiners connected and exchanged a message before session close.");
+            Console.WriteLine("[demo] SUCCESS. All joiners connected and exchanged a message before session close.");
         }
         finally
         {

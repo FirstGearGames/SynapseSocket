@@ -4,6 +4,8 @@ using System.Collections.Generic;
 using CodeBoost.CodeAnalysis;
 using CodeBoost.Extensions;
 using CodeBoost.Performance;
+using SynapseSocket.Core;
+using SynapseSocket.Core.Configuration;
 
 namespace SynapseSocket.Packets;
 
@@ -15,8 +17,9 @@ namespace SynapseSocket.Packets;
 public sealed class PacketReassembler : PacketSegmenter
 {
     /// <summary>
-    /// Effective concurrent assembly cap: caller's 0 (disabled) is converted to <see cref="uint.MaxValue"/>
-    /// on <see cref="Initialize"/> so the check is a single comparison with no zero guard.
+    /// Effective concurrent assembly cap: caller's 0 (disabled) is converted to
+    /// <see cref="SynapseConfig.EffectiveUnlimitedValueUInt32"/> on <see cref="Initialize"/> so the check is a single
+    /// comparison with no zero guard.
     /// </summary>
     private uint _maximumConcurrentAssemblies;
     /// <summary>
@@ -29,9 +32,22 @@ public sealed class PacketReassembler : PacketSegmenter
     private readonly object _lock = new();
     /// <summary>
     /// Pass as <c>maximumConcurrentAssemblies</c> to <see cref="Initialize"/> to disable the concurrent assembly limit.
-    /// Stored internally as <see cref="uint.MaxValue"/> after conversion.
+    /// Stored internally as an unlimited sentinel after conversion.
     /// </summary>
     public const uint UnsetMaximumConcurrentAssemblies = 0;
+
+    /// <summary>
+    /// True while at least one assembly is in progress. Diagnostic surface for callers verifying that a segment
+    /// was refused rather than buffered.
+    /// </summary>
+    public bool HasAssemblies
+    {
+        get
+        {
+            lock (_lock)
+                return _currentSegments.Count > 0;
+        }
+    }
 
     /// <summary>
     /// Configures the reassembler after renting from the pool.
@@ -42,7 +58,7 @@ public sealed class PacketReassembler : PacketSegmenter
     public void Initialize(uint maximumTransmissionUnit, uint maximumSegments, uint maximumConcurrentAssemblies)
     {
         base.Initialize(maximumTransmissionUnit, maximumSegments);
-        _maximumConcurrentAssemblies = maximumConcurrentAssemblies == 0 ? uint.MaxValue : maximumConcurrentAssemblies;
+        _maximumConcurrentAssemblies = SynapseConfig.ToEffectiveLimit(maximumConcurrentAssemblies);
     }
 
     /// <summary>
@@ -60,14 +76,25 @@ public sealed class PacketReassembler : PacketSegmenter
     /// <param name="isReliable">Whether the segment was delivered on the reliable channel.</param>
     /// <param name="assembledSegments">Receives the fully reassembled payload when the method returns true.</param>
     /// <param name="isProtocolViolation">Set to true when a protocol inconsistency is detected; false otherwise.</param>
+    /// <param name="isDuplicateSegment">Set to true when this segment was already received and was therefore discarded.</param>
     /// <returns>True when the final segment has arrived and the payload is fully reassembled; otherwise false.</returns>
-    public bool TryReassemble(ushort segmentId, byte segmentIndex, byte segmentCount, ReadOnlySpan<byte> segmentData, bool isReliable, out ArraySegment<byte> assembledSegments, out bool isProtocolViolation)
+    public bool TryReassemble(ushort segmentId, byte segmentIndex, byte segmentCount, ReadOnlySpan<byte> segmentData, bool isReliable, out ArraySegment<byte> assembledSegments, out bool isProtocolViolation, out bool isDuplicateSegment)
     {
         assembledSegments = default;
         isProtocolViolation = false;
+        isDuplicateSegment = false;
 
         if (segmentCount == 0 || segmentCount > MaximumSegments || segmentIndex >= segmentCount)
             return false;
+
+        /* A segment may never carry more than one wire packet worth of payload. Without this the caller's
+         * segmentCount * MaximumTransmissionUnit precheck is not an upper bound at all: a peer could declare two
+         * segments, pass the check, and then send two segments of any size the packet filter admits. */
+        if (segmentData.Length > MaximumTransmissionUnit)
+        {
+            isProtocolViolation = true;
+            return false;
+        }
 
         lock (_lock)
         {
@@ -95,7 +122,7 @@ public sealed class PacketReassembler : PacketSegmenter
                 return false;
             }
 
-            segmentAssembly.Add(segmentIndex, segmentData);
+            isDuplicateSegment = !segmentAssembly.Add(segmentIndex, segmentData);
 
             if (segmentAssembly.TryGetAssembledSegments(out assembledSegments))
             {
@@ -110,6 +137,26 @@ public sealed class PacketReassembler : PacketSegmenter
     }
 
     /// <summary>
+    /// Writes the received-segment bitmap for an in-progress assembly. Returns false when no such assembly exists.
+    /// </summary>
+    public bool TryWriteReceivedBitmap(ushort segmentId, Span<byte> bitmap, out byte segmentCount)
+    {
+        lock (_lock)
+        {
+            if (!_currentSegments.TryGetValue(segmentId, out SegmentAssembly? assembly))
+            {
+                segmentCount = 0;
+                return false;
+            }
+
+            assembly.WriteReceivedBitmap(bitmap);
+            segmentCount = (byte)assembly.SegmentCount;
+
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Removes and returns to pool incomplete segment assemblies that have exceeded the timeout.
     /// This ensures that assemblies from connections that disconnect before completing are not held indefinitely.
     /// </summary>
@@ -117,6 +164,10 @@ public sealed class PacketReassembler : PacketSegmenter
     /// <param name="timeoutTicks">Maximum age in ticks before an incomplete assembly is evicted.</param>
     public void RemoveExpiredSegments(long nowTicks, long timeoutTicks)
     {
+        // Runs per connection per poll and almost always has nothing to do; skip the lock and the pooled list
+        // entirely in that case.
+        if (_currentSegments.Count == 0)
+            return;
         lock (_lock)
         {
             List<ushort> toRemove = ListPool<ushort>.Rent();
@@ -221,13 +272,14 @@ public sealed class PacketReassembler : PacketSegmenter
         /// </summary>
         /// <param name="segmentIndex">Zero-based index of the segment to store.</param>
         /// <param name="segmentData">Raw bytes for this segment.</param>
-        public void Add(byte segmentIndex, ReadOnlySpan<byte> segmentData)
+        /// <returns>False when this index was already held, meaning the sender is retransmitting.</returns>
+        public bool Add(byte segmentIndex, ReadOnlySpan<byte> segmentData)
         {
             if (_segments![segmentIndex].Array is not null)
-                return;
+                return false;
 
             if (_receivedCount == 0)
-                FirstReceivedTicks = DateTime.UtcNow.Ticks;
+                FirstReceivedTicks = Clock.Ticks;
 
             byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(segmentData.Length);
             segmentData.CopyTo(rentedBuffer);
@@ -237,6 +289,22 @@ public sealed class PacketReassembler : PacketSegmenter
 
             _receivedCount++;
             _totalLength += (uint)segmentLength;
+
+            return true;
+        }
+
+        /// <summary>
+        /// Writes one bit per held segment index into <paramref name="bitmap"/>.
+        /// </summary>
+        public void WriteReceivedBitmap(Span<byte> bitmap)
+        {
+            bitmap.Clear();
+
+            for (int i = 0; i < SegmentCount && i < _segments!.Count; i++)
+            {
+                if (_segments[i].Array is not null)
+                    bitmap[i >> 3] |= (byte)(1 << (i & 7));
+            }
         }
 
         /// <summary>

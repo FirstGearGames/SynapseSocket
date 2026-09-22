@@ -5,11 +5,6 @@ using SynapseSocket.Packets;
 
 namespace SynapseSocket.Transport;
 
-/// <summary>
-/// Transmission Engine (Sender).
-/// Manages outgoing packet flow for both the unreliable and reliable channels.
-/// Sends are synchronous and immediate per the engine's single-threaded poll model.
-/// </summary>
 public sealed partial class TransmissionEngine
 {
     /// <summary>

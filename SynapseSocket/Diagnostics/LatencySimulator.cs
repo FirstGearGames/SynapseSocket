@@ -36,19 +36,6 @@ public sealed class LatencySimulator
     private readonly List<Deferred> _deferred = [];
 
     /// <summary>
-    /// A single outbound packet awaiting its release time. <see cref="Buffer"/> is a private rental
-    /// (the caller's backing array may be recycled before the delay elapses), returned to the pool
-    /// once the packet is released.
-    /// </summary>
-    private struct Deferred
-    {
-        public byte[] Buffer;
-        public int Count;
-        public IPEndPoint Target;
-        public long DueTicks;
-    }
-
-    /// <summary>
     /// Random source for loss/jitter/reorder rolls. The engine drives the simulator from one thread,
     /// so a single instance is sufficient.
     /// </summary>
@@ -131,15 +118,27 @@ public sealed class LatencySimulator
         {
             Deferred deferred = _deferred[readIndex];
 
-            if (deferred.DueTicks <= nowTicks)
-            {
-                sender(new ArraySegment<byte>(deferred.Buffer, 0, deferred.Count), deferred.Target);
-                ArrayPool<byte>.Shared.Return(deferred.Buffer);
-            }
-            else
+            if (deferred.DueTicks > nowTicks)
             {
                 // Keep the not-yet-due entry, compacting toward the front to preserve insertion order.
                 _deferred[writeIndex++] = deferred;
+                continue;
+            }
+
+            try
+            {
+                sender(new ArraySegment<byte>(deferred.Buffer, 0, deferred.Count), deferred.Target);
+            }
+            catch
+            {
+                /* A failed send consumes the entry like any other. Letting the exception escape would abandon the
+                 * compaction below, leaving already-sent entries queued to go out a second time from buffers that
+                 * are already back in the pool, duplicate delivery on top of a double return. Dropping the packet
+                 * is exactly what this component exists to simulate. */
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(deferred.Buffer);
             }
         }
 
@@ -157,5 +156,18 @@ public sealed class LatencySimulator
             ArrayPool<byte>.Shared.Return(deferred.Buffer);
 
         _deferred.Clear();
+    }
+
+    /// <summary>
+    /// A single outbound packet awaiting its release time. <see cref="Buffer"/> is a private rental
+    /// (the caller's backing array may be recycled before the delay elapses), returned to the pool
+    /// once the packet is released.
+    /// </summary>
+    private struct Deferred
+    {
+        public byte[] Buffer;
+        public int Count;
+        public IPEndPoint Target;
+        public long DueTicks;
     }
 }

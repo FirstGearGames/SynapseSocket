@@ -3,9 +3,6 @@ using CodeBoost.CodeAnalysis;
 
 namespace SynapseSocket.Connections;
 
-/// <summary>
-/// Represents the state of a single remote peer session, including reliable send/receive windows, keep-alive timestamps, and signature binding.
-/// </summary>
 public sealed partial class SynapseConnection
 {
 
@@ -22,7 +19,7 @@ public sealed partial class SynapseConnection
     [PoolResettableMember]
     private int _receivedByBytesCount;
     /// <summary>
-    /// UTC ticks of the last time the inbound rate counters were reset to zero.
+    /// Monotonic ticks of the last time the inbound rate counters were reset to zero.
     /// Used to enforce the one-second window for per-connection rate limiting across both
     /// <see cref="_receivedByPacketCount"/> and <see cref="_receivedByBytesCount"/>.
     /// </summary>
@@ -54,7 +51,7 @@ public sealed partial class SynapseConnection
     internal bool AllowReceiveBytes(int packetLength, uint maximumBytesPerSecond)
     {
         _receivedByBytesCount += packetLength;
-    
+
         if (_receivedByBytesCount > maximumBytesPerSecond)
             return false;
 
@@ -66,7 +63,7 @@ public sealed partial class SynapseConnection
     /// to zero once per second. Has no effect if called within the same one-second window as the
     /// previous reset.
     /// </summary>
-    /// <param name="nowTicks">Current UTC ticks, used to determine whether the one-second window has elapsed.</param>
+    /// <param name="nowTicks">Current monotonic ticks, used to determine whether the one-second window has elapsed.</param>
     internal void ResetInboundRateCounters(long nowTicks)
     {
         if (nowTicks - _inboundRateCountersResetTick < TimeSpan.TicksPerSecond)

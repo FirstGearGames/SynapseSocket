@@ -21,7 +21,7 @@ public abstract class PacketSegmenter : IPoolResettable
     /// The maximum number of segments a single message may be split into.
     /// Set by <see cref="Initialize"/>; reset to 0 on return to pool.
     /// </summary>
-    [PoolResettableMember] 
+    [PoolResettableMember]
     public uint MaximumSegments { get; private set; }
 
     /// <summary>

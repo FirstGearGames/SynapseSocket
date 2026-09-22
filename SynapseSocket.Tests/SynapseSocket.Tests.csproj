@@ -21,6 +21,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\SynapseSocket\SynapseSocket.csproj" />
+    <ProjectReference Include="..\SynapseBeacon\SynapseBeacon.csproj" />
   </ItemGroup>
 
   <ItemGroup>

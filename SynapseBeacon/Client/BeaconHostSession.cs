@@ -17,7 +17,7 @@ public delegate void PeerReadyHandler(IPEndPoint peerEndPoint);
 /// <para>
 /// While the session is alive, the client periodically sends heartbeat packets so the
 /// server will not evict the session. The <see cref="PeerReady"/> event fires whenever a
-/// joiner registers and the server matches the pair — the caller should then initiate a
+/// joiner registers and the server matches the pair. The caller should then initiate a
 /// NAT hole-punch to the joiner's endpoint using its <c>SynapseManager</c>.
 /// </para>
 /// </summary>

@@ -153,7 +153,13 @@ await client.DisconnectAsync(connection);
 | `MaximumConcurrentSegmentAssembliesPerConnection` | 16 | Cap on in-flight segment assemblies per connection |
 | `MaximumReassembledPacketSize` | 0 | Rejects declared assemblies exceeding this size; 0 disables the check |
 | `MaximumOutOfOrderReliablePackets` | 64 | Reorder buffer cap per connection; overflow raises a violation |
-| `MaximumConcurrentConnections` | 0 | Maximum simultaneous peers; 0 disables the cap |
+| `MaximumConcurrentConnections` | 4096 | Maximum simultaneous peers; 0 disables the cap |
+| `MaximumReceivesPerPoll` | 4096 | Datagrams drained in a single `Poll` before the loop yields; 0 disables the bound |
+| `NativeReceiveEnabled` | `true` | Uses direct `recvfrom`/`sendto` bindings where the managed API cannot receive from an unspecified sender without allocating (netstandard2.1); ignored on net8.0, which already allocates nothing |
+| `HandshakeChallengeThreshold` | 1024 | Live connections at or above which an unknown endpoint must return a stateless token before any state is allocated for it; 0 never challenges |
+| `ViolationsBeforeBlacklist` | 5 | Violations from one signature within `ViolationWindowMilliseconds` before it is blacklisted |
+| `ViolationWindowMilliseconds` | 10000 | Window the violation count is measured over |
+| `BlacklistDurationMilliseconds` | 300000 | How long a blacklist entry lasts; 0 makes it permanent |
 | `UnreliableSegmentMode` | `SegmentUnreliable` | How oversized unreliable payloads are handled |
 | `CopyReceivedPayloads` | `true` | When false, the unreliable fast path hands a segment of the ingress receive buffer directly to the callback (zero-copy); the payload is valid only for the duration of the handler, which must honour the segment's offset and count |
 | `SegmentAssemblyTimeoutMilliseconds` | 5000 | Incomplete assemblies older than this are evicted; 0 disables |
@@ -164,7 +170,9 @@ await client.DisconnectAsync(connection);
 | `Connection.KeepAliveIntervalMilliseconds` | — | Keep-alive heartbeat interval |
 | `Connection.TimeoutMilliseconds` | — | Idle timeout before a connection is declared lost |
 | `Connection.HandshakeTimeoutMilliseconds` | 0 | Time a pending connection may wait on its handshake, measured from when the handshake began; 0 falls back to `Connection.TimeoutMilliseconds` |
-| `NatTraversal.Mode` | `Disabled` | `FullCone` or `Server` to enable hole-punching |
+| `Connection.HandshakeRetryIntervalMilliseconds` | 300 | Interval between retries of an unanswered handshake |
+| `Connection.HandshakeMaximumAttempts` | 10 | Handshake sends, including the first, before retrying stops; `Connection.HandshakeTimeoutMilliseconds` still ends the attempt |
+| `NatTraversal.Mode` | `Disabled` | `FullCone` to enable hole-punching |
 
 ---
 
@@ -227,7 +235,7 @@ SynapseConfig config = new()
 
 Server-assisted rendezvous — where a small signalling service matches peers and exchanges their
 external endpoints before hole-punching — lives in the companion **[SynapseBeacon](SynapseBeacon/)**
-project. SynapseBeacon piggybacks on the Synapse UDP socket via the `SynapseManager.SendRawAsync` +
+project. SynapseBeacon piggybacks on the Synapse UDP socket via the `SynapseManager.EnqueueRaw` +
 `UnknownPacketReceived` extension hooks, so the NAT mapping opened to the beacon server is the same
 mapping used for peer-to-peer traffic after the punch. See `SynapseBeacon.Demo` for an end-to-end
 example.
@@ -247,6 +255,7 @@ SynapseSocket ships a full xUnit integration test suite that spins up real engin
 | `SignatureValidatorTests` | Custom validator gates connection admission |
 | `TelemetryAndLatencyTests` | Counters increment correctly; latency simulator delays delivery measurably |
 | `EngineLifecycleTests` | Start/stop/restart; double-start throws; dispose cleans up resources |
+| `SweepFindingTests` | The robustness-sweep findings, each asserting the corrected behaviour: connections-list integrity across removals, handshake reset loops, unbounded connections from unauthenticated handshakes, pending-handshake wedges, one-packet blacklisting, rate-limit false positives, and a forged beacon `PeerReady` failing to complete a join |
 
 ---
 

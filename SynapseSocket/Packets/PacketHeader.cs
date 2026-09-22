@@ -37,6 +37,29 @@ public static class PacketHeader
     public const int MaxHeaderSize = TypeSize + SequenceSize + SegmentSize;
 
     /// <summary>
+    /// Bytes of segment bitmap carried by a <see cref="PacketType.SegmentAck"/>: one bit per segment index, and a
+    /// message may hold at most 255 segments.
+    /// </summary>
+    public const int SegmentAckBitmapSize = 32;
+
+    /// <summary>
+    /// Payload bytes carried by an ordinary <see cref="PacketType.Handshake"/>: a random nonce.
+    /// </summary>
+    public const int HandshakeNonceSize = 8;
+
+    /// <summary>
+    /// Payload bytes carried by a handshake return-routability challenge and by the proof answering it:
+    /// the peer's nonce echoed back, followed by an 8-byte token bound to the peer's address and a time bucket.
+    /// <para>
+    /// The payload length is what distinguishes the two forms on the wire, so no new packet type is needed and
+    /// nothing is added to data packets. Direction disambiguates challenge from proof: a side holding a
+    /// <see cref="SynapseSocket.Connections.ConnectionState.Pending"/> connection is being challenged, anyone else
+    /// is presenting a proof.
+    /// </para>
+    /// </summary>
+    public const int HandshakeChallengeSize = HandshakeNonceSize + 8;
+
+    /// <summary>
     /// Computes the header size for a given packet type.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -44,6 +67,7 @@ public static class PacketHeader
     {
         PacketType.Reliable          => TypeSize + SequenceSize,
         PacketType.Ack               => TypeSize + SequenceSize,
+        PacketType.SegmentAck        => TypeSize + SequenceSize,
         PacketType.Segmented         => TypeSize + SegmentSize,
         PacketType.ReliableSegmented => TypeSize + SequenceSize + SegmentSize,
         _                            => TypeSize
@@ -58,7 +82,7 @@ public static class PacketHeader
         int offset = 0;
         buffer[offset++] = (byte)type;
 
-        if (type == PacketType.Reliable || type == PacketType.Ack || type == PacketType.ReliableSegmented)
+        if (type is PacketType.Reliable or PacketType.Ack or PacketType.ReliableSegmented or PacketType.SegmentAck)
         {
             buffer[offset++] = (byte)(sequence & 0xFF);
             buffer[offset++] = (byte)((sequence >> 8) & 0xFF);
@@ -88,36 +112,59 @@ public static class PacketHeader
     }
 
     /// <summary>
-    /// Reads a header from the supplied buffer. Returns the number of bytes consumed.
-    /// Throws if the buffer is too small for the declared type.
+    /// Reads a header from the supplied buffer without throwing.
+    /// Returns false when the buffer is too small for the fields the declared type requires.
     /// </summary>
-    public static int Read(ReadOnlySpan<byte> buffer, out PacketType type, out ushort sequence, out ushort segmentId, out byte segmentIndex, out byte segmentCount)
+    /// <param name="buffer">The datagram bytes.</param>
+    /// <param name="headerSize">On success, the number of bytes consumed by the header.</param>
+    /// <param name="type">The declared packet type.</param>
+    /// <param name="sequence">The sequence number, or 0 when the type carries none.</param>
+    /// <param name="segmentId">The segment id, or 0 when the type carries none.</param>
+    /// <param name="segmentIndex">The segment index, or 0 when the type carries none.</param>
+    /// <param name="segmentCount">The segment count, or 0 when the type carries none.</param>
+    /// <returns>True when the header parsed cleanly.</returns>
+    /// <remarks>
+    /// Deliberately returns a bool rather than throwing. This sits on the unauthenticated receive path, where a
+    /// truncated header is something any peer can send for the price of a two-byte datagram; signalling that by
+    /// throwing costs an allocation, a message string and two stack walks per packet, which is orders of magnitude
+    /// more than the parse itself and is trivially floodable.
+    /// </remarks>
+    public static bool TryRead(ReadOnlySpan<byte> buffer, out int headerSize, out PacketType type, out ushort sequence, out ushort segmentId, out byte segmentIndex, out byte segmentCount)
     {
-        if (buffer.Length < TypeSize) throw new ArgumentException("Buffer too small for header.");
-
-        int offset = 0;
-        type = (PacketType)buffer[offset++];
+        headerSize = 0;
+        type = PacketType.None;
         sequence = 0;
         segmentId = 0;
         segmentIndex = 0;
         segmentCount = 0;
 
-        if (type is PacketType.Reliable or PacketType.Ack or PacketType.ReliableSegmented)
+        if (buffer.Length < TypeSize)
+            return false;
+
+        int offset = 0;
+        type = (PacketType)buffer[offset++];
+
+        if (type is PacketType.Reliable or PacketType.Ack or PacketType.ReliableSegmented or PacketType.SegmentAck)
         {
-            if (buffer.Length < offset + SequenceSize) throw new ArgumentException("Buffer too small for sequence.");
+            if (buffer.Length < offset + SequenceSize)
+                return false;
+
             sequence = (ushort)(buffer[offset] | (buffer[offset + 1] << 8));
             offset += 2;
         }
 
         if (type == PacketType.Segmented || type == PacketType.ReliableSegmented)
         {
-            if (buffer.Length < offset + SegmentSize) throw new ArgumentException("Buffer too small for segment info.");
+            if (buffer.Length < offset + SegmentSize)
+                return false;
+
             segmentId = (ushort)(buffer[offset] | (buffer[offset + 1] << 8));
             segmentIndex = buffer[offset + 2];
             segmentCount = buffer[offset + 3];
             offset += 4;
         }
 
-        return offset;
+        headerSize = offset;
+        return true;
     }
 }

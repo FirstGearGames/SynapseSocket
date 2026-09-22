@@ -40,6 +40,25 @@ public sealed class ConnectionConfig
     public uint HandshakeTimeoutMilliseconds = UnsetHandshakeTimeoutMilliseconds;
 
     /// <summary>
+    /// Milliseconds between retries of an unanswered initial handshake. Defaults to 300.
+    /// <para>
+    /// Connect emits one handshake; without a retry a single lost datagram leaves the connection in
+    /// <see cref="SynapseSocket.Connections.ConnectionState.Pending"/> with nothing to move it forward.
+    /// </para>
+    /// </summary>
+    public uint HandshakeRetryIntervalMilliseconds = 300;
+
+    /// <summary>
+    /// Handshake attempts, including the first, before retrying stops. Defaults to 10.
+    /// <para>
+    /// This caps the retransmissions only. Ending the attempt is <see cref="HandshakeTimeoutMilliseconds"/>'s job,
+    /// so a connection that stays unanswered past the last retry is still closed by the one timeout path rather
+    /// than by a second, competing one.
+    /// </para>
+    /// </summary>
+    public uint HandshakeMaximumAttempts = 10;
+
+    /// <summary>
     /// Sentinel value: pass as <see cref="HandshakeTimeoutMilliseconds"/> to hold a pending handshake to
     /// <see cref="TimeoutMilliseconds"/>.
     /// </summary>

@@ -35,6 +35,6 @@ public struct PacketReceivedEventArgs
         Connection = synapseConnection;
         Payload = payload;
         IsReliable = isReliable;
-    }        
+    }
 
 }

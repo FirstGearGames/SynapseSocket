@@ -1,16 +1,12 @@
 using System;
 using System.Net;
 using System.Security.Cryptography;
-using System.Threading;
 using SynapseSocket.Connections;
+using SynapseSocket.Core;
+using SynapseSocket.Packets;
 
 namespace SynapseSocket.Transport;
 
-/// <summary>
-/// Ingress Engine (Receiver).
-/// Manages incoming data and initial filtering.
-/// Applies lowest-level mitigations BEFORE any payload copy.
-/// </summary>
 internal sealed partial class IngressEngine
 {
     /// <summary>
@@ -46,18 +42,13 @@ internal sealed partial class IngressEngine
             return;
 
         // Rate-limit outbound challenge responses per source IP.
-        long nowTicks = DateTime.UtcNow.Ticks;
+        long nowTicks = Clock.Ticks;
         long minIntervalTicks = _config.NatTraversal.IntervalMilliseconds * TimeSpan.TicksPerMillisecond;
         IpKey addressKey = IpKey.From(fromEndPoint.Address);
 
-        long lastProbeEvict = Volatile.Read(ref _lastProbeEvictionTicks);
-
-        if (nowTicks - lastProbeEvict > TimeSpan.TicksPerMinute)
-        {
-            if (Interlocked.CompareExchange(ref _lastProbeEvictionTicks, nowTicks, lastProbeEvict) == lastProbeEvict)
-                RemoveExpiredProbeLimitEntries(nowTicks, staleTicks: minIntervalTicks * 10);
-        }
-
+        /* The probe table is swept from RunMaintenance, not from here. Sweeping inline put an O(n) scan over a
+         * table the attacker sizes onto a timer the attacker also chooses, which is the pause it was meant to
+         * avoid. */
         long lastTicks = _natProbeLastResponseTicks.GetOrAdd(addressKey, 0L);
 
         if (nowTicks - lastTicks < minIntervalTicks)
@@ -73,14 +64,20 @@ internal sealed partial class IngressEngine
     /// <summary>
     /// Handles an inbound NatChallenge packet from an unrecognised endpoint.
     /// If the payload matches a token this engine issued, sends a handshake (completing the probe exchange).
-    /// Otherwise echoes the token back, this is the initiator side of a simultaneous P2P probe.
+    /// Otherwise echoes a first-hand challenge back, stamped so the far side never echoes it again. That echo is
+    /// the initiator side of a simultaneous P2P probe; the stamp is what stops two engines that cannot verify each
+    /// other's tokens from bouncing the same bytes forever.
     /// </summary>
     private void ProcessNatChallengeExchange(IPEndPoint fromEndPoint, ReadOnlySpan<byte> payload)
     {
         if (!_isNatEnabled)
             return;
 
-        if (payload.Length != NatTokenSize)
+        /* A fresh challenge is NatTokenSize; one that has already been bounced back carries a trailing marker.
+         * Anything else is malformed. */
+        bool isEchoedChallenge = payload.Length == NatTokenSize + 1;
+
+        if (payload.Length != NatTokenSize && !isEchoedChallenge)
             return;
 
         ulong signature = _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
@@ -91,7 +88,7 @@ internal sealed partial class IngressEngine
         if (_connections.ConnectionsByEndPoint.TryGetValue(fromEndPoint, out SynapseConnection? _))
             return;
 
-        long nowTicks = DateTime.UtcNow.Ticks;
+        long nowTicks = Clock.Ticks;
         long minIntervalTicks = _config.NatTraversal.IntervalMilliseconds * TimeSpan.TicksPerMillisecond;
         IpKey addressKey = IpKey.From(fromEndPoint.Address);
 
@@ -102,10 +99,24 @@ internal sealed partial class IngressEngine
 
         _natProbeLastResponseTicks[addressKey] = nowTicks;
 
-        if (VerifyNatToken(fromEndPoint, payload))
+        if (VerifyEndpointToken(_natChallengeHmac, fromEndPoint, payload[..NatTokenSize]))
+        {
             _sender.SendHandshake(fromEndPoint);
-        else
-            _sender.SendNatChallenge(fromEndPoint, payload);
+            return;
+        }
+
+        /* Unrecognised token. Echoing it back is what lets the initiator side of a simultaneous P2P probe complete,
+         * but an unconditional echo means two engines that cannot verify each other's tokens bounce the same bytes
+         * forever, and one forged datagram naming two victims starts exactly that. Echo only a first-hand
+         * challenge, and mark it so the far side knows not to echo again. */
+        if (isEchoedChallenge)
+            return;
+
+        Span<byte> echo = stackalloc byte[NatTokenSize + 1];
+        payload[..NatTokenSize].CopyTo(echo);
+        echo[NatTokenSize] = 1;
+
+        _sender.SendNatChallenge(fromEndPoint, echo);
     }
 
     /// <summary>
@@ -113,6 +124,23 @@ internal sealed partial class IngressEngine
     /// Writes exactly <see cref="NatTokenSize"/> bytes into <paramref name="destination"/>.
     /// </summary>
     private void ComputeNatToken(IPEndPoint endPoint, long timeBucket, Span<byte> destination)
+        => ComputeEndpointToken(_natChallengeHmac, endPoint, timeBucket, destination);
+
+    /// <summary>
+    /// Computes a truncated HMAC-SHA256 token binding <paramref name="endPoint"/> to <paramref name="timeBucket"/>.
+    /// Shared by the NAT challenge and the handshake return-routability challenge, which differ only in the keyed
+    /// <paramref name="hmac"/> so a token minted for one purpose can never be replayed into the other.
+    /// <para>
+    /// The instance is reused rather than constructed per call: both callers sit on unauthenticated receive paths,
+    /// where a fresh <see cref="HMACSHA256"/> and its key schedule per datagram is exactly the cost an attacker
+    /// would like to impose. The engine is single-threaded, so reuse is safe.
+    /// </para>
+    /// </summary>
+    /// <param name="hmac">Keyed HMAC for the token's purpose.</param>
+    /// <param name="endPoint">Endpoint the token is bound to.</param>
+    /// <param name="timeBucket">Coarse time bucket the token is bound to.</param>
+    /// <param name="destination">Receives exactly <see cref="NatTokenSize"/> bytes.</param>
+    private static void ComputeEndpointToken(HMACSHA256 hmac, IPEndPoint endPoint, long timeBucket, Span<byte> destination)
     {
         Span<byte> addressBytes = stackalloc byte[16];
         endPoint.Address.TryWriteBytes(addressBytes, out int addressLength);
@@ -129,26 +157,56 @@ internal sealed partial class IngressEngine
             input[offset++] = (byte)((timeBucket >> (i * 8)) & 0xFF);
 
         Span<byte> hashBuffer = stackalloc byte[32];
-        using HMACSHA256 hmac = new(_natChallengeSecret);
         hmac.TryComputeHash(input, hashBuffer, out _);
         hashBuffer[..NatTokenSize].CopyTo(destination);
     }
 
     /// <summary>
-    /// Returns true if <paramref name="token"/> matches the expected token for the current or previous time bucket.
+    /// Returns true when <paramref name="token"/> is one this engine issued to <paramref name="endPoint"/> under
+    /// <paramref name="hmac"/> in the current or previous time bucket, giving a legitimate peer roughly 30 to 60
+    /// seconds to answer. Shared by the NAT challenge and the handshake return-routability challenge, which differ
+    /// only in the keyed <paramref name="hmac"/>.
     /// </summary>
-    private bool VerifyNatToken(IPEndPoint endPoint, ReadOnlySpan<byte> token)
+    /// <param name="hmac">Keyed HMAC for the token's purpose.</param>
+    /// <param name="endPoint">Endpoint the token should be bound to.</param>
+    /// <param name="token">The token the peer presented.</param>
+    private static bool VerifyEndpointToken(HMACSHA256 hmac, IPEndPoint endPoint, ReadOnlySpan<byte> token)
     {
-        long bucket = DateTime.UtcNow.Ticks / NatTokenTimeBucketTicks;
+        long bucket = Clock.Ticks / NatTokenTimeBucketTicks;
         Span<byte> expected = stackalloc byte[NatTokenSize];
 
-        ComputeNatToken(endPoint, bucket, expected);
-        if (token.SequenceEqual(expected))
+        /* Fixed-time comparison. A token is a secret the peer must reproduce, so an early-exit compare leaks how
+         * many leading bytes were right. Remote timing over UDP is a stretch at 8 bytes, but the fix is free. */
+        ComputeEndpointToken(hmac, endPoint, bucket, expected);
+        if (CryptographicOperations.FixedTimeEquals(token, expected))
             return true;
 
-        ComputeNatToken(endPoint, bucket - 1, expected);
-        return token.SequenceEqual(expected);
+        ComputeEndpointToken(hmac, endPoint, bucket - 1, expected);
+        return CryptographicOperations.FixedTimeEquals(token, expected);
     }
+
+    /// <summary>
+    /// Answers an unknown endpoint's handshake with a return-routability challenge: its own nonce echoed back,
+    /// followed by a token bound to its address and the current time bucket. Nothing is allocated for the peer:
+    /// the token is stateless, so a source that cannot receive at the address it claimed simply never returns.
+    /// </summary>
+    /// <param name="fromEndPoint">Endpoint being challenged.</param>
+    /// <param name="incomingPayload">The handshake payload received, whose leading nonce is echoed.</param>
+    private void SendHandshakeChallenge(IPEndPoint fromEndPoint, ReadOnlySpan<byte> incomingPayload)
+    {
+        Span<byte> challenge = stackalloc byte[PacketHeader.HandshakeChallengeSize];
+
+        incomingPayload[..PacketHeader.HandshakeNonceSize].CopyTo(challenge);
+        ComputeHandshakeToken(fromEndPoint, Clock.Ticks / NatTokenTimeBucketTicks, challenge[PacketHeader.HandshakeNonceSize..]);
+
+        _sender.SendHandshakePayload(fromEndPoint, challenge);
+    }
+
+    /// <summary>
+    /// Computes the handshake return-routability token for <paramref name="endPoint"/> and <paramref name="timeBucket"/>.
+    /// </summary>
+    private void ComputeHandshakeToken(IPEndPoint endPoint, long timeBucket, Span<byte> destination)
+        => ComputeEndpointToken(_handshakeChallengeHmac, endPoint, timeBucket, destination);
 
     /// <summary>
     /// Evicts stale entries from the NAT probe response-time dictionary.

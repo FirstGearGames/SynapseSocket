@@ -21,7 +21,8 @@ namespace SynapseSocket.Core;
 /// <para>
 /// Rendezvous/relay signaling itself is intentionally NOT implemented in SynapseSocket.
 /// External protocols should piggyback on the engine's UDP socket using the
-/// <see cref="SynapseManager.SendRaw"/> and <see cref="SynapseManager.UnknownPacketReceived"/>
+/// <see cref="SynapseManager.SendRaw"/> (or <see cref="SynapseManager.EnqueueRaw"/> from off the poll thread)
+/// and <see cref="SynapseManager.UnknownPacketReceived"/>
 /// extension API so the NAT mapping opened by talking to the rendezvous service is the same
 /// mapping used for peer-to-peer traffic.
 /// </para>
@@ -35,8 +36,7 @@ public sealed partial class SynapseManager
 
     /// <summary>
     /// State for one pending FullCone hole-punch: the connection being established, the target endpoint,
-    /// when the next probe burst is due, how many bursts have been sent, and whether the initial direct-attempt
-    /// grace period has elapsed.
+    /// when the next probe burst is due, and how many bursts have been sent.
     /// </summary>
     private struct NatPunch
     {
@@ -44,7 +44,6 @@ public sealed partial class SynapseManager
         public IPEndPoint EndPoint;
         public long NextActionTicks;
         public uint AttemptsDone;
-        public bool GraceElapsed;
     }
 
     /// <summary>
@@ -54,16 +53,28 @@ public sealed partial class SynapseManager
     /// </summary>
     private void RegisterNatPunch(SynapseConnection synapseConnection, IPEndPoint endPoint)
     {
-        long nowTicks = DateTime.UtcNow.Ticks;
+        long nowTicks = Clock.Ticks;
 
         _natPunches.Add(new NatPunch
         {
             Connection = synapseConnection,
             EndPoint = endPoint,
             NextActionTicks = nowTicks + (long)Config.NatTraversal.FullCone.DirectAttemptMilliseconds * TimeSpan.TicksPerMillisecond,
-            AttemptsDone = 0,
-            GraceElapsed = false
+            AttemptsDone = 0
         });
+    }
+
+    /// <summary>
+    /// Drops every pending hole-punch referencing <paramref name="synapseConnection"/>. Called from
+    /// <see cref="TeardownConnection"/> before the instance is queued for the pool: a punch holds the connection
+    /// across polls and reads its <see cref="ConnectionState"/>, so leaving one behind would let a recycled instance
+    /// be inspected as though it were still the original peer.
+    /// </summary>
+    private void RemoveNatPunchesFor(SynapseConnection synapseConnection)
+    {
+        for (int i = _natPunches.Count - 1; i >= 0; i--)
+            if (ReferenceEquals(_natPunches[i].Connection, synapseConnection))
+                _natPunches.RemoveAt(i);
     }
 
     /// <summary>
@@ -91,9 +102,7 @@ public sealed partial class SynapseManager
             if (nowTicks < punch.NextActionTicks)
                 continue;
 
-            // The direct-handshake grace has elapsed; begin probing on this tick.
-            punch.GraceElapsed = true;
-
+            // The direct-handshake grace has elapsed, so probing begins on this tick.
             if (punch.AttemptsDone >= Config.NatTraversal.MaximumAttempts)
             {
                 RaiseConnectionFailed(punch.EndPoint, ConnectionRejectedReason.NatTraversalFailed, null);

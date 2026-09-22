@@ -18,7 +18,7 @@ namespace SynapseSocket.Core;
 
 /// <summary>
 /// The main entry point for the SynapseSocket UDP Transport Engine.
-/// This is a partial class; the core API lives here, and the background maintenance loops (keep-alive, reliable retransmission) live in <c>SynapseManager.Maintenance.cs</c>.
+/// This is a partial class; the core API lives here, and the maintenance work (keep-alive, reliable retransmission) driven from <see cref="Poll"/> lives in <c>SynapseManager.Maintenance.cs</c>.
 /// </summary>
 public sealed partial class SynapseManager : IDisposable
 {
@@ -53,9 +53,10 @@ public sealed partial class SynapseManager : IDisposable
     /// </summary>
     public event ViolationHandler? ViolationDetected;
     /// <summary>
-    /// Raised when an unexpected exception escapes a background loop (ingress or maintenance).
+    /// Raised when an unexpected exception escapes the engine's own work during <see cref="Poll"/>, or escapes one of
+    /// the application's event handlers that the engine invokes.
     /// Subscribe to route engine errors into your logging system (e.g., Unity's Debug.LogException).
-    /// The loop that raised the exception continues running after the handler returns.
+    /// The poll continues after the handler returns; a single failure does not abort the rest of the frame.
     /// If no handler is subscribed the exception is silently discarded.
     /// </summary>
     public event UnhandledExceptionHandler? UnhandledException;
@@ -117,15 +118,15 @@ public sealed partial class SynapseManager : IDisposable
     /// </remarks>
     public IReadOnlyList<IPEndPoint> BoundEndPoints => _boundEndPoints;
     /// <summary>
-    /// True if <see cref="StartAsync"/> has completed successfully and the engine has not been stopped or disposed.
+    /// True if <see cref="Start"/> has completed successfully and the engine has not been stopped or disposed.
     /// </summary>
     public bool IsRunning => _isStarted && !_isDisposed;
     /// <summary>
-    /// True after <see cref="StartAsync"/> completes; false after <see cref="StopAsync"/> or disposal.
+    /// True after <see cref="Start"/> completes; false after <see cref="Stop"/> or disposal.
     /// </summary>
     private bool _isStarted;
     /// <summary>
-    /// True after <see cref="Dispose"/> or <see cref="DisposeAsync"/> is called. Guards against double-dispose.
+    /// True after <see cref="Dispose"/> is called. Guards against double-dispose.
     /// </summary>
     private bool _isDisposed;
     /// <summary>
@@ -158,10 +159,42 @@ public sealed partial class SynapseManager : IDisposable
     /// Null until <see cref="Start"/> binds sockets.
     /// </summary>
     private TransmissionEngine? _transmissionEngine;
+    /// <summary>
+    /// Connections torn down during the current <see cref="Poll"/>, awaiting return to the pool once no engine frame
+    /// can still be holding them. Drained at the end of every poll.
+    /// </summary>
+    private readonly List<SynapseConnection> _pendingPoolReturns = [];
+    /// <summary>
+    /// Raw sends queued from other threads by <see cref="EnqueueRaw"/>, drained on the engine thread during
+    /// <see cref="Poll"/>.
+    /// </summary>
+    private readonly System.Collections.Concurrent.ConcurrentQueue<QueuedRawSend> _queuedRawSends = new();
+
+    /// <summary>
+    /// Ceiling on handshake replay-cache entries per ingress engine. The key mixes the peer-supplied nonce, so
+    /// without a cap a single peer mints one entry per handshake it sends.
+    /// </summary>
+    internal const int MaximumReplayCacheEntries = 8192;
+
+    /// <summary>
+    /// Total handshake replay-cache entries across every ingress engine. Diagnostic surface.
+    /// </summary>
+    internal int ReplayCacheCount
+    {
+        get
+        {
+            int total = 0;
+
+            for (int i = 0; i < _ingressEngines.Count; i++)
+                total += _ingressEngines[i].ReplayCacheCount;
+
+            return total;
+        }
+    }
 
     /// <summary>
     /// Creates a new SynapseSocket engine from the supplied configuration.
-    /// Call <see cref="StartAsync"/> to begin binding and receiving.
+    /// Call <see cref="Start"/> to begin binding and receiving.
     /// </summary>
     public SynapseManager(SynapseConfig config)
     {
@@ -170,7 +203,7 @@ public sealed partial class SynapseManager : IDisposable
         if (Config.BindEndPoints.Count == 0)
             throw new ArgumentException("At least one bind endpoint is required.", nameof(config));
 
-        if (Config.Segment.AssemblyTimeoutMilliseconds is > 0 and > 300_000)
+        if (Config.Segment.AssemblyTimeoutMilliseconds > 300_000)
             throw new ArgumentOutOfRangeException(nameof(config), "Segment.AssemblyTimeoutMilliseconds must not exceed 300000 (5 minutes).");
 
         uint handshakeTimeoutMilliseconds = Config.Connection.HandshakeTimeoutMilliseconds;
@@ -194,7 +227,8 @@ public sealed partial class SynapseManager : IDisposable
         MaximumTransmissionUnit = Config.MaximumTransmissionUnit - reservedBytes;
 
         ISignatureProvider signatureProvider = Config.Security.SignatureProvider ?? new DefaultSignatureProvider();
-        Security = new(signatureProvider, Config.Security.MaximumPacketsPerSecond, Config.Security.MaximumBytesPerSecond, Config.MaximumPacketSize, Config.Security.Enabled);
+        Security = new(signatureProvider, Config.Security.MaximumPacketsPerSecond, Config.Security.MaximumBytesPerSecond, Config.MaximumPacketSize, Config.Security.Enabled,
+            Config.Security.ViolationsBeforeBlacklist, Config.Security.ViolationWindowMilliseconds, Config.Security.BlacklistDurationMilliseconds);
         Connections = new();
         Telemetry = new(Config.EnableTelemetry);
         _latencySimulator = new(Config.LatencySimulator);
@@ -209,6 +243,8 @@ public sealed partial class SynapseManager : IDisposable
         _connectionKeepAliveTicks = TimeSpan.FromMilliseconds(Config.Connection.KeepAliveIntervalMilliseconds).Ticks;
         _connectionTimeoutTicks = TimeSpan.FromMilliseconds(Config.Connection.TimeoutMilliseconds).Ticks;
         _handshakeTimeoutTicks = handshakeTimeoutMilliseconds is ConnectionConfig.UnsetHandshakeTimeoutMilliseconds ? _connectionTimeoutTicks : TimeSpan.FromMilliseconds(handshakeTimeoutMilliseconds).Ticks;
+        _handshakeRetryIntervalTicks = TimeSpan.FromMilliseconds(Config.Connection.HandshakeRetryIntervalMilliseconds).Ticks;
+        _handshakeMaximumAttempts = Config.Connection.HandshakeMaximumAttempts;
         _reliableResendTicks = TimeSpan.FromMilliseconds(Config.Reliable.ResendMilliseconds).Ticks;
         _maximumReliableRetries = Config.Reliable.MaximumRetries;
         _isAckBatchingEnabled = Config.Reliable.AckBatchingEnabled;
@@ -233,12 +269,23 @@ public sealed partial class SynapseManager : IDisposable
         if (_isDisposed)
             throw new ObjectDisposedException(nameof(SynapseManager));
 
+        /* One TransmissionEngine serves every bound socket and selects its outbound socket purely by address
+         * family, so two endpoints of the same family leave it pointing at whichever bound last. Every reply
+         * (handshake acks, ACKs, keep-alives, payloads) would then leave through the wrong socket, and peers that
+         * connected via the other endpoint would see replies from an unexpected source address. Fail loudly
+         * rather than misroute silently. */
+        HashSet<AddressFamily> boundFamilies = [];
+
+        foreach (IPEndPoint configuredEndPoint in Config.BindEndPoints)
+            if (!boundFamilies.Add(configuredEndPoint.AddressFamily))
+                throw new InvalidOperationException($"Multiple bind endpoints share the address family {configuredEndPoint.AddressFamily}. Bind at most one endpoint per address family, or run a separate SynapseManager per endpoint.");
+
         Socket? ipv4Socket = null;
         Socket? ipv6Socket = null;
 
         foreach (IPEndPoint bindEndPoint in Config.BindEndPoints)
         {
-            Socket socket;
+            Socket? socket = null;
             try
             {
                 socket = new(bindEndPoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
@@ -246,7 +293,7 @@ public sealed partial class SynapseManager : IDisposable
                 if (bindEndPoint.AddressFamily == AddressFamily.InterNetworkV6)
                     socket.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, false);
 
-                // Raise kernel UDP buffers before bind. The OS default (8–64 KiB on Windows) is too small
+                // Raise kernel UDP buffers before bind. The OS default (8 to 64 KiB on Windows) is too small
                 // for bursty loopback traffic with many concurrent peers and causes silent datagram drops.
                 if (Config.SocketReceiveBufferBytes != SynapseConfig.DisabledSocketBufferOverride)
                     socket.ReceiveBufferSize = Config.SocketReceiveBufferBytes;
@@ -257,7 +304,10 @@ public sealed partial class SynapseManager : IDisposable
             }
             catch (SocketException socketException)
             {
+                // The socket was constructed before the failure, so its OS handle is live until disposed.
+                socket?.Dispose();
                 RaiseConnectionFailed(bindEndPoint, ConnectionRejectedReason.BindFailed, socketException.Message);
+
                 continue;
             }
 
@@ -283,6 +333,7 @@ public sealed partial class SynapseManager : IDisposable
             ingressEngine.PayloadDelivered += OnPayloadDelivered;
             ingressEngine.ConnectionEstablished += OnConnectionEstablishedInternal;
             ingressEngine.ConnectionClosed += OnConnectionClosedInternal;
+            ingressEngine.TeardownRequested += TeardownConnection;
             ingressEngine.ConnectionFailed += RaiseConnectionFailed;
             ingressEngine.ViolationOccurred += HandleViolation;
             ingressEngine.UnhandledException += OnUnhandledException;
@@ -306,11 +357,15 @@ public sealed partial class SynapseManager : IDisposable
         if (!_isStarted || _isDisposed || _transmissionEngine is null)
             return;
 
-        long nowTicks = DateTime.UtcNow.Ticks;
+        long nowTicks = Clock.Ticks;
 
         // 1. Receive: drain each socket, processing and delivering inline on this thread.
         for (int i = 0; i < _ingressEngines.Count; i++)
-            _ingressEngines[i].Drain();
+            _ingressEngines[i].Drain(nowTicks);
+
+        // 1b. Per-engine upkeep: replay-cache and NAT probe-table sweeps, moved off the receive path.
+        for (int i = 0; i < _ingressEngines.Count; i++)
+            _ingressEngines[i].RunMaintenance(nowTicks);
 
         // 2. Advance NAT hole-punch state machines for any pending FullCone connects.
         AdvanceNatPunches(nowTicks);
@@ -322,8 +377,15 @@ public sealed partial class SynapseManager : IDisposable
         if (_isAckBatchingEnabled)
             FlushPendingAcks();
 
+        // 4b. Send anything handed over from other threads, on this thread.
+        FlushQueuedRawSends();
+
         // 5. Release any latency-simulator-delayed packets whose due time has elapsed.
         _transmissionEngine.FlushDeferredSends(nowTicks);
+
+        // 6. Recycle connections torn down during this poll. Deferred to here so no engine frame, including a user
+        //    handler that disconnected re-entrantly from inside PacketReceived. Is still holding one.
+        DrainPendingPoolReturns();
     }
 
     /// <summary>
@@ -359,9 +421,15 @@ public sealed partial class SynapseManager : IDisposable
         if (Config.ConnectedSocketEnabled)
             ConnectSocketToRemote(endPoint);
 
+        // Tear the previous session down through the one teardown path rather than letting CreateNew drop it.
+        if (Connections.ConnectionsByEndPoint.TryGetValue(endPoint, out SynapseConnection? previousConnection))
+            TeardownConnection(previousConnection);
+
         SynapseConnection synapseConnection = Connections.CreateNew(endPoint, signature);
 
         _transmissionEngine!.SendHandshake(endPoint);
+        // Stamped so the peer's answering handshake is recognised as an answer rather than a session-resetting request.
+        synapseConnection.LastHandshakeSentTicks = Clock.Ticks;
 
         if (Config.NatTraversal.Mode == NatTraversalMode.FullCone)
             RegisterNatPunch(synapseConnection, endPoint);
@@ -437,6 +505,29 @@ public sealed partial class SynapseManager : IDisposable
     }
 
     /// <summary>
+    /// Queues raw bytes to be sent from the engine thread on the next <see cref="Poll"/>.
+    /// </summary>
+    /// <param name="target">The remote endpoint to send to.</param>
+    /// <param name="data">The wire-ready bytes; copied, so the caller may reuse its buffer immediately.</param>
+    /// <remarks>
+    /// Use this instead of <see cref="SendRaw"/> from any thread that is not the one calling <see cref="Poll"/>.
+    /// The send path keeps unsynchronised per-engine state. The serialized-target cache and the latency
+    /// simulator queue, on the assumption that only the poll thread touches it. A background timer or heartbeat
+    /// calling SendRaw directly races that state, and a Dictionary resize interleaved with an insert can leave a
+    /// cyclic bucket chain that spins the next lookup forever.
+    /// </remarks>
+    public void EnqueueRaw(IPEndPoint target, ArraySegment<byte> data)
+    {
+        if (data.Array is null || data.Count == 0)
+            return;
+
+        byte[] copy = ArrayPool<byte>.Shared.Rent(data.Count);
+        Buffer.BlockCopy(data.Array, data.Offset, copy, 0, data.Count);
+
+        _queuedRawSends.Enqueue(new(copy, data.Count, target));
+    }
+
+    /// <summary>
     /// Gracefully disconnects a connection, notifying the peer.
     /// </summary>
     public void Disconnect(SynapseConnection synapseConnection)
@@ -444,13 +535,7 @@ public sealed partial class SynapseManager : IDisposable
         if (_transmissionEngine is not null)
             _transmissionEngine.SendDisconnect(synapseConnection);
 
-        ReturnConnectionSegmenters(synapseConnection);
-        ReturnReorderBufferToPool(synapseConnection);
-        SynapseConnection.DrainPendingReliableQueue(synapseConnection);
-        synapseConnection.State = ConnectionState.Disconnected;
-        Connections.Remove(synapseConnection.RemoteEndPoint, out _);
-
-        RaiseConnectionClosed(synapseConnection);
+        TeardownConnection(synapseConnection);
     }
 
     /// <summary>
@@ -491,8 +576,12 @@ public sealed partial class SynapseManager : IDisposable
 
                 case ViolationAction.KickAndBlacklist:
                 default: // ViolationAction.KickAndBlacklist
+                    /* The kick is immediate; the ban is not. A single datagram carries an attacker-chosen source
+                     * address, so banning on one violation lets a forged packet lock out an arbitrary endpoint.
+                     * RegisterViolation blacklists only once the signature crosses SecurityConfig's threshold,
+                     * and the resulting entry expires. */
                     if (signature != SecurityProvider.UnsetSignature)
-                        Security.AddToBlacklist(signature);
+                        Security.RegisterViolation(signature);
 
                     DisconnectAndBlacklist(endPoint, canBlacklist: false);
                     return;
@@ -502,7 +591,7 @@ public sealed partial class SynapseManager : IDisposable
     }
 
     /// <summary>
-    /// Stops the engine and releases all resources. Prefer <see cref="DisposeAsync"/> in async contexts.
+    /// Stops the engine and releases all resources.
     /// </summary>
     public void Dispose()
     {
@@ -544,13 +633,18 @@ public sealed partial class SynapseManager : IDisposable
         for (int i = connections.Count - 1; i >= 0; i--)
         {
             SynapseConnection connection = connections[i];
-            ReturnConnectionSegmenters(connection);
-            ReturnReorderBufferToPool(connection);
-            SynapseConnection.DrainPendingReliableQueue(connection);
+
             connection.State = ConnectionState.Disconnected;
+
+            if (connection.IsPendingPoolReturn)
+                continue;
+
+            connection.IsPendingPoolReturn = true;
+            _pendingPoolReturns.Add(connection);
         }
 
         Connections.Clear();
+        DrainPendingPoolReturns();
     }
 
     /// <summary>
@@ -578,7 +672,7 @@ public sealed partial class SynapseManager : IDisposable
     }
 
     /// <summary>
-    /// Forwards a background-loop exception to the <see cref="UnhandledException"/> event.
+    /// Forwards an exception raised by an ingress engine to the <see cref="UnhandledException"/> event.
     /// </summary>
     private void OnUnhandledException(Exception exception) => UnhandledException?.Invoke(exception);
 
@@ -666,36 +760,6 @@ public sealed partial class SynapseManager : IDisposable
     }
 
     /// <summary>
-    /// Atomically clears and returns both the splitter and reassembler on <paramref name="synapseConnection"/>
-    /// to their respective pools. Safe to call even when neither was ever rented.
-    /// </summary>
-    private static void ReturnReorderBufferToPool(SynapseConnection synapseConnection)
-    {
-        foreach (ArraySegment<byte> segment in synapseConnection.ReorderBuffer.Values)
-        {
-            if (segment.Array is not null)
-                ArrayPool<byte>.Shared.Return(segment.Array);
-        }
-
-        synapseConnection.ReorderBuffer.Clear();
-    }
-
-    /// <summary>
-    /// Atomically detaches and returns the splitter and reassembler on <paramref name="synapseConnection"/>
-    /// to their respective pools. Safe to call even when neither was ever rented.
-    /// </summary>
-    private static void ReturnConnectionSegmenters(SynapseConnection synapseConnection)
-    {
-        PacketSplitter? splitter = Interlocked.Exchange(ref synapseConnection.Splitter, null);
-        if (splitter is not null)
-            ResettableObjectPool<PacketSplitter>.Return(splitter);
-
-        PacketReassembler? reassembler = Interlocked.Exchange(ref synapseConnection.Reassembler, null);
-        if (reassembler is not null)
-            ResettableObjectPool<PacketReassembler>.Return(reassembler);
-    }
-
-    /// <summary>
     /// Ingress callback: wraps the delivered payload in a <see cref="PacketReceivedEventArgs"/> and raises
     /// <see cref="PacketReceived"/>. Returns the payload buffer to the pool in the finally block, but only when the
     /// ingress path rented that buffer for this delivery and handed ownership over with it.
@@ -716,6 +780,13 @@ public sealed partial class SynapseManager : IDisposable
         try
         {
             PacketReceived?.Invoke(packetReceivedEventArgs);
+        }
+        catch (Exception listenerException)
+        {
+            /* One bad subscriber must not abort the drain. DeliverOrdered can be mid-way through releasing a
+             * batch out of the reorder buffer; letting the exception escape drops every remaining payload and
+             * strands its pooled buffer. Every other event raise on this class already swallows this way. */
+            UnhandledException?.Invoke(listenerException);
         }
         finally
         {
@@ -795,18 +866,12 @@ public sealed partial class SynapseManager : IDisposable
     }
 
     /// <summary>
-    /// Removes the connection for <paramref name="endPoint"/>, returns pooled resources, and optionally blacklists the computed signature.
+    /// Removes the connection for <paramref name="endPoint"/>, tears it down, and optionally blacklists the computed signature.
     /// </summary>
     private void DisconnectAndBlacklist(IPEndPoint endPoint, bool canBlacklist)
     {
-        if (Connections.Remove(endPoint, out SynapseConnection? synapseConnection) && synapseConnection is not null)
-        {
-            ReturnConnectionSegmenters(synapseConnection);
-            ReturnReorderBufferToPool(synapseConnection);
-            SynapseConnection.DrainPendingReliableQueue(synapseConnection);
-            synapseConnection.State = ConnectionState.Disconnected;
-            RaiseConnectionClosed(synapseConnection);
-        }
+        if (Connections.ConnectionsByEndPoint.TryGetValue(endPoint, out SynapseConnection? synapseConnection))
+            TeardownConnection(synapseConnection);
 
         if (canBlacklist)
         {
@@ -815,4 +880,103 @@ public sealed partial class SynapseManager : IDisposable
         }
     }
 
+    /// <summary>
+    /// The single teardown path for a connection. Every route by which a session ends, local disconnect, violation
+    /// kick, timeout, a peer's disconnect packet, being replaced by a fresh connect, or engine shutdown, goes
+    /// through here, so no two paths can disagree about what gets released.
+    /// </summary>
+    /// <param name="synapseConnection">The connection to terminate.</param>
+    /// <remarks>
+    /// Order matters. The lookup tables are cleared first so nothing can resolve the connection again, then every
+    /// engine-internal reference to it is dropped, then the close notification is raised while the instance is still
+    /// intact, and only then is it queued for the pool. The queue is drained at the end of <see cref="Poll"/> rather
+    /// than here, because a user handler can call this re-entrantly from inside <c>PacketReceived</c> while the
+    /// ingress loop still holds the same connection in a local. Returning it immediately would recycle an object the
+    /// engine is mid-way through using.
+    /// </remarks>
+    private void TeardownConnection(SynapseConnection synapseConnection)
+    {
+        if (synapseConnection.IsPendingPoolReturn)
+            return;
+
+        Connections.Remove(synapseConnection.RemoteEndPoint, out _);
+        RemoveNatPunchesFor(synapseConnection);
+
+        synapseConnection.State = ConnectionState.Disconnected;
+        RaiseConnectionClosed(synapseConnection);
+
+        synapseConnection.IsPendingPoolReturn = true;
+        _pendingPoolReturns.Add(synapseConnection);
+    }
+
+    /// <summary>
+    /// Sends everything queued by <see cref="EnqueueRaw"/>. Runs on the engine thread as part of <see cref="Poll"/>.
+    /// </summary>
+    private void FlushQueuedRawSends()
+    {
+        while (_queuedRawSends.TryDequeue(out QueuedRawSend queued))
+        {
+            try
+            {
+                _transmissionEngine?.SendRaw(new(queued.Buffer, 0, queued.Length), queued.Target);
+            }
+            catch (Exception unexpectedException)
+            {
+                UnhandledException?.Invoke(unexpectedException);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(queued.Buffer);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns every connection queued by <see cref="TeardownConnection"/> to the pool. Called at the end of
+    /// <see cref="Poll"/>, once no engine frame can still be holding one, and again on shutdown.
+    /// </summary>
+    private void DrainPendingPoolReturns()
+    {
+        if (_pendingPoolReturns.Count == 0)
+            return;
+
+        for (int i = 0; i < _pendingPoolReturns.Count; i++)
+            ResettableObjectPool<SynapseConnection>.Return(_pendingPoolReturns[i]);
+
+        _pendingPoolReturns.Clear();
+    }
+
+
+    /// <summary>
+    /// A raw send handed over from another thread, holding a private copy of the payload.
+    /// </summary>
+    private readonly struct QueuedRawSend
+    {
+        /// <summary>
+        /// Pooled buffer holding the payload; returned once sent.
+        /// </summary>
+        public readonly byte[] Buffer;
+        /// <summary>
+        /// Valid byte count within <see cref="Buffer"/>.
+        /// </summary>
+        public readonly int Length;
+        /// <summary>
+        /// Destination endpoint.
+        /// </summary>
+        public readonly IPEndPoint Target;
+
+        /// <summary>
+        /// Creates a queued send over <paramref name="buffer"/>, carrying <paramref name="length"/>
+        /// valid bytes and addressed to <paramref name="target"/>.
+        /// </summary>
+        /// <param name="buffer">Pooled buffer holding the payload copy.</param>
+        /// <param name="length">Number of valid bytes within <paramref name="buffer"/>.</param>
+        /// <param name="target">Endpoint the payload is addressed to.</param>
+        public QueuedRawSend(byte[] buffer, int length, IPEndPoint target)
+        {
+            Buffer = buffer;
+            Length = length;
+            Target = target;
+        }
+    }
 }

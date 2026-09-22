@@ -22,6 +22,16 @@ public static class BeaconWireFormat
     public const int MaxPeerEndPointBytes = 1 + 16 + 2;
 
     /// <summary>
+    /// Bytes of client-chosen nonce carried by a request and echoed by the reply that answers it.
+    /// <para>
+    /// A beacon reply is accepted on the strength of its source address alone, which is forgeable over UDP. The
+    /// nonce is what ties a reply to a request this client actually made: an off-path attacker never sees it, so
+    /// it cannot produce a reply that will be accepted.
+    /// </para>
+    /// </summary>
+    public const int NonceBytes = 8;
+
+    /// <summary>
     /// Writes a type byte followed by a 4-byte big-endian session ID into <paramref name="destination"/>.
     /// Returns the total number of bytes written.
     /// </summary>
@@ -69,7 +79,27 @@ public static class BeaconWireFormat
     }
 
     /// <summary>
-    /// Parses a peer-endpoint payload. Returns null if the body is malformed or too short.
+    /// Returns the number of bytes the encoded peer endpoint occupies at the start of <paramref name="body"/>,
+    /// or 0 when it is malformed. Used to locate data that follows the endpoint, such as an echoed nonce.
+    /// </summary>
+    public static int MeasurePeerEndPoint(ReadOnlySpan<byte> body)
+    {
+        if (body.Length < 1)
+            return 0;
+
+        byte addressFamily = body[0];
+
+        if (addressFamily == 4 && body.Length >= 1 + 4 + 2)
+            return 1 + 4 + 2;
+
+        if (addressFamily == 6 && body.Length >= 1 + 16 + 2)
+            return 1 + 16 + 2;
+
+        return 0;
+    }
+
+    /// <summary>
+    /// Parses a peer-endpoint payload. Returns <see langword="null"/> when the body is malformed or too short.
     /// </summary>
     public static IPEndPoint? TryReadPeerEndPoint(ReadOnlySpan<byte> body)
     {

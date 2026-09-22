@@ -107,7 +107,7 @@ public class HandshakeAndChannelTests
         SynapseManager serverRef = server;
         server.PacketReceived += (packetReceivedEventArgs) =>
         {
-            // Re-entrant reliable send from inside the receive callback — safe because the engine is single-threaded.
+            // Re-entrant reliable send from inside the receive callback. Safe because the engine is single-threaded.
             serverRef.Send(packetReceivedEventArgs.Connection, Encoding.UTF8.GetBytes("pong"), isReliable: true);
         };
 

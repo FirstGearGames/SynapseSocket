@@ -6,6 +6,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using CodeBoost.Performance;
 using SynapseSocket.Connections;
+using SynapseSocket.Core;
 using SynapseSocket.Diagnostics;
 using SynapseSocket.Packets;
 using SynapseSocket.Core.Configuration;
@@ -69,7 +70,8 @@ public sealed partial class TransmissionEngine
     /// </summary>
     private IPEndPoint? _connectedRemoteEndPoint;
     /// <summary>
-    /// The OS-connected socket sends to <see cref="_connectedRemoteEndPoint"/> ride, resolved once when the connection is made.
+    /// The OS-connected socket that sends to <see cref="_connectedRemoteEndPoint"/>, resolved once when the
+    /// connection is made.
     /// </summary>
     private Socket? _connectedSocket;
 #if NET8_0_OR_GREATER
@@ -78,12 +80,27 @@ public sealed partial class TransmissionEngine
     /// fresh SocketAddress on every call, two allocations per sent datagram for endpoints that never change, while the
     /// SocketAddress overload sends with none.
     /// </summary>
-    private readonly Dictionary<IPEndPoint, SocketAddress> _serializedSendTargets = [];
+    private readonly Dictionary<IPEndPoint, SocketAddress> _serializedSendTargets = new(Core.IPEndPointComparer.Default);
     /// <summary>
     /// Ceiling for <see cref="_serializedSendTargets"/>. Steady-state targets are the connected peers, so the cap only ever
     /// engages under a flood of transient handshake targets; clearing simply re-serializes on the next send.
     /// </summary>
     private const int MaximumSerializedSendTargets = 4096;
+#else
+    /// <summary>
+    /// Raw sockaddr per send target, built once per endpoint and reused. The managed SendTo re-serialises the
+    /// target into a fresh SocketAddress on every datagram; handing the syscall a prebuilt address costs nothing.
+    /// The netstandard2.1 counterpart to the serialized-target cache, which that runtime has no SendTo overload for.
+    /// </summary>
+    private readonly Dictionary<IPEndPoint, NativeSendTarget> _nativeSendTargets = new(Core.IPEndPointComparer.Default);
+    /// <summary>
+    /// Ceiling for <see cref="_nativeSendTargets"/>, matching the serialized-target cache.
+    /// </summary>
+    private const int MaximumNativeSendTargets = 4096;
+    /// <summary>
+    /// True when this engine sends through the native binding.
+    /// </summary>
+    private readonly bool _useNativeSend;
 #endif
 
     /// <summary>
@@ -110,6 +127,11 @@ public sealed partial class TransmissionEngine
         // so a transformed packet never runs out of destination.
         if (_packetTransform is not null)
             _transformBuffer = new byte[Math.Max(config.MaximumPacketSize, config.MaximumTransmissionUnit) + _packetTransform.ReservedBytes];
+
+#if !NET8_0_OR_GREATER
+        // net8.0 has no native send path to select: its SocketAddress SendTo overload already allocates nothing.
+        _useNativeSend = config.NativeReceiveEnabled && NativeSocket.IsSupported;
+#endif
     }
 
     /// <summary>
@@ -136,7 +158,7 @@ public sealed partial class TransmissionEngine
             return;
         }
 
-        _latencySimulator.Process(segment, target, DateTime.UtcNow.Ticks, _sendDirect);
+        _latencySimulator.Process(segment, target, Clock.Ticks, _sendDirect);
     }
 
     /// <summary>
@@ -205,9 +227,9 @@ public sealed partial class TransmissionEngine
         segments.Add(new(packetBuffer, 0, written));
 
         SynapseConnection.PendingReliable pendingReliable = ResettableObjectPool<SynapseConnection.PendingReliable>.Rent();
-        pendingReliable.Initialize(segments, packetBuffer, DateTime.UtcNow.Ticks);
+        pendingReliable.Initialize(segments, packetBuffer, Clock.Ticks);
 
-        synapseConnection.PendingReliableQueue[sequence] = pendingReliable;
+        ParkPendingReliable(synapseConnection, sequence, pendingReliable);
 
         SendToConnection(segments[0], synapseConnection);
     }
@@ -236,7 +258,7 @@ public sealed partial class TransmissionEngine
 
         // One last-sent stamp covers the whole burst rather than routing each segment through SendToConnection.
         // The segments leave back to back, so a per-segment clock read would buy nothing on a send of up to 255 of them.
-        long nowTicks = DateTime.UtcNow.Ticks;
+        long nowTicks = Clock.Ticks;
         synapseConnection.LastSentTicks = nowTicks;
 
         if (isReliable)
@@ -244,7 +266,7 @@ public sealed partial class TransmissionEngine
             SynapseConnection.PendingReliable pendingReliable = ResettableObjectPool<SynapseConnection.PendingReliable>.Rent();
             pendingReliable.Initialize(segments, backingBuffer, nowTicks);
 
-            synapseConnection.PendingReliableQueue[sequence] = pendingReliable;
+            ParkPendingReliable(synapseConnection, sequence, pendingReliable);
 
             // Segments are now owned by PendingReliable; do NOT return them here.
             // When the latency simulator is enabled it copies each segment, so an independent random
@@ -263,6 +285,11 @@ public sealed partial class TransmissionEngine
             finally
             {
                 ArrayPool<byte>.Shared.Return(backingBuffer);
+
+                /* The reliable branch hands the list to PendingReliable, which returns it on ack or eviction.
+                 * Nothing owns it here, so it has to go back explicitly, otherwise ListPool is permanently
+                 * empty and every large unreliable send allocates a fresh list. */
+                ListPool<ArraySegment<byte>>.Return(segments);
             }
         }
     }
@@ -282,18 +309,91 @@ public sealed partial class TransmissionEngine
     }
 
     /// <summary>
+    /// Drains <paramref name="pendingAcks"/> into as few datagrams as the MTU allows, packing sequences back to
+    /// back after the type byte.
+    /// </summary>
+    /// <param name="synapseConnection">The connection being acknowledged.</param>
+    /// <param name="pendingAcks">Queued sequence numbers; fully drained by this call.</param>
+    /// <remarks>
+    /// One datagram per acknowledged sequence makes batching pure loss: it adds the flush delay without saving any
+    /// packets, and under a reliable flood it emits an outbound datagram for every inbound one.
+    /// </remarks>
+    internal void SendAcks(SynapseConnection synapseConnection, Queue<ushort> pendingAcks)
+    {
+        if (pendingAcks.Count == 0)
+            return;
+
+        int maximumPerDatagram = (int)((_config.MaximumTransmissionUnit - PacketHeader.TypeSize) / PacketHeader.SequenceSize);
+
+        if (maximumPerDatagram < 1)
+            maximumPerDatagram = 1;
+
+        while (pendingAcks.Count > 0)
+        {
+            int sequenceCount = Math.Min(pendingAcks.Count, maximumPerDatagram);
+            int totalLength = PacketHeader.TypeSize + (sequenceCount * PacketHeader.SequenceSize);
+            byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(totalLength);
+
+            rentedBuffer[0] = (byte)PacketType.Ack;
+            int offset = PacketHeader.TypeSize;
+
+            for (int i = 0; i < sequenceCount; i++)
+            {
+                ushort sequence = pendingAcks.Dequeue();
+                rentedBuffer[offset++] = (byte)(sequence & 0xFF);
+                rentedBuffer[offset++] = (byte)((sequence >> 8) & 0xFF);
+            }
+
+            SendAndPoolBuffer(new(rentedBuffer, 0, totalLength), synapseConnection);
+        }
+    }
+
+    /// <summary>
+    /// Sends a selective acknowledgement for a reliable segmented message: the message sequence followed by a
+    /// bitmap of the segment indices already held.
+    /// </summary>
+    /// <param name="synapseConnection">The connection being acknowledged.</param>
+    /// <param name="sequence">The message sequence.</param>
+    /// <param name="bitmap">Received-segment bitmap.</param>
+    internal void SendSegmentAck(SynapseConnection synapseConnection, ushort sequence, ReadOnlySpan<byte> bitmap)
+    {
+        const PacketType Type = PacketType.SegmentAck;
+        int headerSize = PacketHeader.ComputeHeaderSize(Type);
+        int totalLength = headerSize + bitmap.Length;
+
+        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(totalLength);
+        PacketHeader.Write(rentedBuffer.AsSpan(), Type, sequence, 0, 0, 0);
+        bitmap.CopyTo(rentedBuffer.AsSpan(headerSize, bitmap.Length));
+
+        SendAndPoolBuffer(new(rentedBuffer, 0, totalLength), synapseConnection);
+    }
+
+    /// <summary>
     /// Sends a handshake packet with an 8-byte cryptographic nonce in the payload.
     /// </summary>
     /// <param name="target">The remote endpoint to send the handshake to.</param>
     public void SendHandshake(IPEndPoint target)
     {
+        Span<byte> nonce = stackalloc byte[PacketHeader.HandshakeNonceSize];
+        RandomNumberGenerator.Fill(nonce);
+
+        SendHandshakePayload(target, nonce);
+    }
+
+    /// <summary>
+    /// Sends a handshake packet carrying an explicit payload, used for the return-routability challenge and for the
+    /// proof answering it. Data packets are unaffected, only the handshake exchange carries these extra bytes.
+    /// </summary>
+    /// <param name="target">The remote endpoint to send to.</param>
+    /// <param name="payload">The handshake payload to carry.</param>
+    public void SendHandshakePayload(IPEndPoint target, ReadOnlySpan<byte> payload)
+    {
         const PacketType Type = PacketType.Handshake;
-        const int NonceSize = 8;
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
-        int totalSize = headerSize + NonceSize;
+        int totalSize = headerSize + payload.Length;
         byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(totalSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
-        RandomNumberGenerator.Fill(rentedBuffer.AsSpan(headerSize, NonceSize));
+        payload.CopyTo(rentedBuffer.AsSpan(headerSize, payload.Length));
         SendAndPoolBuffer(new(rentedBuffer, 0, totalSize), target);
     }
 
@@ -324,6 +424,24 @@ public sealed partial class TransmissionEngine
     }
 
     /// <summary>
+    /// Parks <paramref name="pendingReliable"/> under <paramref name="sequence"/>, releasing whatever entry was
+    /// already held there. A bare indexer assignment would drop the displaced entry silently, orphaning its backing
+    /// array and its pooled segment list. That is reachable once
+    /// <see cref="SynapseConnection.NextOutgoingSequence"/> wraps the 16-bit sequence space while an older entry is
+    /// still unacknowledged.
+    /// </summary>
+    /// <param name="synapseConnection">Connection owning the pending-reliable table.</param>
+    /// <param name="sequence">Sequence the entry is parked under.</param>
+    /// <param name="pendingReliable">The entry taking ownership of the sequence.</param>
+    private static void ParkPendingReliable(SynapseConnection synapseConnection, ushort sequence, SynapseConnection.PendingReliable pendingReliable)
+    {
+        if (synapseConnection.PendingReliableQueue.TryGetValue(sequence, out SynapseConnection.PendingReliable? displaced))
+            SynapseConnection.ReleasePendingReliable(displaced);
+
+        synapseConnection.PendingReliableQueue[sequence] = pendingReliable;
+    }
+
+    /// <summary>
     /// Sends bytes directly over the appropriate socket (IPv6 when available, otherwise IPv4)
     /// and records the sent byte count in telemetry.
     /// </summary>
@@ -348,9 +466,9 @@ public sealed partial class TransmissionEngine
         Socket socket = target.AddressFamily == AddressFamily.InterNetworkV6 && _ipv6Socket is not null ? _ipv6Socket : _ipv4Socket;
 
 #if NET8_0_OR_GREATER
-        /* The SocketAddress overload sends without serializing the endpoint; the EndPoint overload below re-serializes the
-         * same stable per-connection endpoint on every datagram. netstandard2.1 has no SocketAddress overload, so only the
-         * modern build takes this path. */
+        /* The SocketAddress overload sends without serializing the endpoint; the EndPoint overload in the legacy branch
+         * re-serializes the same stable per-connection endpoint on every datagram. netstandard2.1 has no SocketAddress
+         * overload, which is why it reaches for the native syscall instead. */
         if (!_serializedSendTargets.TryGetValue(target, out SocketAddress? serializedTarget))
         {
             if (_serializedSendTargets.Count >= MaximumSerializedSendTargets)
@@ -362,6 +480,37 @@ public sealed partial class TransmissionEngine
 
         int bytesSent = socket.SendTo(segment.AsSpan(), SocketFlags.None, serializedTarget);
 #else
+        if (_useNativeSend && segment.Array is not null)
+        {
+            if (!_nativeSendTargets.TryGetValue(target, out NativeSendTarget nativeTarget))
+            {
+                /* Bounded like the serialized-target cache: steady-state targets are the connected peers, so the
+                 * cap only engages under a flood of transient handshake targets. */
+                if (_nativeSendTargets.Count >= MaximumNativeSendTargets)
+                    _nativeSendTargets.Clear();
+
+                byte[] sockAddr = new byte[NativeSocket.SockAddrSize];
+
+                if (NativeSocket.TryBuildSockAddr(target, sockAddr, out int builtLength))
+                {
+                    nativeTarget = new(sockAddr, builtLength);
+                    _nativeSendTargets[target] = nativeTarget;
+                }
+            }
+
+            // A default instance means the address could not be built; fall through to the managed path.
+            if (nativeTarget.SockAddr is not null)
+            {
+                int nativeSent = NativeSocket.SendTo(socket, segment.Array, segment.Offset, segment.Count, nativeTarget.SockAddr, nativeTarget.Length);
+
+                if (nativeSent >= 0)
+                {
+                    _telemetry.OnSent(nativeSent);
+                    return;
+                }
+            }
+        }
+
         int bytesSent = socket.SendTo(segment.Array!, segment.Offset, segment.Count, SocketFlags.None, target);
 #endif
         _telemetry.OnSent(bytesSent);
@@ -435,7 +584,7 @@ public sealed partial class TransmissionEngine
     /// <param name="synapseConnection">The connection being sent to.</param>
     private void SendToConnection(ArraySegment<byte> segment, SynapseConnection synapseConnection)
     {
-        synapseConnection.LastSentTicks = DateTime.UtcNow.Ticks;
+        synapseConnection.LastSentTicks = Clock.Ticks;
         SendRaw(segment, synapseConnection.RemoteEndPoint);
     }
 
@@ -447,7 +596,36 @@ public sealed partial class TransmissionEngine
     /// <param name="synapseConnection">The connection being sent to.</param>
     private void SendAndPoolBuffer(ArraySegment<byte> segment, SynapseConnection synapseConnection)
     {
-        synapseConnection.LastSentTicks = DateTime.UtcNow.Ticks;
+        synapseConnection.LastSentTicks = Clock.Ticks;
         SendAndPoolBuffer(segment, synapseConnection.RemoteEndPoint);
     }
+
+#if !NET8_0_OR_GREATER
+    /// <summary>
+    /// A peer's raw <c>sockaddr</c> and the number of bytes of it that are valid, built once per target and
+    /// reused for every send. Stored by value in <see cref="_nativeSendTargets"/>, so a lookup allocates nothing.
+    /// </summary>
+    private readonly struct NativeSendTarget
+    {
+        /// <summary>
+        /// Raw address bytes. Null on a default instance, meaning the address could not be built.
+        /// </summary>
+        public readonly byte[]? SockAddr;
+        /// <summary>
+        /// Valid bytes within <see cref="SockAddr"/>.
+        /// </summary>
+        public readonly int Length;
+
+        /// <summary>
+        /// Creates a target from a prebuilt address.
+        /// </summary>
+        /// <param name="sockAddr">Raw address bytes.</param>
+        /// <param name="length">Valid bytes within <paramref name="sockAddr"/>.</param>
+        public NativeSendTarget(byte[] sockAddr, int length)
+        {
+            SockAddr = sockAddr;
+            Length = length;
+        }
+    }
+#endif
 }

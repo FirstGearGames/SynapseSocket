@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Net;
 using SynapseSocket.Connections;
 using SynapseSocket.Core.Configuration;
 using SynapseSocket.Core.Events;
@@ -13,7 +14,6 @@ namespace SynapseSocket.Core;
 /// </summary>
 public sealed partial class SynapseManager
 {
-    private const string ViolationReliableExhausted = "Connection exceeded the maximum reliable packet retry limit.";
     /// <summary>
     /// Ticks between keep-alive heartbeats, derived from <see cref="SynapseSocket.Core.Configuration.ConnectionConfig.KeepAliveIntervalMilliseconds"/>.
     /// </summary>
@@ -29,6 +29,15 @@ public sealed partial class SynapseManager
     /// <see cref="_connectionTimeoutTicks"/> when that is <see cref="SynapseSocket.Core.Configuration.ConnectionConfig.UnsetHandshakeTimeoutMilliseconds"/>.
     /// </summary>
     private readonly long _handshakeTimeoutTicks;
+    /// <summary>
+    /// Ticks between retries of an unanswered initial handshake.
+    /// </summary>
+    private readonly long _handshakeRetryIntervalTicks;
+    /// <summary>
+    /// Handshake attempts, including the first, before retrying stops. The connection is still ended by
+    /// <see cref="_handshakeTimeoutTicks"/>, not by exhausting this.
+    /// </summary>
+    private readonly uint _handshakeMaximumAttempts;
     /// <summary>
     /// Ticks between reliable packet retransmission attempts, derived from <see cref="SynapseSocket.Core.Configuration.ReliableConfig.ResendMilliseconds"/>.
     /// </summary>
@@ -58,6 +67,10 @@ public sealed partial class SynapseManager
     /// </summary>
     private readonly bool _isAckBatchingEnabled;
     /// <summary>
+    /// Violation detail reported when a reliable packet exhausts its retransmission attempts.
+    /// </summary>
+    private const string ViolationReliableExhausted = "Connection exceeded the maximum reliable packet retry limit.";
+    /// <summary>
     /// Sentinel value indicating that segment assembly timeout is disabled.
     /// </summary>
     private const long UnsetSegmentAssemblyTimeoutTicks = 0;
@@ -65,6 +78,12 @@ public sealed partial class SynapseManager
     /// <summary>
     /// Runs one maintenance pass over every connection: keep-alive, timeout detection, reliable retransmission,
     /// segment-assembly timeout, and inbound rate-counter reset. Called once per <see cref="Poll"/>.
+    /// <para>
+    /// Cost is O(connections) per poll, and the connection count is no longer attacker-controlled: it is bounded by
+    /// <see cref="SynapseSocket.Core.Configuration.SynapseConfig.MaximumConcurrentConnections"/>, and above the
+    /// occupancy threshold an unknown endpoint cannot take a slot at all without proving return-routability. That
+    /// pairing is what stops a spoofed-handshake flood from sizing this sweep.
+    /// </para>
     /// </summary>
     /// <param name="nowTicks">Current time in <see cref="DateTime.Ticks"/>.</param>
     private void RunMaintenance(long nowTicks)
@@ -148,14 +167,22 @@ public sealed partial class SynapseManager
         // Default initial action is Kick (disconnect without blacklisting); a listener can escalate or downgrade.
         if (isTimedOut)
         {
-            synapseConnection.State = ConnectionState.Disconnected;
-            Connections.Remove(synapseConnection.RemoteEndPoint, out _);
-            ReturnReorderBufferToPool(synapseConnection);
-            SynapseConnection.DrainPendingReliableQueue(synapseConnection);
-            RaiseConnectionClosed(synapseConnection);
-            HandleViolation(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.Timeout, 0, null, ViolationAction.Kick);
+            // Capture identity before teardown: the instance is queued for the pool and OnReturn clears both.
+            IPEndPoint timedOutEndPoint = synapseConnection.RemoteEndPoint;
+            ulong timedOutSignature = synapseConnection.Signature;
+
+            TeardownConnection(synapseConnection);
+            HandleViolation(timedOutEndPoint, timedOutSignature, ViolationReason.Timeout, 0, null, ViolationAction.Kick);
 
             return false;
+        }
+
+        /* A Pending connection owes a handshake, not a heartbeat. Connect emits exactly one, so without this a
+         * single lost datagram leaves the attempt stranded: nothing re-sends, and the peer never learns of it. */
+        if (synapseConnection.State is ConnectionState.Pending)
+        {
+            RetryPendingHandshake(nowTicks, synapseConnection);
+            return true;
         }
 
         // Inbound traffic of any kind proves the peer is still answering, so the backoff starts over.
@@ -171,7 +198,14 @@ public sealed partial class SynapseManager
             return true;
 
         // Exponential backoff: double the interval for each consecutive unanswered keep-alive, capped at 8×.
+        /* Backoff is capped so the interval can never reach the timeout. At the defaults the 8x ceiling is 40s
+         * against a 15s timeout, which would silence the heartbeat for longer than the peer waits, the connection
+         * dies before the backoff it is waiting on ever elapses. */
         long effectiveIntervalTicks = _connectionKeepAliveTicks << Math.Min(synapseConnection.UnansweredKeepAlives, 3);
+        long maximumIntervalTicks = _connectionTimeoutTicks / 2;
+
+        if (maximumIntervalTicks > 0 && effectiveIntervalTicks > maximumIntervalTicks)
+            effectiveIntervalTicks = maximumIntervalTicks;
 
         if (nowTicks - synapseConnection.LastKeepAliveSentTicks < effectiveIntervalTicks)
             return true;
@@ -187,6 +221,34 @@ public sealed partial class SynapseManager
         _transmissionEngine.SendKeepAlive(synapseConnection);
 
         return true;
+    }
+
+    /// <summary>
+    /// Re-sends the handshake for a connection still waiting to establish, up to the configured number of tries.
+    /// <para>
+    /// Exhausting the tries stops the retransmissions and nothing else: the connection is ended by
+    /// <see cref="_handshakeTimeoutTicks"/> in <see cref="PerformKeepAlive"/>, which raises
+    /// <see cref="ConnectionClosed"/> and a <see cref="ViolationReason.Timeout"/> violation the same way an idle
+    /// timeout does. Tearing down here as well would race that path and report the same failure twice under two
+    /// different events.
+    /// </para>
+    /// </summary>
+    /// <param name="nowTicks">Current time in <see cref="DateTime.Ticks"/>.</param>
+    /// <param name="synapseConnection">The pending connection.</param>
+    private void RetryPendingHandshake(long nowTicks, SynapseConnection synapseConnection)
+    {
+        if (_transmissionEngine is null)
+            return;
+
+        if (nowTicks - synapseConnection.LastHandshakeSentTicks < _handshakeRetryIntervalTicks)
+            return;
+
+        if (synapseConnection.HandshakeAttempts >= _handshakeMaximumAttempts)
+            return;
+
+        synapseConnection.HandshakeAttempts++;
+        synapseConnection.LastHandshakeSentTicks = nowTicks;
+        _transmissionEngine.SendHandshake(synapseConnection.RemoteEndPoint);
     }
 
     /// <summary>
@@ -250,8 +312,16 @@ public sealed partial class SynapseManager
 
             try
             {
+                /* Only what the peer has not confirmed. A segmented message shares one sequence, so before
+                 * selective acknowledgement a single lost segment resent the entire message, up to 255
+                 * datagrams, every resend interval, for one missing one. */
                 for (int i = 0; i < segments.Count; i++)
+                {
+                    if (pendingReliable.SegmentCount > 1 && pendingReliable.IsSegmentAcked(i))
+                        continue;
+
                     _transmissionEngine.SendRaw(segments[i], synapseConnection.RemoteEndPoint);
+                }
             }
             catch (Exception)
             {

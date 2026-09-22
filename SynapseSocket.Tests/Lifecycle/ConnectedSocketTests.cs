@@ -10,14 +10,14 @@ namespace SynapseSocket.Tests.Lifecycle;
 
 /// <summary>
 /// Live-socket coverage for <see cref="SynapseConfig.ConnectedSocketEnabled"/>: a client whose socket is OS-connected to the
-/// server must handshake and exchange payloads in both directions through the endpoint-free Receive and Send calls — the mode
+/// server must handshake and exchange payloads in both directions through the endpoint-free Receive and Send calls, the mode
 /// that removes the per-datagram endpoint serialization the classic ReceiveFrom and SendTo paths pay on every runtime.
 /// </summary>
 public class ConnectedSocketTests
 {
     /// <summary>
     /// A connected-socket client completes the handshake and exchanges unreliable and reliable payloads with the server in
-    /// both directions — the connected receive attributes the server's datagrams correctly, and the connected send carries the
+    /// both directions. The connected receive attributes the server's datagrams correctly, and the connected send carries the
     /// client's payloads and acks.
     /// </summary>
     [Fact]

@@ -15,6 +15,12 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+            <_Parameter1>SynapseSocket.Tests</_Parameter1>
+        </AssemblyAttribute>
+    </ItemGroup>
+
+    <ItemGroup>
         <ProjectReference Include="..\submodules\CodeBoost\CodeBoost.CodeAnalysis.Analyzers\CodeBoost.CodeAnalysis.Analyzers.csproj"
                           OutputItemType="Analyzer"
                           ReferenceOutputAssembly="false"/>

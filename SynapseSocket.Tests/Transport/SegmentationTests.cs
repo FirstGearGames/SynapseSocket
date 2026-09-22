@@ -90,7 +90,8 @@ public class SegmentationTests
         // Establish a connection first so the server has a known peer.
         using Socket socket = TestHarness.CreateRawSocket();
         IPEndPoint serverEndPoint = new(IPAddress.Loopback, port);
-        socket.SendTo(new byte[] { 0x03 }, serverEndPoint); // PacketType.Handshake
+        // PacketType.Handshake followed by the 8-byte nonce the wire format requires.
+        socket.SendTo(new byte[] { 0x03, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 }, serverEndPoint);
         Assert.True(TestHarness.PumpUntil(() => eventRecorder.ConnectionsEstablished >= 1, 2000, server),
             "connection should have been established");
 

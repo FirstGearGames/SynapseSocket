@@ -10,7 +10,7 @@ namespace SynapseSocket.Tests.Transport;
 public class OutOfOrderTests
 {
     // -------------------------------------------------------------------------
-    // Test 1 — Unreliable segmented out-of-order
+    // Test 1, Unreliable segmented out-of-order
     // -------------------------------------------------------------------------
 
     /// <summary>
@@ -36,7 +36,7 @@ public class OutOfOrderTests
             c.MaximumPacketSize = 4096 * 2;
             c.Segment.MaximumSegments = 128;
 
-            // Every packet gets a random extra delay up to 200 ms, released over successive polls — guarantees mixed arrival order.
+            // Every packet gets a random extra delay up to 200 ms, released over successive polls. Guarantees mixed arrival order.
             c.LatencySimulator.Enabled = true;
             c.LatencySimulator.BaseLatencyMilliseconds = 0;
             c.LatencySimulator.ReorderChance = 1.0;
@@ -66,7 +66,7 @@ public class OutOfOrderTests
     }
 
     // -------------------------------------------------------------------------
-    // Test 2 — Reliable segmented out-of-order
+    // Test 2, Reliable segmented out-of-order
     // -------------------------------------------------------------------------
 
     /// <summary>
@@ -119,7 +119,7 @@ public class OutOfOrderTests
     }
 
     // -------------------------------------------------------------------------
-    // Test 3 — Unsegmented reliable out-of-order
+    // Test 3, Unsegmented reliable out-of-order
     // -------------------------------------------------------------------------
 
     /// <summary>

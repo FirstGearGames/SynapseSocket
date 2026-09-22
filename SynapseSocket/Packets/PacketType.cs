@@ -11,39 +11,71 @@ namespace SynapseSocket.Packets;
 /// </list>
 /// All other types carry no additional header fields; any further bytes are payload.
 /// <para>
-/// Byte values strictly greater than <see cref="NatChallenge"/> are reserved for external protocols
+/// Byte values strictly greater than <see cref="SegmentAck"/> are reserved for external protocols
 /// that piggyback on the Synapse UDP socket via <c>SynapseManager.UnknownPacketReceived</c>.
+/// </para>
+/// <para>
+/// The reserved boundary moves whenever a member is added here, so an external protocol should sit well clear of
+/// it rather than immediately above it. <c>SynapseBeacon</c> is the reference example: every one of its packet
+/// types is greater than <c>0x7F</c>.
 /// </para>
 /// </summary>
 public enum PacketType : byte
 {
-    /// <summary>Unreliable, unsegmented data payload.</summary>
+    /// <summary>
+    /// Unreliable, unsegmented data payload.
+    /// </summary>
     None = 0,
 
-    /// <summary>Reliable, unsegmented data payload. Header includes a sequence number.</summary>
+    /// <summary>
+    /// Reliable, unsegmented data payload. Header includes a sequence number.
+    /// </summary>
     Reliable = 1,
 
-    /// <summary>Acknowledgment for a reliable packet. Header includes the acknowledged sequence number.</summary>
+    /// <summary>
+    /// Acknowledgment for a reliable packet. Header includes the acknowledged sequence number.
+    /// </summary>
     Ack = 2,
 
-    /// <summary>Handshake or handshake acknowledgment. Payload contains an 8-byte nonce.</summary>
+    /// <summary>
+    /// Handshake or handshake acknowledgment. Payload contains an 8-byte nonce.
+    /// </summary>
     Handshake = 3,
 
-    /// <summary>Keep-alive heartbeat. No payload.</summary>
+    /// <summary>
+    /// Keep-alive heartbeat. No payload.
+    /// </summary>
     KeepAlive = 4,
 
-    /// <summary>Graceful disconnect notification. No payload.</summary>
+    /// <summary>
+    /// Graceful disconnect notification. No payload.
+    /// </summary>
     Disconnect = 5,
 
-    /// <summary>Unreliable, segmented data payload. Header includes segment fields.</summary>
+    /// <summary>
+    /// Unreliable, segmented data payload. Header includes segment fields.
+    /// </summary>
     Segmented = 6,
 
-    /// <summary>Reliable, segmented data payload. Header includes a sequence number then segment fields.</summary>
+    /// <summary>
+    /// Reliable, segmented data payload. Header includes a sequence number then segment fields.
+    /// </summary>
     ReliableSegmented = 7,
 
-    /// <summary>NAT punch probe. Sent to open a NAT table mapping. No payload.</summary>
+    /// <summary>
+    /// NAT punch probe. Sent to open a NAT table mapping. No payload.
+    /// </summary>
     NatProbe = 8,
 
-    /// <summary>NAT challenge or challenge echo. Payload is an 8-byte HMAC token.</summary>
-    NatChallenge = 9
+    /// <summary>
+    /// NAT challenge or challenge echo. Payload is an 8-byte HMAC token.
+    /// </summary>
+    NatChallenge = 9,
+
+    /// <summary>
+    /// Selective acknowledgement for a reliable segmented message: carries the message sequence followed by a
+    /// bitmap of which segment indices the receiver already holds. Lets the sender retransmit only what is
+    /// missing instead of the whole message.
+    /// </summary>
+    SegmentAck = 10
 }

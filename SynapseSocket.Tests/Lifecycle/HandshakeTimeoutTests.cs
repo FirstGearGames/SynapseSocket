@@ -149,6 +149,10 @@ public class HandshakeTimeoutTests
         byte[] keepAlivePacket = [(byte)PacketType.KeepAlive];
         long deadlineMilliseconds = Environment.TickCount64 + CloseWaitMilliseconds;
         long nextKeepAliveMilliseconds = 0;
+        /* Sampled inside the loop, because the timed-out connection is returned to the pool at the end of the poll
+         * that closes it, and the return resets every timestamp on it. Reading the field afterwards would report
+         * the pooled zero rather than what the peer's traffic did to a live connection. */
+        long lastObservedReceivedTicks = handshakeReceivedTicks;
 
         while (clientEventRecorder.ConnectionsClosed == 0 && Environment.TickCount64 < deadlineMilliseconds)
         {
@@ -159,6 +163,10 @@ public class HandshakeTimeoutTests
             }
 
             client.Poll();
+
+            if (synapseConnection.LastReceivedTicks > lastObservedReceivedTicks)
+                lastObservedReceivedTicks = synapseConnection.LastReceivedTicks;
+
             Thread.Sleep(1);
         }
 
@@ -167,7 +175,7 @@ public class HandshakeTimeoutTests
         Assert.True(clientEventRecorder.ConnectionsClosed == 1, "The pending connection was held open by the peer's traffic instead of timing out on its handshake.");
         Assert.True(elapsedMilliseconds >= HandshakeTimeoutMilliseconds - ClockToleranceMilliseconds, $"The pending connection closed after [{elapsedMilliseconds}] ms, before its [{HandshakeTimeoutMilliseconds}] ms timeout.");
         // The peer's traffic reached the pending connection, so an idle clock would have been reset throughout.
-        Assert.True(synapseConnection.LastReceivedTicks > handshakeReceivedTicks, "The peer's keep-alives never reached the pending connection.");
+        Assert.True(lastObservedReceivedTicks > handshakeReceivedTicks, "The peer's keep-alives never reached the pending connection.");
         Assert.Equal(0, clientEventRecorder.ConnectionsEstablished);
         Assert.Contains(ViolationReason.Timeout, clientEventRecorder.ViolationReasons);
     }

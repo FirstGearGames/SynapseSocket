@@ -13,8 +13,8 @@ namespace SynapseSocket.Tests.Stress;
 public sealed class ConnectionStressTests
 {
     // The engine is poll-driven and these tests pump 2001 engines on a single thread, so they are throughput-bound
-    // rather than latency-bound; the timeouts are generous to tolerate that (the rework's goal is correctness — no
-    // drops, no corruption — not raw single-thread speed).
+    // rather than latency-bound; the timeouts are generous to tolerate that (the rework's goal is correctness, no
+    // drops, no corruption, not raw single-thread speed).
     private const int StressTestTimeoutMs = 120000;
     private const int LifecycleTestTimeoutMs = 240000;
 
@@ -213,7 +213,7 @@ public sealed class ConnectionStressTests
                         clients[i].Send(connections[i], payload, reliable);
 
                         // Drain the server incrementally so a large burst (2000 × 1 KB) can't overflow its kernel
-                        // receive buffer before this single thread polls it — unreliable loss would be unrecoverable.
+                        // receive buffer before this single thread polls it. Unreliable loss would be unrecoverable.
                         if ((i & 255) == 255)
                             server.Poll();
                     }
@@ -250,7 +250,7 @@ public sealed class ConnectionStressTests
                     $"Only {totalClientClosedCount} / {closeTarget} connections closed.");
             }
 
-            // Warmup — primes object pools before GC baseline.
+            // Warmup. Primes object pools before GC baseline.
             RunCycle();
 
             GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: true);
