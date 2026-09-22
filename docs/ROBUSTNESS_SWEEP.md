@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-17
 **Scope:** Full sweep of `SynapseSocket`, `SynapseBeacon`, and the CodeBoost pooling primitives they depend on, across six requested axes: incorrect socket timeouts, memory-flooding vulnerabilities, socket identity spoofing, CPU-loop vulnerabilities, memory leaks, and general memory/GC/CPU performance.
-**Status:** For review only — **no fixes applied**. Nothing in this document has been changed in code.
+**Status:** **Fixes applied and landed on `main`** (commit `3b5ffcc`, 2026-09-22). This document is the record of the sweep that produced them, not an open work list. It is written throughout in the present tense of 2026-08-17, when nothing had been fixed yet; read a finding's description as the state *before* that commit. 25 of the 46 findings now have a test asserting the corrected behaviour in `SynapseSocket.Tests/Security/SweepFindingTests.cs`; the rest were either fixed without dedicated coverage, refuted (C2), or judged not worth acting on. A finding without a test is not evidence that it was fixed.
 **Method:** Manual trace of every hot path, plus a seven-dimension parallel audit with one adversarial verifier per top finding and a completeness critic. 67 raw findings → deduplicated and consolidated to the 54 below.
 
 ---
@@ -11,9 +11,10 @@
 
 This document originally shipped as **static analysis only**: code reading and hand-tracing, with nothing compiled or executed. The words "confirmed" and "verified" meant *confirmed by re-reading the source*, which overstated their weight.
 
-Eight findings have since been **empirically tested** against a live engine over real loopback UDP sockets
-(`SynapseSocket.Tests/Security/SweepFindingTests.cs`). Each test asserts the *correct* post-fix behaviour, so a
-failing test means the finding is real and present.
+Findings have since been **empirically tested** against a live engine over real loopback UDP sockets
+(`SynapseSocket.Tests/Security/SweepFindingTests.cs`). Each test asserts the *correct* post-fix behaviour. The
+results below are from before the fixes landed, which is why they read as failures: a failing test there was the
+proof that the finding was real. All of them pass on `main` as of `3b5ffcc`.
 
 | Finding | Test | Result |
 |---|---|---|
