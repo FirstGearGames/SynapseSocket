@@ -18,9 +18,10 @@ is given rather than left blank.
 |---|---|---|
 | **Fixed, with a test** | C1, C3, C4, H1, H2, H3, H4, H5, H6, H7, H9, H10, H11, H12, H13, M1, M2, M3, M4, M5, M9, M12, M13, M14, M15, M16, M17, M18 | `SweepFindingTests`, plus `NatTraversalTests` for the NAT exchange (M9) |
 | **Refuted, with a test** | C2 | Windows reports `Available == 1` for a queued zero-length datagram; see "C2 was wrong" below. Still unverified on Linux |
-| **Fixed, no test** | M10, M11, M19, M20, M22, M23, M24 | M10 `RemoveExpiredProbeLimitEntries` from maintenance; M11 `Core/Clock.cs`; M19 the two HMAC instances are built once in the ingress constructor; M20 `ParkPendingReliable`; M22 `MixHandshakeNonce` folds at most `HandshakeNonceSize` bytes; M23 the sweep moved off the receive path into `RunMaintenance`; M24 the sweep is bounded by `MaximumConcurrentConnections` |
+| **Fixed, no test** | M10, M11, M19, M20, M22, M23, M24, L10, L11 | L10 the NAT and handshake tokens are compared with `CryptographicOperations.FixedTimeEquals`; L11 the unused `EndPointKey` struct is gone; M10 `RemoveExpiredProbeLimitEntries` from maintenance; M11 `Core/Clock.cs`; M19 the two HMAC instances are built once in the ingress constructor; M20 `ParkPendingReliable`; M22 `MixHandshakeNonce` folds at most `HandshakeNonceSize` bytes; M23 the sweep moved off the receive path into `RunMaintenance`; M24 the sweep is bounded by `MaximumConcurrentConnections` |
 | **Accepted risk, by design** | H8, M6, M7, M8 | Datagram attribution is source-IP only and per-packet authentication is deliberately not paid for. Stated in `IngressEngine.ProcessPacket` at the point where it bites: damage is bounded to a held connection slot, and anyone able to forge there can already inject payloads as that peer |
 | **Fixed, with a test** (second pass) | H11b/M21 (partly), L1 | `BeaconSecurityTests`. See the note below for what remains of H11b |
+| **Partly fixed** | L14 | Two of the four stale comments are corrected: `InspectNew` no longer claims to rate-limit, and `HandleRegister` no longer claims to drop unknown sessions silently. Two remain: `PacketSentEventArgs` says it is "returned to the pool" although it is a struct, and the `PacketHeader` layout comment gives fixed byte offsets that are wrong for an unreliable segmented packet, which carries no sequence number |
 | **Open, not triaged** | L2, L3, L4, L5, L6, L7, L8, L9, L12, L13 | Low/info-severity performance and tidiness items: a socket handle held until finalization when `Bind` throws, two dictionary lookups per datagram, a double payload copy on segmented receive, a slower comparer on the send table, pooled-list rentals for the empty case, an extra `ioctl` per receive, an unreachable keep-alive backoff range, and `Interlocked` on telemetry counters in a single-threaded engine. None is a security property |
 
 **H11b/M21, what is fixed and what is not.** The reflection vector is closed: a `JoinSession` is answered
@@ -40,6 +41,34 @@ sequence space to wrap with an entry still unacknowledged; M19, M23 and M24 are 
 whose only honest assertion is a timing or allocation measurement that would be flaky in CI. Each was verified by
 reading the current source, which is weaker evidence than a test, and is labelled as such rather than counted as
 covered.
+
+---
+
+## Open issues found by the README fact-check (2026-09-23)
+
+The rewritten README was fact-checked against the code in three adversarial rounds: 1,671 claims, each reported
+discrepancy judged by three independent verifiers, majority rules. Most discrepancies were errors in the README and
+were fixed there. The ones below are problems in the **code**, and the README now documents each as current
+behaviour. None is fixed yet. Rows marked *read* were also confirmed by reading the cited lines directly, not only
+by the verifier majority.
+
+| # | Severity | Issue | Where | Evidence |
+|---|---|---|---|---|
+| F1 | **Security** | `SegmentAck` bypasses `IPacketTransform` in both directions. The transform gate treats any type byte above `NatChallenge` (9) as an external protocol, but `SegmentAck` is 10, so with an encrypting or authenticating transform the selective-ack bitmaps travel in the clear and are accepted unverified | `TransmissionEngine.cs:533`, `IngressEngine.cs:616`; the unknown-packet check at `IngressEngine.cs:690` correctly uses `> SegmentAck` | read |
+| F2 | High | An oversized reliable send throws *after* `NextOutgoingSequence++`. The peer then waits forever for that sequence, buffers later reliable messages behind the gap, and kicks the sender once more than `MaximumOutOfOrderReliablePackets` are waiting, so catching the exception does not save the connection. Check the segment count before taking a sequence | `TransmissionEngine.SendSegmented` takes the sequence before `PacketSplitter.Split` throws on the segment limit | read |
+| F3 | High | A reliable message dropped on reorder-buffer overflow has already been acknowledged, so the sender never resends it and the receiver's reliable stream stops for good if the handler keeps the peer connected | Reorder path in `IngressEngine` acknowledges before `DeliverOrdered` drops | majority |
+| F4 | Medium | Batched acknowledgements are sized against the configured MTU rather than the one reduced by `ReservedBytes`, so with a transform a full ack batch exceeds the configured MTU on the wire | `TransmissionEngine.cs:326` | read |
+| F5 | Medium | `Telemetry.PacketsDroppedOut` is never incremented: `OnLatencyDroppedSent` has no callers, so packets the latency simulator drops are counted nowhere | `Telemetry.cs:116` | read |
+| F6 | Medium | Under `FullCone`, the constructor checks `HandshakeTimeoutMilliseconds` against the punch schedule but not the `TimeoutMilliseconds` it falls back to when unset, so a short idle timeout ends connections mid-punch unreported | `SynapseManager` constructor, the schedule check near `:216` | majority |
+| F7 | Medium | `BeaconClient` sends each request once and never retransmits, so a single lost datagram in either round trip of a join ends in `TimeoutException` | `BeaconClient.SendAndReturnAsync` | majority |
+| F8 | Medium | `BeaconServer` listens on IPv4 only (`new UdpClient(port)`), so it never answers a client pointed at an IPv6 address | `BeaconServer` constructor | majority |
+| F9 | Medium | Nothing guards the `UnhandledException` handler, so an exception it throws escapes `Poll` and skips the rest of that poll. The reliable-resend path, the latency-simulator release and applying a violation's action swallow exceptions without reporting them at all | `SynapseManager.cs` (`Poll`, `OnPayloadDelivered`), `SynapseManager.Maintenance.cs` resend loop, `LatencySimulator.cs` | majority |
+| F10 | Low | `ViolationEventArgs.Action` is a settable public field on a struct passed by value, and its XML doc tells handlers to "downgrade" it. Assigning it has no effect: only the handler's return value is used | `ViolationEventArgs.cs`, `SynapseManager.HandleViolation` | read |
+| F11 | Low | `ConnectionRejectedReason.Timeout` is never raised; timeouts arrive as `ConnectionClosed` plus a `Timeout` violation | `ConnectionRejectedReason.cs` | read |
+| F12 | Low | The `SegmentConfig.ReliableEnabled` XML doc says oversized reliable sends throw when it is false. They throw only when `UnreliableMode` is also `Disabled`; otherwise they still go out as reliable segments | `SegmentConfig.cs`, `SynapseManager.Send` | read |
+| F13 | Low | The `ConnectionConfig.HandshakeMaximumAttempts` XML doc says "including the first". It counts retries only, so the default of 10 sends 11 handshakes | `ConnectionConfig.cs`, `SynapseManager.Maintenance.RetryPendingHandshake` | read |
+| F14 | Low | The concurrent-assembly cap raises `Malformed` with the detail string for a different failure ("Segment resent with mismatched segment count or reliability flag") | `IngressEngine.cs:880`, `:901` | read |
+| F15 | Low | `ISignatureValidator` is documented as supporting token schemes, but `Connect` offers no way to put application data in a handshake, so the validator only ever sees the random nonce | `ISignatureValidator.cs`, `SynapseManager.Connect` | read |
 
 ---
 
