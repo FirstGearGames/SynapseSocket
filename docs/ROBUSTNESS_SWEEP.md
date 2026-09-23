@@ -50,7 +50,8 @@ The rewritten README was fact-checked against the code in three adversarial roun
 discrepancy judged by three independent verifiers, majority rules. Most discrepancies were errors in the README and
 were fixed there. The ones below are problems in the **code**, and the README now documents each as current
 behaviour. None is fixed yet. Rows marked *read* were also confirmed by reading the cited lines directly, not only
-by the verifier majority.
+by the verifier majority. F16 came from a follow-up analysis of how Nucleus holds `SynapseConnection` objects, run
+when an unmerged branch (`claude/busy-jang-cec99e`) turned out to have avoided connection pooling on purpose.
 
 | # | Severity | Issue | Where | Evidence |
 |---|---|---|---|---|
@@ -69,6 +70,7 @@ by the verifier majority.
 | F13 | Low | The `ConnectionConfig.HandshakeMaximumAttempts` XML doc says "including the first". It counts retries only, so the default of 10 sends 11 handshakes | `ConnectionConfig.cs`, `SynapseManager.Maintenance.RetryPendingHandshake` | read |
 | F14 | Low | The concurrent-assembly cap raises `Malformed` with the detail string for a different failure ("Segment resent with mismatched segment count or reliability flag") | `IngressEngine.cs:880`, `:901` | read |
 | F15 | Low | `ISignatureValidator` is documented as supporting token schemes, but `Connect` offers no way to put application data in a handshake, so the validator only ever sees the random nonce | `ISignatureValidator.cs`, `SynapseManager.Connect` | read |
+| F16 | **High** | **Pooling `SynapseConnection` (the M3 fix) is unsafe for any consumer that keeps a connection past close, and Nucleus does.** A closed connection is reset and returned to `ResettableObjectPool<SynapseConnection>`, a static pool whose thread-local LIFO stack hands the same object to the very next `Rent` on that thread, from any `SynapseManager` in the process. A stale reference then operates on a recycled or re-issued object. Nucleus `BlitzRelay` `RelayLink` never clears `_relayConnection` on close, which gives three majority-confirmed hazards: `Dispose` throws `NullReferenceException` after a relay session closes, leaking the UDP socket (high likelihood); in Newfarm host migration the stale link corrupts the new host link's live connection (critical, near-deterministic); a host whose session drops parks reliable sends on the pooled object and poisons the pool (high). Nucleus `ServerSocket` reaches a recycled object only if `Disconnect` throws during `DisconnectAsync`. `ClientSocket` is safe. Nucleus builds against `D:\Development\SynapseSocket` by ProjectReference, and that checkout predates pooling, so Nucleus is unaffected until it is pulled. **Open decision:** stop recycling `SynapseConnection` (keep the eager resource release, as `claude/busy-jang-cec99e` does, costing one allocation per connection), or keep pooling and fix every consumer | `SynapseManager.TeardownConnection` / `DrainPendingPoolReturns`; Nucleus `RelayLink.cs:107,356`, `ServerSocket.DisconnectRemoteClients` | majority, 25 agents |
 
 ---
 
