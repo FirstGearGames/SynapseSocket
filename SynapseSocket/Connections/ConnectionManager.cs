@@ -2,7 +2,6 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
-using CodeBoost.Performance;
 using SynapseSocket.Core;
 using SynapseSocket.Core.Events;
 
@@ -69,7 +68,8 @@ public sealed class ConnectionManager
 
         if (!isFound)
         {
-            synapseConnection = ResettableObjectPool<SynapseConnection>.Rent();
+            // Allocated, not rented: connection objects are never pooled. See SynapseManager.ReleaseTornDownConnections.
+            synapseConnection = new();
 
             int connectionsIndex = _connections.Count;
             synapseConnection.Initialize(endPoint, signature, connectionsIndex);
@@ -116,7 +116,8 @@ public sealed class ConnectionManager
             _connectionsBySignature.TryRemove(old.Signature, out _);
         }
 
-        SynapseConnection synapseConnection = ResettableObjectPool<SynapseConnection>.Rent();
+        // Allocated, not rented: connection objects are never pooled. See SynapseManager.ReleaseTornDownConnections.
+        SynapseConnection synapseConnection = new();
         int connectionsIndex = _connections.Count;
         synapseConnection.Initialize(endPoint, signature, connectionsIndex);
 

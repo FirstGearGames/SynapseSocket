@@ -149,9 +149,9 @@ public class HandshakeTimeoutTests
         byte[] keepAlivePacket = [(byte)PacketType.KeepAlive];
         long deadlineMilliseconds = Environment.TickCount64 + CloseWaitMilliseconds;
         long nextKeepAliveMilliseconds = 0;
-        /* Sampled inside the loop, because the timed-out connection is returned to the pool at the end of the poll
-         * that closes it, and the return resets every timestamp on it. Reading the field afterwards would report
-         * the pooled zero rather than what the peer's traffic did to a live connection. */
+        /* Sampled inside the loop, while the connection is live, so the assertion describes what the peer's traffic did
+         * to it rather than whatever state teardown leaves behind. That matters if connection pooling is ever switched
+         * back on: a returned connection has every timestamp reset to zero. */
         long lastObservedReceivedTicks = handshakeReceivedTicks;
 
         while (clientEventRecorder.ConnectionsClosed == 0 && Environment.TickCount64 < deadlineMilliseconds)

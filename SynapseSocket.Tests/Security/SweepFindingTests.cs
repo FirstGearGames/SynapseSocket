@@ -464,11 +464,67 @@ public sealed class SweepFindingTests
     }
 
     /// <summary>
-    /// M3: teardown must actually return the connection to the pool. <c>OnReturn</c> nulls
-    /// <see cref="SynapseConnection.RemoteEndPoint"/>, so observing that proves the return ran.
+    /// F16: a closed connection must never be handed out again, and a caller still holding it must not be able to
+    /// reach whatever session comes next.
     /// </summary>
+    /// <remarks>
+    /// The connection pool is a static, thread-local LIFO stack, so with recycling on, the very next connection made on
+    /// this thread is given the object that was just closed. Nucleus's relay link kept such a reference past close,
+    /// which let a stale <c>Disconnect</c> or <c>Send</c> land on an unrelated live session.
+    /// </remarks>
     [Fact]
-    public void M3_Teardown_ReturnsTheConnectionToThePool()
+    public void F16_ClosedConnection_IsNeverReissued_AndStaleCallsAreInert()
+    {
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port));
+        using SynapseManager client = new(TestHarness.ClientConfig());
+
+        TestHarness.EventRecorder serverEvents = new();
+        serverEvents.Attach(server);
+
+        server.Start();
+        client.Start();
+
+        IPEndPoint serverEndPoint = new(IPAddress.Loopback, port);
+
+        SynapseConnection first = client.Connect(serverEndPoint);
+        Assert.True(
+            TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 1, 3000, server, client),
+            "the first handshake did not complete");
+
+        client.Disconnect(first);
+        Assert.True(
+            TestHarness.PumpUntil(() => server.Connections.Count == 0, 3000, server, client),
+            "the server never saw the first connection close");
+
+        SynapseConnection second = client.Connect(serverEndPoint);
+        Assert.True(
+            TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 2, 3000, server, client),
+            "the second handshake did not complete");
+
+        Assert.False(ReferenceEquals(first, second), "the closed connection object was handed out again for the new session");
+
+        // A caller still holding the closed connection must not be able to reach the live one.
+        Assert.Throws<InvalidOperationException>(() => client.Send(first, new byte[] { 1 }, isReliable: true));
+        client.Disconnect(first);
+        TestHarness.PumpFor(200, server, client);
+
+        Assert.Equal(ConnectionState.Connected, second.State);
+        Assert.Equal(1, server.Connections.Count);
+    }
+
+    /// <summary>
+    /// M3: teardown must release everything a connection holds from the shared pools, and, with connection pooling
+    /// disabled after F16, must leave the connection object itself alone rather than recycle it.
+    /// </summary>
+    /// <remarks>
+    /// The original M3 finding was that connections were never returned to their pool. Returning them turned out to be
+    /// unsafe for any application that keeps a connection past close (F16), so the object is now deliberately left to
+    /// the garbage collector. What must not leak is what the connection borrowed: its splitter, its reassembler and the
+    /// buffers behind its reliable queue and reorder buffer.
+    /// </remarks>
+    [Fact]
+    public void M3_Teardown_ReleasesPooledBuffersWithoutRecyclingTheConnection()
     {
         int port = TestHarness.GetFreePort();
         using SynapseManager server = new(TestHarness.ServerConfig(port));
@@ -488,18 +544,29 @@ public sealed class SweepFindingTests
         SynapseConnection serverSide = server.Connections.Connections[0];
         Assert.NotNull(serverSide.RemoteEndPoint);
 
+        // A segmented send rents a splitter, so there is something pooled for the teardown to release.
+        server.Send(serverSide, new byte[3000], isReliable: false);
+        Assert.NotNull(serverSide.Splitter);
+
         client.Disconnect(clientToServer);
 
         Assert.True(
             TestHarness.PumpUntil(() => server.Connections.Count == 0, 3000, server, client),
             "server never observed the remote disconnect");
 
-        // The return is deferred to the end of Poll, so give it one more.
+        // The release is deferred to the end of Poll, so give it one more.
         server.Poll();
 
-        Assert.True(
-            serverSide.RemoteEndPoint is null,
-            "the torn-down connection was never returned to the pool. OnReturn did not run");
+        Assert.Null(serverSide.Splitter);
+        Assert.Null(serverSide.Reassembler);
+        Assert.Empty(serverSide.PendingReliableQueue);
+        Assert.Empty(serverSide.ReorderBuffer);
+
+        // Not recycled: the identity is intact, so a caller that kept this reference is holding a dead connection
+        // rather than someone else's live one.
+        Assert.True(serverSide.IsTornDown);
+        Assert.Equal(ConnectionState.Disconnected, serverSide.State);
+        Assert.NotNull(serverSide.RemoteEndPoint);
     }
 
     /// <summary>
@@ -538,7 +605,7 @@ public sealed class SweepFindingTests
             TestHarness.PumpUntil(() => server.Connections.Count == 0, 3000, server, client),
             "re-entrant disconnect never removed the connection");
 
-        // Keep polling: a recycled-mid-use connection surfaces here as an unhandled exception out of the drain.
+        // Keep polling: a connection released mid-use surfaces here as an unhandled exception out of the drain.
         TestHarness.PumpFor(300, server, client);
 
         failures.AssertNoFailures();
@@ -1560,8 +1627,9 @@ public sealed class SweepFindingTests
     }
 
     /// <summary>
-    /// M2: connecting again to an endpoint that already has a session must reclaim the replaced connection rather
-    /// than dropping it on the floor, which orphaned its pooled buffers, its splitter and its reassembler.
+    /// M2: connecting again to an endpoint that already has a session must tear the replaced connection down and
+    /// release what it borrowed, rather than dropping it on the floor, which orphaned its pooled buffers, its splitter
+    /// and its reassembler.
     /// </summary>
     [Fact]
     public void M2_ReconnectingToTheSameEndpoint_ReclaimsTheReplacedConnection()
@@ -1583,13 +1651,21 @@ public sealed class SweepFindingTests
             TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 1, 3000, server, client),
             "the first handshake did not complete");
 
+        // A segmented send rents a splitter, so there is something pooled for the reconnect to reclaim.
+        client.Send(first, new byte[3000], isReliable: false);
+        Assert.NotNull(first.Splitter);
+
         // Connect again to the same endpoint. The first instance must be torn down, not silently discarded.
         SynapseConnection second = client.Connect(target);
         TestHarness.PumpFor(300, server, client);
 
         Assert.False(ReferenceEquals(first, second), "the second Connect reused the first connection instance");
         Assert.True(client.Connections.Count == 1, $"reconnecting left [{client.Connections.Count}] client connections for one endpoint");
-        Assert.True(first.RemoteEndPoint is null, "the replaced connection was discarded without being reset and returned to the pool");
+        Assert.True(first.IsTornDown, "the replaced connection was discarded without being torn down");
+        Assert.Equal(ConnectionState.Disconnected, first.State);
+        Assert.Null(first.Splitter);
+        Assert.Null(first.Reassembler);
+        Assert.Empty(first.PendingReliableQueue);
     }
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -153,12 +153,13 @@ public sealed partial class SynapseConnection : IPoolResettable
     [PoolResettableMember]
     internal TransmissionEngine? TransmissionEngine;
     /// <summary>
-    /// True once this connection has been torn down and queued for return to the pool, but before the return has
-    /// actually happened. Guards against a second teardown queueing the same instance twice, which would hand one
-    /// object to two future renters.
+    /// True once this connection has been torn down. Set before <c>ConnectionClosed</c> is raised, so a handler that
+    /// disconnects the same connection re-entrantly cannot tear it down, raise the event, or queue its release twice.
+    /// It is never cleared while pooling is disabled, which is what makes a stale reference inert: <c>Send</c> refuses
+    /// a torn-down connection and <c>Disconnect</c> ignores one.
     /// </summary>
     [PoolResettableMember]
-    internal bool IsPendingPoolReturn;
+    internal bool IsTornDown;
     /// <summary>
     /// Handshake attempts made while this connection has been Pending, including the initial one from Connect.
     /// </summary>
@@ -253,7 +254,7 @@ public sealed partial class SynapseConnection : IPoolResettable
     /// </para>
     /// </summary>
     [PoolResettableMethod]
-    private void ReleasePooledResources()
+    internal void ReleasePooledResources()
     {
         PendingAcks.Clear();
 
@@ -273,19 +274,16 @@ public sealed partial class SynapseConnection : IPoolResettable
 
     /// <inheritdoc/>
     /// <remarks>
-    /// The single place a connection is cleared. Every teardown funnels through
-    /// <c>SynapseManager.TeardownConnection</c>, which queues the instance for return; the pool then calls this.
-    /// <para>
-    /// The engine guarantees only that <b>nothing inside Synapse</b> still references the instance when it is
-    /// returned. Table entries are removed, NAT punches retired, and the actual return deferred to the end of
-    /// <c>Poll</c> so no in-flight engine frame is holding it. An application that keeps the reference handed to it by
-    /// <c>Connect</c>, <c>PacketReceivedEventArgs.Connection</c> or <c>ConnectionEventArgs.Connection</c> past the
-    /// close notification is holding a recycled object, and that is the application's responsibility.
-    /// </para>
+    /// <b>Not currently called: connection pooling is disabled.</b> A torn-down connection is released with
+    /// <see cref="ReleasePooledResources"/> and then left alone rather than returned, because <c>Connect</c> and every
+    /// connection event hand the raw object to the application, and an application that kept one past close would be
+    /// holding a recycled object that the pool, which is shared by every <c>SynapseManager</c> in the process, may
+    /// already have handed to a different peer. Kept intact so pooling can be switched back on once every consumer is
+    /// known to drop its references on close.
     /// </remarks>
     public void OnReturn()
     {
-        IsPendingPoolReturn = false;
+        IsTornDown = false;
         HandshakeAttempts = 0;
         RemoteEndPoint = null;
 #if NET8_0_OR_GREATER

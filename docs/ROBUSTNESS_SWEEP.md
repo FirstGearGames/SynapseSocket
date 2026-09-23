@@ -32,6 +32,14 @@ receives the host's endpoint: the ID is the only credential. Closing that needs 
 carried alongside the ID, which lengthens the shared room code and is therefore a product decision rather
 than a fix.
 
+**M3** is fixed in its intent but not to the letter. Its goal was a single cleanup implementation, so that no teardown
+path could forget to release what a connection borrowed: every teardown now funnels through
+`SynapseManager.TeardownConnection`, and the buffers are released by `SynapseConnection.ReleasePooledResources` at the
+end of the poll. The connection object itself is deliberately *not* returned to its pool. M3's own suggested fix
+required an audit of connection references escaping to user code before pooling, warning of exactly the
+send-to-the-wrong-peer bug that pooling without that audit later produced; that audit is F16, and it found Nucleus
+holding such references. The test is `M3_Teardown_ReleasesPooledBuffersWithoutRecyclingTheConnection`.
+
 **L1** was closed as a side effect of H5's per-poll receive budget, which is what its own suggested fix called
 for. The secondary half, disabling `SIO_UDP_CONNRESET` on Windows so ICMP-induced errors never reach the
 receive path, is not done.
@@ -49,7 +57,7 @@ covered.
 The rewritten README was fact-checked against the code in three adversarial rounds: 1,671 claims, each reported
 discrepancy judged by three independent verifiers, majority rules. Most discrepancies were errors in the README and
 were fixed there. The ones below are problems in the **code**, and the README now documents each as current
-behaviour. None is fixed yet. Rows marked *read* were also confirmed by reading the cited lines directly, not only
+behaviour. None is fixed yet except F16, mitigated on 2026-09-23 as its row describes. Rows marked *read* were also confirmed by reading the cited lines directly, not only
 by the verifier majority. F16 came from a follow-up analysis of how Nucleus holds `SynapseConnection` objects, run
 when an unmerged branch (`claude/busy-jang-cec99e`) turned out to have avoided connection pooling on purpose.
 
@@ -70,7 +78,7 @@ when an unmerged branch (`claude/busy-jang-cec99e`) turned out to have avoided c
 | F13 | Low | The `ConnectionConfig.HandshakeMaximumAttempts` XML doc says "including the first". It counts retries only, so the default of 10 sends 11 handshakes | `ConnectionConfig.cs`, `SynapseManager.Maintenance.RetryPendingHandshake` | read |
 | F14 | Low | The concurrent-assembly cap raises `Malformed` with the detail string for a different failure ("Segment resent with mismatched segment count or reliability flag") | `IngressEngine.cs:880`, `:901` | read |
 | F15 | Low | `ISignatureValidator` is documented as supporting token schemes, but `Connect` offers no way to put application data in a handshake, so the validator only ever sees the random nonce | `ISignatureValidator.cs`, `SynapseManager.Connect` | read |
-| F16 | **High** | **Pooling `SynapseConnection` (the M3 fix) is unsafe for any consumer that keeps a connection past close, and Nucleus does.** A closed connection is reset and returned to `ResettableObjectPool<SynapseConnection>`, a static pool whose thread-local LIFO stack hands the same object to the very next `Rent` on that thread, from any `SynapseManager` in the process. A stale reference then operates on a recycled or re-issued object. Nucleus `BlitzRelay` `RelayLink` never clears `_relayConnection` on close, which gives three majority-confirmed hazards: `Dispose` throws `NullReferenceException` after a relay session closes, leaking the UDP socket (high likelihood); in Newfarm host migration the stale link corrupts the new host link's live connection (critical, near-deterministic); a host whose session drops parks reliable sends on the pooled object and poisons the pool (high). Nucleus `ServerSocket` reaches a recycled object only if `Disconnect` throws during `DisconnectAsync`. `ClientSocket` is safe. Nucleus builds against `D:\Development\SynapseSocket` by ProjectReference, and that checkout predates pooling, so Nucleus is unaffected until it is pulled. **Open decision:** stop recycling `SynapseConnection` (keep the eager resource release, as `claude/busy-jang-cec99e` does, costing one allocation per connection), or keep pooling and fix every consumer | `SynapseManager.TeardownConnection` / `DrainPendingPoolReturns`; Nucleus `RelayLink.cs:107,356`, `ServerSocket.DisconnectRemoteClients` | majority, 25 agents |
+| F16 | **High**, mitigated | **Pooling `SynapseConnection` (the M3 fix) is unsafe for any consumer that keeps a connection past close, and Nucleus does.** A closed connection is reset and returned to `ResettableObjectPool<SynapseConnection>`, a static pool whose thread-local LIFO stack hands the same object to the very next `Rent` on that thread, from any `SynapseManager` in the process. A stale reference then operates on a recycled or re-issued object. Nucleus `BlitzRelay` `RelayLink` never clears `_relayConnection` on close, which gives three majority-confirmed hazards: `Dispose` throws `NullReferenceException` after a relay session closes, leaking the UDP socket (high likelihood); in Newfarm host migration the stale link corrupts the new host link's live connection (critical, near-deterministic); a host whose session drops parks reliable sends on the pooled object and poisons the pool (high). Nucleus `ServerSocket` reaches a recycled object only if `Disconnect` throws during `DisconnectAsync`. `ClientSocket` is safe. Nucleus builds against `D:\Development\SynapseSocket` by ProjectReference, and that checkout predates pooling, so Nucleus is unaffected until it is pulled. **Mitigated 2026-09-23.** Connection pooling is disabled: a torn-down connection still has its buffers released at the end of the poll, but the object is never returned or reused, `Send` on a closed connection throws, and `Disconnect` on one does nothing. `F16_ClosedConnection_IsNeverReissued_AndStaleCallsAreInert` failed against the pooling code (the closed object was handed to the next connection) and passes now. Nucleus `RelayLink` also clears `_relayConnection` on close. Switching pooling back on requires every consumer to drop its references on close first | `SynapseManager.TeardownConnection` / `DrainPendingPoolReturns`; Nucleus `RelayLink.cs:107,356`, `ServerSocket.DisconnectRemoteClients` | majority, 25 agents |
 
 ---
 

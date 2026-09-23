@@ -160,10 +160,10 @@ public sealed partial class SynapseManager : IDisposable
     /// </summary>
     private TransmissionEngine? _transmissionEngine;
     /// <summary>
-    /// Connections torn down during the current <see cref="Poll"/>, awaiting return to the pool once no engine frame
+    /// Connections torn down since the last release, awaiting the release of their pooled buffers once no engine frame
     /// can still be holding them. Drained at the end of every poll.
     /// </summary>
-    private readonly List<SynapseConnection> _pendingPoolReturns = [];
+    private readonly List<SynapseConnection> _pendingReleases = [];
     /// <summary>
     /// Raw sends queued from other threads by <see cref="EnqueueRaw"/>, drained on the engine thread during
     /// <see cref="Poll"/>.
@@ -383,9 +383,9 @@ public sealed partial class SynapseManager : IDisposable
         // 5. Release any latency-simulator-delayed packets whose due time has elapsed.
         _transmissionEngine.FlushDeferredSends(nowTicks);
 
-        // 6. Recycle connections torn down during this poll. Deferred to here so no engine frame, including a user
-        //    handler that disconnected re-entrantly from inside PacketReceived. Is still holding one.
-        DrainPendingPoolReturns();
+        // 6. Release the buffers of connections torn down since the last poll. Deferred to here so that no engine frame,
+        //    including a user handler that disconnected re-entrantly from inside PacketReceived, is still using them.
+        ReleaseTornDownConnections();
     }
 
     /// <summary>
@@ -445,10 +445,16 @@ public sealed partial class SynapseManager : IDisposable
     /// <item><see cref="UnreliableSegmentMode.SegmentUnreliable"/>: splits into unreliable segments (default).</item>
     /// <item><see cref="UnreliableSegmentMode.SegmentReliable"/>: splits into reliable segments.</item>
     /// </list>
+    /// Throws <see cref="InvalidOperationException"/> for a connection that has been closed.
     /// </summary>
     public void Send(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable)
     {
         EnsureRunning();
+
+        /* A closed connection is never reused, so a reference to one can only be stale. Sending on it would park
+         * reliable buffers on a dead object and put datagrams on the wire for a session that no longer exists. */
+        if (synapseConnection.IsTornDown)
+            throw new InvalidOperationException("Cannot send on a connection that has been closed.");
 
         if (payload.Count <= MaximumPayloadSize)
         {
@@ -528,10 +534,15 @@ public sealed partial class SynapseManager : IDisposable
     }
 
     /// <summary>
-    /// Gracefully disconnects a connection, notifying the peer.
+    /// Gracefully disconnects a connection, notifying the peer. Does nothing for a connection that is already closed.
     /// </summary>
     public void Disconnect(SynapseConnection synapseConnection)
     {
+        /* Already closed: nothing to do. Sending the disconnect packet anyway would be worse than redundant, because the
+         * peer may have a new session with this endpoint by now, and the packet would end that one instead. */
+        if (synapseConnection.IsTornDown)
+            return;
+
         if (_transmissionEngine is not null)
             _transmissionEngine.SendDisconnect(synapseConnection);
 
@@ -636,15 +647,15 @@ public sealed partial class SynapseManager : IDisposable
 
             connection.State = ConnectionState.Disconnected;
 
-            if (connection.IsPendingPoolReturn)
+            if (connection.IsTornDown)
                 continue;
 
-            connection.IsPendingPoolReturn = true;
-            _pendingPoolReturns.Add(connection);
+            connection.IsTornDown = true;
+            _pendingReleases.Add(connection);
         }
 
         Connections.Clear();
-        DrainPendingPoolReturns();
+        ReleaseTornDownConnections();
     }
 
     /// <summary>
@@ -888,25 +899,26 @@ public sealed partial class SynapseManager : IDisposable
     /// <param name="synapseConnection">The connection to terminate.</param>
     /// <remarks>
     /// Order matters. The lookup tables are cleared first so nothing can resolve the connection again, then every
-    /// engine-internal reference to it is dropped, then the close notification is raised while the instance is still
-    /// intact, and only then is it queued for the pool. The queue is drained at the end of <see cref="Poll"/> rather
-    /// than here, because a user handler can call this re-entrantly from inside <c>PacketReceived</c> while the
-    /// ingress loop still holds the same connection in a local. Returning it immediately would recycle an object the
-    /// engine is mid-way through using.
+    /// engine-internal reference to it is dropped, then it is marked torn down, then the close notification is raised
+    /// while the instance is still intact, and only then is its release queued. Marking it before the notification is
+    /// what stops a handler that disconnects the same connection re-entrantly from raising <c>ConnectionClosed</c> a
+    /// second time and queueing a second release. The release runs at the end of <see cref="Poll"/> rather than here,
+    /// because a user handler can call this re-entrantly from inside <c>PacketReceived</c> while the ingress loop still
+    /// holds the same connection in a local, and its buffers are still in use.
     /// </remarks>
     private void TeardownConnection(SynapseConnection synapseConnection)
     {
-        if (synapseConnection.IsPendingPoolReturn)
+        if (synapseConnection.IsTornDown)
             return;
 
         Connections.Remove(synapseConnection.RemoteEndPoint, out _);
         RemoveNatPunchesFor(synapseConnection);
 
         synapseConnection.State = ConnectionState.Disconnected;
+        synapseConnection.IsTornDown = true;
         RaiseConnectionClosed(synapseConnection);
 
-        synapseConnection.IsPendingPoolReturn = true;
-        _pendingPoolReturns.Add(synapseConnection);
+        _pendingReleases.Add(synapseConnection);
     }
 
     /// <summary>
@@ -932,18 +944,27 @@ public sealed partial class SynapseManager : IDisposable
     }
 
     /// <summary>
-    /// Returns every connection queued by <see cref="TeardownConnection"/> to the pool. Called at the end of
+    /// Releases the pooled buffers of every connection queued by <see cref="TeardownConnection"/>. Called at the end of
     /// <see cref="Poll"/>, once no engine frame can still be holding one, and again on shutdown.
     /// </summary>
-    private void DrainPendingPoolReturns()
+    /// <remarks>
+    /// The connection object itself is deliberately <b>not</b> returned to its pool; it is left torn down, with its
+    /// identity intact, for the garbage collector. <c>Connect</c> and every connection event hand the raw object to the
+    /// application, and the pool is a static thread-local stack shared by every <see cref="SynapseManager"/> in the
+    /// process, so the very next connection made on this thread would be given the same object. An application still
+    /// holding the old reference, as Nucleus's relay link did, would then send to or disconnect an unrelated peer.
+    /// Recycling saved one allocation per connection, not per packet, which is not worth that. See F16 in
+    /// <c>docs/ROBUSTNESS_SWEEP.md</c>.
+    /// </remarks>
+    private void ReleaseTornDownConnections()
     {
-        if (_pendingPoolReturns.Count == 0)
+        if (_pendingReleases.Count == 0)
             return;
 
-        for (int i = 0; i < _pendingPoolReturns.Count; i++)
-            ResettableObjectPool<SynapseConnection>.Return(_pendingPoolReturns[i]);
+        for (int i = 0; i < _pendingReleases.Count; i++)
+            _pendingReleases[i].ReleasePooledResources();
 
-        _pendingPoolReturns.Clear();
+        _pendingReleases.Clear();
     }
 
 
