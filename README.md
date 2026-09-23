@@ -240,6 +240,17 @@ project. SynapseBeacon piggybacks on the Synapse UDP socket via the `SynapseMana
 mapping used for peer-to-peer traffic after the punch. See `SynapseBeacon.Demo` for an end-to-end
 example.
 
+Joining takes two round trips rather than one. The first `JoinSession` is answered with a
+`JoinChallenge` carrying a cookie bound to the joiner's own address; the joiner repeats the join with
+that cookie, and only the second request is matched. The challenge is sent before the session is
+looked up, so it is identical whatever ID was named.
+
+This costs one extra round trip per joiner, once, during matchmaking — nothing is added to the data
+path, and established peer traffic never touches the beacon. What it buys is that a forged
+`JoinSession` naming a victim's address cannot make a host aim a hole-punch burst at that victim: a
+source that cannot receive at the address it claimed never obtains a cookie. The beacon server also
+rate-limits per source address, and acknowledges a heartbeat only to the session's own host.
+
 ---
 
 ## Test Suite
@@ -255,6 +266,7 @@ SynapseSocket ships a full xUnit integration test suite that spins up real engin
 | `SignatureValidatorTests` | Custom validator gates connection admission |
 | `TelemetryAndLatencyTests` | Counters increment correctly; latency simulator delays delivery measurably |
 | `EngineLifecycleTests` | Start/stop/restart; double-start throws; dispose cleans up resources |
+| `BeaconSecurityTests` | The beacon's admission rules over real sockets: an unproven join drawing a challenge and leaving the host untouched, a proven join matching both sides, a forged cookie dropped silently, a heartbeat acknowledged only to its host, and a per-address request flood ceasing to draw replies |
 | `NatTraversalTests` | The full-cone punch over real sockets: a probe drawing a challenge rather than a handshake, the echoed token drawing the handshake that completes the exchange, a forged token drawing an echo instead, an already-echoed token drawing nothing, per-address probe rate limiting, and two engines punching simultaneously |
 | `SweepFindingTests` | The robustness-sweep findings, each asserting the corrected behaviour: connections-list integrity across removals, handshake reset loops, unbounded connections from unauthenticated handshakes, pending-handshake wedges, one-packet blacklisting, rate-limit false positives, and a forged beacon `PeerReady` failing to complete a join |
 

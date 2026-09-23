@@ -63,5 +63,16 @@ public enum BeaconPacketType : byte
     /// Host requests the rendezvous server to close a session and stop accepting new joiners.
     /// Payload is a 4-byte big-endian session ID.
     /// </summary>
-    CloseSession = 0x88
+    CloseSession = 0x88,
+
+    /// <summary>
+    /// Rendezvous server challenges a <see cref="JoinSession"/> to prove the joiner can receive at the address it
+    /// sent from. Payload is an 8-byte cookie followed by the joiner's echoed nonce.
+    /// <para>
+    /// Sent before the session is looked up, and sent to every first-hand join whatever the ID names, so the
+    /// challenge itself distinguishes nothing. The joiner repeats its <see cref="JoinSession"/> with the cookie
+    /// appended, and only that second request can disclose an endpoint or start a hole punch.
+    /// </para>
+    /// </summary>
+    JoinChallenge = 0x89
 }

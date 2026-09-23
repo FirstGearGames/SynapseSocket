@@ -115,11 +115,19 @@ internal sealed class BeaconSessionRegistry
 
     /// <summary>
     /// Refreshes the heartbeat timestamp for the host of an existing session.
+    /// Returns true only when <paramref name="endpoint"/> is that session's host, so the caller can withhold the
+    /// acknowledgement from everyone else rather than answering any address that names a number.
     /// </summary>
-    internal void Heartbeat(uint sessionId, IPEndPoint endpoint)
+    /// <param name="sessionId">Session being refreshed.</param>
+    /// <param name="endpoint">Sender claiming to be the session host.</param>
+    /// <returns>True when the refresh applied.</returns>
+    internal bool Heartbeat(uint sessionId, IPEndPoint endpoint)
     {
-        if (_sessions.TryGetValue(sessionId, out Entry? entry) && entry.Host.Equals(endpoint))
-            entry.LastHeartbeatTicks = DateTime.UtcNow.Ticks;
+        if (!_sessions.TryGetValue(sessionId, out Entry? entry) || !entry.Host.Equals(endpoint))
+            return false;
+
+        entry.LastHeartbeatTicks = DateTime.UtcNow.Ticks;
+        return true;
     }
 
     /// <summary>

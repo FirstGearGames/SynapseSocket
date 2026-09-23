@@ -212,7 +212,11 @@ public sealed class BeaconClient : IDisposable
                 break;
 
             case BeaconPacketType.SessionNotFound:
-                HandleSessionNotFound();
+                HandleSessionNotFound(payload);
+                break;
+
+            case BeaconPacketType.JoinChallenge:
+                HandleJoinChallenge(payload);
                 break;
 
             case BeaconPacketType.HeartbeatAck:
@@ -252,10 +256,19 @@ public sealed class BeaconClient : IDisposable
     /// <summary>
     /// Fails all pending registrations whose session ID was not found or has expired on the server.
     /// </summary>
-    private void HandleSessionNotFound()
+    private void HandleSessionNotFound(ReadOnlySpan<byte> payload)
     {
         foreach (KeyValuePair<uint, TaskCompletionSource<IPEndPoint>> kvp in _pendingRegistrations)
+        {
+            /* Only the registration whose nonce comes back is failed. A rejection is accepted on the strength of
+             * its source address otherwise, which is forgeable, and one forged datagram would then fail every join
+             * this client has in flight rather than the single session it names. */
+            if (!RegistrationNonceMatches(kvp.Key, payload, endPointLength: 0))
+                continue;
+
             kvp.Value.TrySetException(new InvalidOperationException($"Beacon server rejected registration: session '{kvp.Key}' not found or has expired."));
+            return;
+        }
     }
 
     /// <summary>
@@ -292,6 +305,58 @@ public sealed class BeaconClient : IDisposable
         foreach (KeyValuePair<uint, BeaconHostSession> kvp in _hostSessions)
         {
             kvp.Value.RaisePeerReady(peer);
+        }
+    }
+
+    /// <summary>
+    /// Answers a <see cref="BeaconPacketType.JoinChallenge"/> by repeating the join with the cookie appended.
+    /// <para>
+    /// The challenge echoes the nonce of the join that drew it, which is what identifies the pending registration
+    /// to repeat and what stops an off-path forgery from driving this: an attacker that never saw the join cannot
+    /// reproduce its nonce. The cookie itself is opaque here; only the server can check it.
+    /// </para>
+    /// </summary>
+    /// <param name="payload">Challenge payload: the cookie followed by the echoed nonce.</param>
+    private void HandleJoinChallenge(ReadOnlySpan<byte> payload)
+    {
+        if (payload.Length < BeaconWireFormat.CookieBytes + BeaconWireFormat.NonceBytes)
+            return;
+
+        ReadOnlySpan<byte> echoedNonce = payload[BeaconWireFormat.CookieBytes..];
+
+        foreach (KeyValuePair<uint, byte[]> kvp in _pendingRegistrationNonces)
+        {
+            if (!EchoesNonce(echoedNonce, kvp.Value))
+                continue;
+
+            SendProvenJoinSession(kvp.Key, kvp.Value, payload[..BeaconWireFormat.CookieBytes]);
+            return;
+        }
+    }
+
+    /// <summary>
+    /// Repeats a <see cref="BeaconPacketType.JoinSession"/> with the server's cookie appended, which is the
+    /// request that can actually be matched.
+    /// </summary>
+    /// <param name="sessionId">Session being joined.</param>
+    /// <param name="nonce">The nonce already registered for this join, reused so the reply still binds to it.</param>
+    /// <param name="cookie">Cookie the server issued for this client's address.</param>
+    private void SendProvenJoinSession(uint sessionId, byte[] nonce, ReadOnlySpan<byte> cookie)
+    {
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(BeaconWireFormat.ProvenJoinBytes);
+
+        try
+        {
+            BeaconWireFormat.WriteTypeAndSessionId(buffer.AsSpan(), BeaconPacketType.JoinSession, sessionId);
+            nonce.CopyTo(buffer, 1 + BeaconWireFormat.SessionIdBytes);
+            cookie.CopyTo(buffer.AsSpan(BeaconWireFormat.UnprovenJoinBytes));
+
+            _synapse.EnqueueRaw(_serverEndPoint, new(buffer, 0, BeaconWireFormat.ProvenJoinBytes));
+        }
+        finally
+        {
+            // Matches every other send here: an exception out of EnqueueRaw must not strand the rental.
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 

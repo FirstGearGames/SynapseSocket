@@ -1,7 +1,10 @@
 using System;
 using System.Buffers;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using SynapseBeacon.Wire;
@@ -56,6 +59,18 @@ public sealed class BeaconServer : IDisposable
     private readonly Action<string>? _log;
 
     /// <summary>
+    /// Keyed MAC signing join cookies. Generated once at construction and never transmitted, so a cookie can only
+    /// be produced by this server and only checked by it.
+    /// </summary>
+    private readonly HMACSHA256 _cookieHmac;
+
+    /// <summary>
+    /// Per-source request tallies. Swept on the same timer that evicts sessions, because a table keyed by an
+    /// attacker-chosen address is itself a memory-flooding vector if it only ever grows.
+    /// </summary>
+    private readonly ConcurrentDictionary<IPAddress, RequestRate> _requestRates = new();
+
+    /// <summary>
     /// Immutable single-byte payload for <see cref="BeaconPacketType.HeartbeatAck"/>. Shared across all sends.
     /// </summary>
     private static readonly byte[] HeartbeatAckPacket = [(byte)BeaconPacketType.HeartbeatAck];
@@ -71,6 +86,24 @@ public sealed class BeaconServer : IDisposable
     private static readonly byte[] SessionNotFoundPacket = [(byte)BeaconPacketType.SessionNotFound];
 
     /// <summary>
+    /// Duration of a cookie time bucket. A cookie is accepted for the current bucket and the previous one, giving
+    /// a joiner roughly 30 to 60 seconds to answer a challenge and leaving retries under packet loss valid.
+    /// </summary>
+    private static readonly long CookieTimeBucketTicks = 30 * TimeSpan.TicksPerSecond;
+
+    /// <summary>
+    /// Window over which <see cref="MaximumRequestsPerWindow"/> is counted.
+    /// </summary>
+    private static readonly long RateLimitWindowTicks = TimeSpan.TicksPerSecond;
+
+    /// <summary>
+    /// Requests each source address may make per <see cref="RateLimitWindowTicks"/> before the rest are dropped.
+    /// Sized for a legitimate client, which sends one session request or two join requests and then heartbeats
+    /// every 30 seconds; many players behind one carrier NAT still sit far below it.
+    /// </summary>
+    private const int MaximumRequestsPerWindow = 20;
+
+    /// <summary>
     /// Initialises the server bound to <paramref name="port"/> on all interfaces.
     /// </summary>
     /// <param name="port">UDP port to listen on.</param>
@@ -81,8 +114,99 @@ public sealed class BeaconServer : IDisposable
     {
         _socket = new(port);
         _registry = new(sessionTimeoutMilliseconds, maximumConcurrentSessions);
-        _evictionTimer = new(_ => _registry.EvictExpired(), null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+        _evictionTimer = new(_ => RunMaintenance(), null, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
         _log = log;
+
+        Span<byte> cookieSecret = stackalloc byte[32];
+        RandomNumberGenerator.Fill(cookieSecret);
+        _cookieHmac = new(cookieSecret.ToArray());
+    }
+
+    /// <summary>
+    /// Evicts expired sessions and stale rate-limit entries. Driven by the eviction timer rather than the receive
+    /// loop, so neither sweep sits on a path an attacker can time.
+    /// </summary>
+    private void RunMaintenance()
+    {
+        _registry.EvictExpired();
+
+        long cutoffTicks = DateTime.UtcNow.Ticks - RateLimitWindowTicks;
+
+        foreach (KeyValuePair<IPAddress, RequestRate> entry in _requestRates)
+            if (entry.Value.WindowStartTicks < cutoffTicks)
+                _requestRates.TryRemove(entry.Key, out _);
+    }
+
+    /// <summary>
+    /// Returns false when <paramref name="from"/> has exceeded <see cref="MaximumRequestsPerWindow"/> inside the
+    /// current window, in which case the datagram is dropped without a reply.
+    /// </summary>
+    /// <param name="from">Source address of the datagram.</param>
+    private bool IsWithinRateLimit(IPEndPoint from)
+    {
+        long nowTicks = DateTime.UtcNow.Ticks;
+        RequestRate requestRate = _requestRates.GetOrAdd(from.Address, static _ => new RequestRate());
+
+        lock (requestRate)
+        {
+            if (nowTicks - requestRate.WindowStartTicks >= RateLimitWindowTicks)
+            {
+                requestRate.WindowStartTicks = nowTicks;
+                requestRate.Count = 0;
+            }
+
+            requestRate.Count++;
+            return requestRate.Count <= MaximumRequestsPerWindow;
+        }
+    }
+
+    /// <summary>
+    /// Computes the cookie bound to <paramref name="endPoint"/> and <paramref name="timeBucket"/>, writing exactly
+    /// <see cref="BeaconWireFormat.CookieBytes"/> bytes into <paramref name="destination"/>.
+    /// </summary>
+    /// <param name="endPoint">Endpoint the cookie is bound to.</param>
+    /// <param name="timeBucket">Coarse time bucket the cookie is bound to.</param>
+    /// <param name="destination">Receives the truncated MAC.</param>
+    private void ComputeCookie(IPEndPoint endPoint, long timeBucket, Span<byte> destination)
+    {
+        Span<byte> addressBytes = stackalloc byte[16];
+        endPoint.Address.TryWriteBytes(addressBytes, out int addressLength);
+
+        Span<byte> input = stackalloc byte[addressLength + 2 + 8];
+        addressBytes[..addressLength].CopyTo(input);
+
+        int offset = addressLength;
+        input[offset++] = (byte)(endPoint.Port & 0xFF);
+        input[offset++] = (byte)((endPoint.Port >> 8) & 0xFF);
+
+        for (int i = 0; i < 8; i++)
+            input[offset++] = (byte)((timeBucket >> (i * 8)) & 0xFF);
+
+        Span<byte> hashBuffer = stackalloc byte[32];
+        _cookieHmac.TryComputeHash(input, hashBuffer, out _);
+        hashBuffer[..BeaconWireFormat.CookieBytes].CopyTo(destination);
+    }
+
+    /// <summary>
+    /// Returns true when <paramref name="cookie"/> is one this server issued to <paramref name="endPoint"/> in the
+    /// current or previous time bucket.
+    /// </summary>
+    /// <param name="endPoint">Endpoint the cookie should be bound to.</param>
+    /// <param name="cookie">The cookie the joiner presented.</param>
+    private bool VerifyCookie(IPEndPoint endPoint, ReadOnlySpan<byte> cookie)
+    {
+        long bucket = DateTime.UtcNow.Ticks / CookieTimeBucketTicks;
+        Span<byte> expected = stackalloc byte[BeaconWireFormat.CookieBytes];
+
+        /* Fixed-time compare: the cookie is a secret the joiner must reproduce, so an early-exit comparison leaks
+         * how many leading bytes were right. */
+        ComputeCookie(endPoint, bucket, expected);
+        if (CryptographicOperations.FixedTimeEquals(cookie, expected))
+            return true;
+
+        ComputeCookie(endPoint, bucket - 1, expected);
+
+        return CryptographicOperations.FixedTimeEquals(cookie, expected);
     }
 
     /// <summary>
@@ -129,6 +253,11 @@ public sealed class BeaconServer : IDisposable
     {
         // Layout: [BeaconPacketType (1 byte)] [payload]
         if (data.Length < 1)
+            return;
+
+        /* Checked before the type is even read. Every request below either allocates state or draws a reply, so
+         * the limit has to sit ahead of all of them rather than inside any one handler. */
+        if (!IsWithinRateLimit(from))
             return;
 
         BeaconPacketType type = (BeaconPacketType)data[0];
@@ -180,12 +309,29 @@ public sealed class BeaconServer : IDisposable
         if (!BeaconWireFormat.TryReadSessionId(data.AsSpan(1), out uint sessionId))
             return;
 
+        /* A first-hand join is answered with a challenge and nothing else. No session lookup runs, so the reply is
+         * identical whatever ID was named and the exchange leaks nothing at this stage. A source that cannot
+         * receive at the address it claimed never gets the cookie, and so never reaches the disclosure below:
+         * that is what stops a forged join from aiming a host's hole-punch burst at a third party. */
+        if (data.Length < BeaconWireFormat.ProvenJoinBytes)
+        {
+            SendJoinChallenge(from, ReadNonce(data, BeaconWireFormat.SessionIdBytes));
+            return;
+        }
+
+        if (!VerifyCookie(from, data.AsSpan(BeaconWireFormat.UnprovenJoinBytes, BeaconWireFormat.CookieBytes)))
+            return;
+
         (bool matched, bool notFound, IPEndPoint? host, IPEndPoint? joiner) = _registry.Register(sessionId, from);
 
         if (notFound)
         {
+            /* Answered only now, behind the cookie. The reply does distinguish a live ID from a dead one, but only
+             * for a joiner that has already proven it receives at its own address and is inside the rate limit, so
+             * sweeping the 32-bit space costs a round trip per guess from an address that can be blocked. Keeping
+             * it is what lets a mistyped code fail immediately instead of hanging until the client's timeout. */
             _log?.Invoke($"[BeaconServer] session '{sessionId}' not found, notifying {from}.");
-            SendSessionNotFound(from);
+            SendSessionNotFound(from, ReadNonce(data, BeaconWireFormat.SessionIdBytes));
             return;
         }
 
@@ -206,8 +352,11 @@ public sealed class BeaconServer : IDisposable
         if (!BeaconWireFormat.TryReadSessionId(data.AsSpan(1), out uint sessionId))
             return;
 
-        _registry.Heartbeat(sessionId, from);
-        SendHeartbeatAck(from);
+        /* Acknowledged only when the refresh actually applied, which means the sender is that session's host. The
+         * registry already ignored everyone else; the acknowledgement did not, leaving the server an
+         * unauthenticated reflector that answered any address naming any number. */
+        if (_registry.Heartbeat(sessionId, from))
+            SendHeartbeatAck(from);
     }
 
     /// <summary>
@@ -276,6 +425,24 @@ public sealed class BeaconServer : IDisposable
     }
 
     /// <summary>
+    /// Sends a <see cref="BeaconPacketType.JoinChallenge"/> carrying a cookie bound to <paramref name="to"/>,
+    /// followed by the joiner's own nonce so it can tie the challenge to the join it sent.
+    /// </summary>
+    /// <param name="to">Joiner being challenged.</param>
+    /// <param name="nonce">The nonce that joiner sent, echoed back.</param>
+    private void SendJoinChallenge(IPEndPoint to, ReadOnlySpan<byte> nonce)
+    {
+        int size = 1 + BeaconWireFormat.CookieBytes + nonce.Length;
+        byte[] packet = ArrayPool<byte>.Shared.Rent(size);
+
+        packet[0] = (byte)BeaconPacketType.JoinChallenge;
+        ComputeCookie(to, DateTime.UtcNow.Ticks / CookieTimeBucketTicks, packet.AsSpan(1, BeaconWireFormat.CookieBytes));
+        nonce.CopyTo(packet.AsSpan(1 + BeaconWireFormat.CookieBytes));
+
+        _ = SendAndReturnAsync(packet, size, to);
+    }
+
+    /// <summary>
     /// Sends a <see cref="BeaconPacketType.HeartbeatAck"/> packet using the shared immutable buffer.
     /// </summary>
     private void SendHeartbeatAck(IPEndPoint to)
@@ -294,9 +461,23 @@ public sealed class BeaconServer : IDisposable
     /// <summary>
     /// Sends a <see cref="BeaconPacketType.SessionNotFound"/> packet indicating the requested session ID does not exist or has expired.
     /// </summary>
-    private void SendSessionNotFound(IPEndPoint to)
+    private void SendSessionNotFound(IPEndPoint to, ReadOnlySpan<byte> nonce)
     {
-        _ = _socket.SendAsync(SessionNotFoundPacket, SessionNotFoundPacket.Length, to);
+        if (nonce.Length == 0)
+        {
+            _ = _socket.SendAsync(SessionNotFoundPacket, SessionNotFoundPacket.Length, to);
+            return;
+        }
+
+        /* Carries the joiner's nonce back for the same reason PeerReady does: without it a rejection forged from
+         * the server's address fails every join the client has in flight, not merely the one it names. */
+        int size = 1 + nonce.Length;
+        byte[] packet = ArrayPool<byte>.Shared.Rent(size);
+
+        packet[0] = (byte)BeaconPacketType.SessionNotFound;
+        nonce.CopyTo(packet.AsSpan(1));
+
+        _ = SendAndReturnAsync(packet, size, to);
     }
 
     /// <summary>
@@ -319,5 +500,22 @@ public sealed class BeaconServer : IDisposable
     {
         _evictionTimer.Dispose();
         _socket.Dispose();
+        _cookieHmac.Dispose();
+    }
+
+    /// <summary>
+    /// Request tally for one source address inside the current rate-limit window.
+    /// </summary>
+    private sealed class RequestRate
+    {
+        /// <summary>
+        /// UTC ticks the current window began.
+        /// </summary>
+        internal long WindowStartTicks = DateTime.UtcNow.Ticks;
+
+        /// <summary>
+        /// Requests counted inside the current window.
+        /// </summary>
+        internal int Count;
     }
 }

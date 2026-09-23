@@ -20,7 +20,20 @@ is given rather than left blank.
 | **Refuted, with a test** | C2 | Windows reports `Available == 1` for a queued zero-length datagram; see "C2 was wrong" below. Still unverified on Linux |
 | **Fixed, no test** | M10, M11, M19, M20, M22, M23, M24 | M10 `RemoveExpiredProbeLimitEntries` from maintenance; M11 `Core/Clock.cs`; M19 the two HMAC instances are built once in the ingress constructor; M20 `ParkPendingReliable`; M22 `MixHandshakeNonce` folds at most `HandshakeNonceSize` bytes; M23 the sweep moved off the receive path into `RunMaintenance`; M24 the sweep is bounded by `MaximumConcurrentConnections` |
 | **Accepted risk, by design** | H8, M6, M7, M8 | Datagram attribution is source-IP only and per-packet authentication is deliberately not paid for. Stated in `IngressEngine.ProcessPacket` at the point where it bites: damage is bounded to a held connection slot, and anyone able to forge there can already inject payloads as that peer |
-| **Open, not triaged** | H11b/M21, L1, L2, L3, L4, L5, L6, L7, L8, L9, L12, L13 | Low/info-severity performance and tidiness items, plus the unauthenticated beacon join. H11's crypto-random 32-bit ID space removed the sweepable-ID half of H11b; joining with a known ID is still unauthenticated by design, since the beacon has no identity to authenticate against |
+| **Fixed, with a test** (second pass) | H11b/M21 (partly), L1 | `BeaconSecurityTests`. See the note below for what remains of H11b |
+| **Open, not triaged** | L2, L3, L4, L5, L6, L7, L8, L9, L12, L13 | Low/info-severity performance and tidiness items: a socket handle held until finalization when `Bind` throws, two dictionary lookups per datagram, a double payload copy on segmented receive, a slower comparer on the send table, pooled-list rentals for the empty case, an extra `ioctl` per receive, an unreachable keep-alive backoff range, and `Interlocked` on telemetry counters in a single-threaded engine. None is a security property |
+
+**H11b/M21, what is fixed and what is not.** The reflection vector is closed: a `JoinSession` is answered
+with an address-bound cookie and nothing else until that cookie comes back, so a forged join can no longer
+make a host aim a hole-punch burst at a third party. The heartbeat reflector is closed, and the server now
+rate-limits per source address. What remains is that a joiner who *does* learn a valid session ID still
+receives the host's endpoint: the ID is the only credential. Closing that needs a host-issued join secret
+carried alongside the ID, which lengthens the shared room code and is therefore a product decision rather
+than a fix.
+
+**L1** was closed as a side effect of H5's per-poll receive budget, which is what its own suggested fix called
+for. The secondary half, disabling `SIO_UDP_CONNRESET` on Windows so ICMP-induced errors never reach the
+receive path, is not done.
 
 Why some fixes carry no test: M11 needs the system clock stepped underneath a running engine; M20 needs the 16-bit
 sequence space to wrap with an entry still unacknowledged; M19, M23 and M24 are allocation and cost properties

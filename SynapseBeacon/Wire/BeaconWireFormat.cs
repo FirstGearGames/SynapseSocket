@@ -32,6 +32,27 @@ public static class BeaconWireFormat
     public const int NonceBytes = 8;
 
     /// <summary>
+    /// Bytes of the return-routability cookie the server issues in a <see cref="BeaconPacketType.JoinChallenge"/>
+    /// and requires back on the join that follows.
+    /// <para>
+    /// The cookie is a truncated keyed MAC over the joiner's own address, so only a joiner that genuinely receives
+    /// at the address it claimed can present one. That is what stops a forged join from pointing a host's
+    /// hole-punch burst at a third party, and it costs the server no per-joiner state to check.
+    /// </para>
+    /// </summary>
+    public const int CookieBytes = 8;
+
+    /// <summary>
+    /// Wire size of a first-hand <see cref="BeaconPacketType.JoinSession"/>: type, session ID and nonce.
+    /// </summary>
+    public const int UnprovenJoinBytes = 1 + SessionIdBytes + NonceBytes;
+
+    /// <summary>
+    /// Wire size of a <see cref="BeaconPacketType.JoinSession"/> carrying a cookie back.
+    /// </summary>
+    public const int ProvenJoinBytes = UnprovenJoinBytes + CookieBytes;
+
+    /// <summary>
     /// Writes a type byte followed by a 4-byte big-endian session ID into <paramref name="destination"/>.
     /// Returns the total number of bytes written.
     /// </summary>
