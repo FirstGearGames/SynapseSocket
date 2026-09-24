@@ -39,6 +39,22 @@ public sealed partial class SynapseManager : IDisposable
     /// </summary>
     public event ConnectionClosedHandler? ConnectionClosed;
     /// <summary>
+    /// Raised once a closed connection's pooled buffers have been released, which is the point to drop every
+    /// reference kept to it. After this the connection is dead, unless the peer reconnected from the same endpoint,
+    /// in which case the same object goes on to carry the new session and <see cref="ConnectionEstablished"/> follows.
+    /// <para>
+    /// Normally raised at the end of the <see cref="Poll"/> that closed the connection, after <see cref="ConnectionClosed"/>.
+    /// A reconnect raises it straight after <see cref="ConnectionClosed"/>. <see cref="Stop"/> and <see cref="Dispose"/>
+    /// raise it for every connection still open, without raising <see cref="ConnectionClosed"/> first.
+    /// </para>
+    /// </summary>
+    public event ConnectionReleasedHandler? ConnectionReleased;
+    /// <summary>
+    /// Handler for the <see cref="ConnectionReleased"/> event.
+    /// </summary>
+    /// <param name="connectionEventArgs">Details about the released connection.</param>
+    public delegate void ConnectionReleasedHandler(ConnectionEventArgs connectionEventArgs);
+    /// <summary>
     /// Raised on any binding, signature, or validation failure.
     /// </summary>
     public event ConnectionFailedHandler? ConnectionFailed;
@@ -821,7 +837,8 @@ public sealed partial class SynapseManager : IDisposable
     }
 
     /// <summary>
-    /// Ingress callback: raises <see cref="ConnectionClosed"/> via a pooled <see cref="ConnectionEventArgs"/>.
+    /// Ingress callback for a peer reconnecting from the same endpoint: raises <see cref="ConnectionClosed"/> for the
+    /// replaced session, then <see cref="ConnectionReleased"/>, because the reconnect has already released its buffers.
     /// </summary>
     private void OnConnectionClosedInternal(SynapseConnection synapseConnection)
     {
@@ -832,6 +849,10 @@ public sealed partial class SynapseManager : IDisposable
             ConnectionClosed?.Invoke(connectionEventArgs);
         }
         catch { }
+
+        // A handler that disconnected the connection above has queued it for release instead, and that release raises the event.
+        if (!synapseConnection.IsTornDown)
+            RaiseConnectionReleased(synapseConnection);
     }
 
     /// <summary>
@@ -858,6 +879,20 @@ public sealed partial class SynapseManager : IDisposable
         try
         {
             ConnectionClosed?.Invoke(connectionEventArgs);
+        }
+        catch { }
+    }
+
+    /// <summary>
+    /// Raises <see cref="ConnectionReleased"/>.
+    /// </summary>
+    private void RaiseConnectionReleased(SynapseConnection synapseConnection)
+    {
+        ConnectionEventArgs connectionEventArgs = new(synapseConnection);
+
+        try
+        {
+            ConnectionReleased?.Invoke(connectionEventArgs);
         }
         catch { }
     }
@@ -944,8 +979,9 @@ public sealed partial class SynapseManager : IDisposable
     }
 
     /// <summary>
-    /// Releases the pooled buffers of every connection queued by <see cref="TeardownConnection"/>. Called at the end of
-    /// <see cref="Poll"/>, once no engine frame can still be holding one, and again on shutdown.
+    /// Releases the pooled buffers of every connection queued by <see cref="TeardownConnection"/> and raises
+    /// <see cref="ConnectionReleased"/> for each. Called at the end of <see cref="Poll"/>, once no engine frame can
+    /// still be holding one, and again on shutdown.
     /// </summary>
     /// <remarks>
     /// The connection object itself is deliberately <b>not</b> returned to its pool; it is left torn down, with its
@@ -955,16 +991,22 @@ public sealed partial class SynapseManager : IDisposable
     /// holding the old reference, as Nucleus's relay link did, would then send to or disconnect an unrelated peer.
     /// Recycling saved one allocation per connection, not per packet, which is not worth that. See F16 in
     /// <c>docs/ROBUSTNESS_SWEEP.md</c>.
+    /// <para>
+    /// Each connection leaves the queue before its event is raised, so a handler that polls, stops or disconnects
+    /// re-entrantly can neither release one twice nor raise its event twice.
+    /// </para>
     /// </remarks>
     private void ReleaseTornDownConnections()
     {
-        if (_pendingReleases.Count == 0)
-            return;
+        // Taken from the front so the events arrive in the order the connections closed.
+        while (_pendingReleases.Count > 0)
+        {
+            SynapseConnection synapseConnection = _pendingReleases[0];
+            _pendingReleases.RemoveAt(0);
 
-        for (int i = 0; i < _pendingReleases.Count; i++)
-            _pendingReleases[i].ReleasePooledResources();
-
-        _pendingReleases.Clear();
+            synapseConnection.ReleasePooledResources();
+            RaiseConnectionReleased(synapseConnection);
+        }
     }
 
 

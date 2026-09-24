@@ -1129,6 +1129,11 @@ internal sealed partial class IngressEngine
             // and a clean reorder buffer, then fall through to normal connection initialisation.
             synapseConnection.ResetForReconnect();
             ConnectionClosed?.Invoke(synapseConnection);
+
+            /* A ConnectionClosed handler that disconnected this connection has torn it down and removed it from the
+             * tables. Establishing the new session on it would hand the application a dead, untabled connection. */
+            if (synapseConnection.IsTornDown)
+                return;
         }
 
         if (!isExistingConnection || synapseConnection.State != ConnectionState.Connected)
