@@ -65,6 +65,10 @@ internal sealed partial class IngressEngine
     /// </summary>
     internal bool IsRunning { get; private set; }
     /// <summary>
+    /// True while the receive buffer is rented from the pool. Diagnostic surface.
+    /// </summary>
+    internal bool IsReceiveBufferRented => _receiveBuffer is not null;
+    /// <summary>
     /// The UDP socket this engine receives from.
     /// </summary>
     private readonly Socket _socket;
@@ -257,6 +261,11 @@ internal sealed partial class IngressEngine
     /// </remarks>
     private byte[]? _transformBuffer;
     /// <summary>
+    /// True while <see cref="Drain"/> is reading from the pooled buffers, so a <see cref="Stop"/> raised by a handler
+    /// defers releasing them until the drain unwinds.
+    /// </summary>
+    private bool _isDraining;
+    /// <summary>
     /// Caller-owned sockaddr the native receive fills per datagram, reused for the engine's lifetime. Replaces the
     /// SocketAddress, IPEndPoint and IPAddress that the managed any-sender receive creates every time.
     /// </summary>
@@ -328,10 +337,77 @@ internal sealed partial class IngressEngine
     /// <summary>
     /// Marks the engine stopped and returns the receive buffer to the pool.
     /// </summary>
+    /// <remarks>
+    /// A handler raised from inside <see cref="Drain"/> can stop the manager while a datagram is still being read out
+    /// of the pooled buffers further up the stack. In that case only the running flag is cleared here, and the buffers
+    /// and HMACs are released once the drain unwinds.
+    /// </remarks>
     public void Stop()
     {
         IsRunning = false;
 
+        if (_isDraining)
+            return;
+
+        ReleaseResources();
+    }
+
+    /// <summary>
+    /// Drains every datagram currently buffered on the socket, running lowest-level filters and dispatching each
+    /// to the packet handlers inline. Called once per engine poll on the host's thread; returns when the socket
+    /// has nothing more to read. The kernel receive buffer (SO_RCVBUF) bounds how much can accumulate between polls.
+    /// </summary>
+    /// <param name="nowTicks">
+    /// The tick this poll started at, reused for every datagram in the batch rather than re-read per datagram.
+    /// <see cref="Clock.Ticks"/> is a QPC/vDSO call at roughly 20-30ns, an order of magnitude above anything else
+    /// on this path, and a drain completes in microseconds, so per-datagram precision buys nothing against a 15s
+    /// timeout or a 250ms resend interval.
+    /// </param>
+    public void Drain(long nowTicks)
+    {
+        _isDraining = true;
+
+        try
+        {
+            DrainCore(nowTicks);
+        }
+        finally
+        {
+            _isDraining = false;
+
+            // A handler stopped the engine mid-drain, so the release Stop deferred happens now that nothing reads the buffers.
+            if (!IsRunning)
+                ReleaseResources();
+        }
+    }
+
+
+    /// <summary>
+    /// Periodic upkeep for this engine, driven from <see cref="SynapseManager.Poll"/>.
+    /// Runs the replay-cache and NAT probe-table sweeps here rather than from the receive path: both are O(n) scans
+    /// over tables an attacker sizes, and running them inline meant the pause landed on a timer the attacker chose.
+    /// </summary>
+    /// <param name="nowTicks">Current time in <see cref="DateTime.Ticks"/>.</param>
+    internal void RunMaintenance(long nowTicks)
+    {
+        if (nowTicks - _lastHandshakeEvictionTicks > TimeSpan.TicksPerSecond)
+        {
+            _lastHandshakeEvictionTicks = nowTicks;
+            RemoveExpiredHandshakeEntries(nowTicks, ReplayCacheEntryLifetimeTicks);
+        }
+
+        if (_isNatEnabled && nowTicks - _lastProbeEvictionTicks > TimeSpan.TicksPerSecond)
+        {
+            _lastProbeEvictionTicks = nowTicks;
+            RemoveExpiredProbeLimitEntries(nowTicks, _config.NatTraversal.IntervalMilliseconds * TimeSpan.TicksPerMillisecond * 10);
+        }
+    }
+
+    /// <summary>
+    /// Returns the pooled buffers and disposes the challenge HMACs. Safe to call more than once.
+    /// </summary>
+    private void ReleaseResources()
+    {
         if (_receiveBuffer is not null)
         {
             ArrayPool<byte>.Shared.Return(_receiveBuffer, clearArray: false);
@@ -350,17 +426,10 @@ internal sealed partial class IngressEngine
     }
 
     /// <summary>
-    /// Drains every datagram currently buffered on the socket, running lowest-level filters and dispatching each
-    /// to the packet handlers inline. Called once per engine poll on the host's thread; returns when the socket
-    /// has nothing more to read. The kernel receive buffer (SO_RCVBUF) bounds how much can accumulate between polls.
+    /// Receives and dispatches datagrams for <see cref="Drain"/>, which owns the deferred release around it.
     /// </summary>
-    /// <param name="nowTicks">
-    /// The tick this poll started at, reused for every datagram in the batch rather than re-read per datagram.
-    /// <see cref="Clock.Ticks"/> is a QPC/vDSO call at roughly 20-30ns, an order of magnitude above anything else
-    /// on this path, and a drain completes in microseconds, so per-datagram precision buys nothing against a 15s
-    /// timeout or a 250ms resend interval.
-    /// </param>
-    public void Drain(long nowTicks)
+    /// <param name="nowTicks">The tick this poll started at.</param>
+    private void DrainCore(long nowTicks)
     {
         if (_receiveBuffer is null)
             return;
@@ -368,6 +437,10 @@ internal sealed partial class IngressEngine
         uint receivesThisPoll = 0;
         while (true)
         {
+            // A handler stopped the engine, so nothing more is read from the buffers it is about to release.
+            if (!IsRunning)
+                break;
+
             /* Bounded work per poll. Without this the loop runs until the socket is empty, so traffic arriving
              * faster than the engine processes it keeps the loop fed and Poll never returns. The host frame loop
              * stalls for the duration of the flood. Counting every iteration rather than every successful receive
@@ -498,27 +571,6 @@ internal sealed partial class IngressEngine
                 // A single bad packet must not stop the drain.
                 UnhandledException?.Invoke(unexpectedException);
             }
-        }
-    }
-
-    /// <summary>
-    /// Periodic upkeep for this engine, driven from <see cref="SynapseManager.Poll"/>.
-    /// Runs the replay-cache and NAT probe-table sweeps here rather than from the receive path: both are O(n) scans
-    /// over tables an attacker sizes, and running them inline meant the pause landed on a timer the attacker chose.
-    /// </summary>
-    /// <param name="nowTicks">Current time in <see cref="DateTime.Ticks"/>.</param>
-    internal void RunMaintenance(long nowTicks)
-    {
-        if (nowTicks - _lastHandshakeEvictionTicks > TimeSpan.TicksPerSecond)
-        {
-            _lastHandshakeEvictionTicks = nowTicks;
-            RemoveExpiredHandshakeEntries(nowTicks, ReplayCacheEntryLifetimeTicks);
-        }
-
-        if (_isNatEnabled && nowTicks - _lastProbeEvictionTicks > TimeSpan.TicksPerSecond)
-        {
-            _lastProbeEvictionTicks = nowTicks;
-            RemoveExpiredProbeLimitEntries(nowTicks, _config.NatTraversal.IntervalMilliseconds * TimeSpan.TicksPerMillisecond * 10);
         }
     }
 

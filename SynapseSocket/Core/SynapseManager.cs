@@ -187,6 +187,11 @@ public sealed partial class SynapseManager : IDisposable
     private readonly System.Collections.Concurrent.ConcurrentQueue<QueuedRawSend> _queuedRawSends = new();
 
     /// <summary>
+    /// The ingress engines, one per socket. Diagnostic surface.
+    /// </summary>
+    internal IReadOnlyList<IngressEngine> IngressEngines => _ingressEngines;
+
+    /// <summary>
     /// Ceiling on handshake replay-cache entries per ingress engine. The key mixes the peer-supplied nonce, so
     /// without a cap a single peer mints one entry per handshake it sends.
     /// </summary>
@@ -378,6 +383,10 @@ public sealed partial class SynapseManager : IDisposable
         // 1. Receive: drain each socket, processing and delivering inline on this thread.
         for (int i = 0; i < _ingressEngines.Count; i++)
             _ingressEngines[i].Drain(nowTicks);
+
+        // A handler raised during the drain may have stopped or disposed this manager, leaving nothing to maintain.
+        if (!_isStarted || _isDisposed)
+            return;
 
         // 1b. Per-engine upkeep: replay-cache and NAT probe-table sweeps, moved off the receive path.
         for (int i = 0; i < _ingressEngines.Count; i++)

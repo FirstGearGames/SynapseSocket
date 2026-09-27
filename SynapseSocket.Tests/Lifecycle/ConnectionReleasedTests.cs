@@ -7,6 +7,7 @@ using Xunit;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
 using SynapseSocket.Packets;
+using SynapseSocket.Transport;
 
 namespace SynapseSocket.Tests.Lifecycle;
 
@@ -202,6 +203,58 @@ public class ConnectionReleasedTests
         Assert.Equal(ConnectionState.Disconnected, serverConnection.State);
         Assert.DoesNotContain(serverConnection, server.Connections.Connections);
         Assert.True(serverEventLog.IsAllFor(serverConnection), "An event carried a different connection.");
+    }
+
+    /// <summary>
+    /// A client whose <see cref="SynapseManager.ConnectionClosed"/> handler stops or disposes its own manager, raised
+    /// from inside the drain by the server's disconnect, shuts down without any exception reaching the engine, even
+    /// though the drain is still reading the receive buffer the shutdown would otherwise return to the pool.
+    /// </summary>
+    /// <param name="isDisposing">True to dispose the client from the handler, false to stop it.</param>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Stop_Inside_Closed_Handler_During_Drain_Stops_Cleanly(bool isDisposing)
+    {
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port));
+        using SynapseManager client = new(TestHarness.ClientConfig());
+
+        List<Exception> clientExceptions = [];
+        client.UnhandledException += exception => clientExceptions.Add(exception);
+
+        server.Start();
+        client.Start();
+
+        SynapseConnection clientConnection = client.Connect(new(IPAddress.Loopback, port));
+        Assert.True(TestHarness.PumpUntil(() => server.Connections.Count == 1 && clientConnection.State is ConnectionState.Connected, WaitMilliseconds, server, client), "The handshake did not complete.");
+
+        // The manager drops its engines on shutdown, so the engine is held here to inspect it afterwards.
+        IngressEngine clientEngine = client.IngressEngines[0];
+        bool isClosedRaised = false;
+        bool isBufferRentedAfterStop = false;
+        client.ConnectionClosed += _ =>
+        {
+            isClosedRaised = true;
+
+            if (isDisposing)
+                client.Dispose();
+            else
+                client.Stop();
+
+            // The drain further up the stack is still reading this buffer, so it must not be back in the pool yet.
+            isBufferRentedAfterStop = clientEngine.IsReceiveBufferRented;
+        };
+
+        server.Disconnect(server.Connections.Connections[0]);
+        Assert.True(TestHarness.PumpUntil(() => isClosedRaised, WaitMilliseconds, server, client), "The client never saw the disconnect.");
+        TestHarness.PumpFor(100, server, client);
+
+        Assert.Empty(clientExceptions);
+        Assert.False(client.IsRunning);
+        Assert.True(isBufferRentedAfterStop, "Stop returned the receive buffer while the drain was still reading it.");
+        Assert.False(clientEngine.IsRunning);
+        Assert.False(clientEngine.IsReceiveBufferRented, "The receive buffer was never returned once the drain unwound.");
     }
 
     /// <summary>
