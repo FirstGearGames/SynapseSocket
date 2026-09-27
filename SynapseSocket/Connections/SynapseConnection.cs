@@ -382,6 +382,20 @@ public sealed partial class SynapseConnection : IPoolResettable
         public bool IsSegmentAcked(int index) => (AckedSegments[index >> 3] & (1 << (index & 7))) != 0;
 
         /// <summary>
+        /// True when the peer has confirmed at least one segment of this message.
+        /// </summary>
+        public bool IsAnySegmentAcked()
+        {
+            for (int i = 0; i < AckedSegments.Length; i++)
+            {
+                if (AckedSegments[i] != 0)
+                    return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
         /// Marks confirmed segments from a peer bitmap.
         /// </summary>
         /// <returns>True when every segment is now confirmed.</returns>

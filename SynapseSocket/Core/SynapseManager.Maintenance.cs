@@ -315,6 +315,15 @@ public sealed partial class SynapseManager
                 /* Only what the peer has not confirmed. A segmented message shares one sequence, so before
                  * selective acknowledgement a single lost segment resent the entire message, up to 255
                  * datagrams, every resend interval, for one missing one. */
+                if (pendingReliable.SegmentCount > 1 && !pendingReliable.IsAnySegmentAcked())
+                {
+                    /* No report has arrived, which is what happens when the last segment itself was lost, since its
+                     * arrival is what makes the peer report. Resend only the last segment as a probe: the peer answers
+                     * it with what it holds, and the next sweep repairs just the gap instead of every segment. */
+                    _transmissionEngine.SendRaw(segments[segments.Count - 1], synapseConnection.RemoteEndPoint);
+                    continue;
+                }
+
                 for (int i = 0; i < segments.Count; i++)
                 {
                     if (pendingReliable.SegmentCount > 1 && pendingReliable.IsSegmentAcked(i))
