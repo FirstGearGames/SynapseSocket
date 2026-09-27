@@ -155,8 +155,8 @@ public sealed partial class SynapseConnection : IPoolResettable
     /// <summary>
     /// True once this connection has been torn down. Set before <c>ConnectionClosed</c> is raised, so a handler that
     /// disconnects the same connection re-entrantly cannot tear it down, raise the event, or queue its release twice.
-    /// It is never cleared while pooling is disabled, which is what makes a stale reference inert: <c>Send</c> refuses
-    /// a torn-down connection and <c>Disconnect</c> ignores one.
+    /// It holds until the object goes back to the pool after <c>ConnectionReleased</c>, so until then <c>Send</c>
+    /// refuses the connection and <c>Disconnect</c> ignores it. <see cref="OnReturn"/> clears it for the next session.
     /// </summary>
     [PoolResettableMember]
     internal bool IsTornDown;
@@ -274,12 +274,9 @@ public sealed partial class SynapseConnection : IPoolResettable
 
     /// <inheritdoc/>
     /// <remarks>
-    /// <b>Not currently called: connection pooling is disabled.</b> A torn-down connection is released with
-    /// <see cref="ReleasePooledResources"/> and then left alone rather than returned, because <c>Connect</c> and every
-    /// connection event hand the raw object to the application, and an application that kept one past close would be
-    /// holding a recycled object that the pool, which is shared by every <c>SynapseManager</c> in the process, may
-    /// already have handed to a different peer. Kept intact so pooling can be switched back on once every consumer is
-    /// known to drop its references on close.
+    /// Called by <c>SynapseManager.ReleaseTornDownConnections</c> straight after <c>ConnectionReleased</c>, once the
+    /// connection is out of every lookup table. Resets every member, identity included, so the next renter on this
+    /// thread, from any <c>SynapseManager</c>, starts from the same state as a newly constructed connection.
     /// </remarks>
     public void OnReturn()
     {

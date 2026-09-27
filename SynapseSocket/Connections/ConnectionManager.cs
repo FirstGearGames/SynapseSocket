@@ -2,6 +2,7 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
+using CodeBoost.Performance;
 using SynapseSocket.Core;
 using SynapseSocket.Core.Events;
 
@@ -68,8 +69,9 @@ public sealed class ConnectionManager
 
         if (!isFound)
         {
-            // Allocated, not rented: connection objects are never pooled. See SynapseManager.ReleaseTornDownConnections.
-            synapseConnection = new();
+            /* Rented: the object may have carried an earlier session, from this manager or any other on this thread. It
+             * went back to the pool only after that session's ConnectionReleased, and OnReturn left it fully reset. */
+            synapseConnection = ResettableObjectPool<SynapseConnection>.Rent();
 
             int connectionsIndex = _connections.Count;
             synapseConnection.Initialize(endPoint, signature, connectionsIndex);
@@ -81,14 +83,17 @@ public sealed class ConnectionManager
             _connectionsByAddressKey[Transport.NativeSocket.ComputeAddressKey(endPoint)] = synapseConnection!;
 #endif
             _connections.Add(synapseConnection);
-        }
 
-        if (!_connectionsBySignature.TryAdd(signature, synapseConnection!))
-        {
-            // Two distinct endpoints produced the same 64-bit signature.
-            // Overwrite so reverse lookup stays current, but surface the collision.
-            _connectionsBySignature[signature] = synapseConnection!;
-            SignatureCollisionDetected?.Invoke(signature);
+            /* Keyed only here, under the signature Initialize just stored, so a connection has exactly the one key that
+             * the removals clear. A found connection is already keyed. The signature computed from a later handshake can
+             * differ when the provider mixes in the payload, and a second key would outlive the connection's release. */
+            if (!_connectionsBySignature.TryAdd(signature, synapseConnection))
+            {
+                // Two distinct endpoints produced the same 64-bit signature.
+                // Overwrite so reverse lookup stays current, but surface the collision.
+                _connectionsBySignature[signature] = synapseConnection;
+                SignatureCollisionDetected?.Invoke(signature);
+            }
         }
 
         return synapseConnection!;
@@ -112,12 +117,11 @@ public sealed class ConnectionManager
             _connectionsByAddressKey.Remove(Transport.NativeSocket.ComputeAddressKey(endPoint));
 #endif
             RemoveFromConnections(old);
-
-            _connectionsBySignature.TryRemove(old.Signature, out _);
+            RemoveSignature(old);
         }
 
-        // Allocated, not rented: connection objects are never pooled. See SynapseManager.ReleaseTornDownConnections.
-        SynapseConnection synapseConnection = new();
+        // Rented, as in GetOrAdd. SynapseManager.ReleaseTornDownConnections is where it goes back.
+        SynapseConnection synapseConnection = ResettableObjectPool<SynapseConnection>.Rent();
         int connectionsIndex = _connections.Count;
         synapseConnection.Initialize(endPoint, signature, connectionsIndex);
 
@@ -152,8 +156,7 @@ public sealed class ConnectionManager
 #else
             _connectionsByAddressKey.Remove(Transport.NativeSocket.ComputeAddressKey(endPoint));
 #endif
-            _connectionsBySignature.TryRemove(removedSynapseConnection.Signature, out _);
-
+            RemoveSignature(removedSynapseConnection);
             RemoveFromConnections(removedSynapseConnection);
         }
 
@@ -161,8 +164,8 @@ public sealed class ConnectionManager
     }
 
     /// <summary>
-    /// Removes all connections from every lookup table. Called on engine shutdown after the connections' pooled
-    /// buffers have been reclaimed.
+    /// Removes all connections from every lookup table. Called on engine shutdown once every connection has been marked
+    /// torn down, and before their buffers are released and the objects go back to the pool.
     /// </summary>
     public void Clear()
     {
@@ -185,6 +188,19 @@ public sealed class ConnectionManager
     /// <returns>True when a connection is registered for the address.</returns>
     public bool TryGetBySocketAddress(SocketAddress socketAddress, out SynapseConnection? synapseConnection) => _connectionsBySocketAddress.TryGetValue(socketAddress, out synapseConnection);
 #endif
+
+    /// <summary>
+    /// Removes the signature entry for <paramref name="synapseConnection"/>, but only while it still points at that
+    /// connection. After a collision the entry belongs to the newer connection, and removing it by key alone would
+    /// drop that live connection's entry instead.
+    /// </summary>
+    /// <param name="synapseConnection">The connection whose signature entry to remove.</param>
+    private void RemoveSignature(SynapseConnection synapseConnection)
+    {
+        // The collection interface's Remove matches the value too, and SynapseConnection compares by reference.
+        ICollection<KeyValuePair<ulong, SynapseConnection>> signatureEntries = _connectionsBySignature;
+        signatureEntries.Remove(new(synapseConnection.Signature, synapseConnection));
+    }
 
     /// <summary>
     /// Unlinks a connection from the dense connections list with a swap-remove, keeping every surviving entry's <see cref="SynapseConnection.ConnectionsIndex"/> equal to its own slot and clearing the removed connection's.

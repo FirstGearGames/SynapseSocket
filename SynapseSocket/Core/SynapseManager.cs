@@ -39,13 +39,18 @@ public sealed partial class SynapseManager : IDisposable
     /// </summary>
     public event ConnectionClosedHandler? ConnectionClosed;
     /// <summary>
-    /// Raised once a closed connection's pooled buffers have been released, which is the point to drop every
-    /// reference kept to it. After this the connection is dead, unless the peer reconnected from the same endpoint,
-    /// in which case the same object goes on to carry the new session and <see cref="ConnectionEstablished"/> follows.
+    /// Raised once a closed connection's pooled buffers have been released, which is the last point to drop every
+    /// reference kept to it. Once the handlers return, the object goes back to a pool shared by every
+    /// <see cref="SynapseManager"/> on this thread, and may be handed to a new session, for any peer, by the next
+    /// <see cref="Connect"/> or inbound handshake. A reference kept past this event may therefore point at somebody
+    /// else's session. When the peer reconnected from the same endpoint, the same object instead goes straight on to
+    /// carry the new session and <see cref="ConnectionEstablished"/> follows.
     /// <para>
     /// Normally raised at the end of the <see cref="Poll"/> that closed the connection, after <see cref="ConnectionClosed"/>.
     /// A reconnect raises it straight after <see cref="ConnectionClosed"/>. <see cref="Stop"/> and <see cref="Dispose"/>
-    /// raise it for every connection still open, without raising <see cref="ConnectionClosed"/> first.
+    /// raise it for every connection still open, without raising <see cref="ConnectionClosed"/> first. When a handler
+    /// calls <see cref="Stop"/> or <see cref="Dispose"/> during a <see cref="Poll"/>, those events arrive as that poll
+    /// returns rather than inside the call.
     /// </para>
     /// </summary>
     public event ConnectionReleasedHandler? ConnectionReleased;
@@ -176,10 +181,19 @@ public sealed partial class SynapseManager : IDisposable
     /// </summary>
     private TransmissionEngine? _transmissionEngine;
     /// <summary>
-    /// Connections torn down since the last release, awaiting the release of their pooled buffers once no engine frame
-    /// can still be holding them. Drained at the end of every poll.
+    /// Connections torn down since the last release, awaiting the release of their pooled buffers and their own return
+    /// to the pool once no engine frame can still be holding them. Drained at the end of every poll.
     /// </summary>
     private readonly List<SynapseConnection> _pendingReleases = [];
+    /// <summary>
+    /// The number of <see cref="Poll"/> calls running on the stack, counting one that a handler makes re-entrantly.
+    /// </summary>
+    /// <remarks>
+    /// While it is above zero an engine frame may still hold a connection in a local, so every release waits for the
+    /// outermost poll to end. That includes the releases a <see cref="Stop"/> or <see cref="Dispose"/> called from
+    /// inside a handler would otherwise perform on the spot.
+    /// </remarks>
+    private int _pollDepth;
     /// <summary>
     /// Raw sends queued from other threads by <see cref="EnqueueRaw"/>, drained on the engine thread during
     /// <see cref="Poll"/>.
@@ -379,38 +393,48 @@ public sealed partial class SynapseManager : IDisposable
             return;
 
         long nowTicks = Clock.Ticks;
+        _pollDepth++;
 
-        // 1. Receive: drain each socket, processing and delivering inline on this thread.
-        for (int i = 0; i < _ingressEngines.Count; i++)
-            _ingressEngines[i].Drain(nowTicks);
+        try
+        {
+            // 1. Receive: drain each socket, processing and delivering inline on this thread.
+            for (int i = 0; i < _ingressEngines.Count; i++)
+                _ingressEngines[i].Drain(nowTicks);
 
-        // A handler raised during the drain may have stopped or disposed this manager, leaving nothing to maintain.
-        if (!_isStarted || _isDisposed)
-            return;
+            // A handler raised during the drain may have stopped or disposed this manager, leaving nothing to maintain.
+            if (!_isStarted || _isDisposed)
+                return;
 
-        // 1b. Per-engine upkeep: replay-cache and NAT probe-table sweeps, moved off the receive path.
-        for (int i = 0; i < _ingressEngines.Count; i++)
-            _ingressEngines[i].RunMaintenance(nowTicks);
+            // 1b. Per-engine upkeep: replay-cache and NAT probe-table sweeps, moved off the receive path.
+            for (int i = 0; i < _ingressEngines.Count; i++)
+                _ingressEngines[i].RunMaintenance(nowTicks);
 
-        // 2. Advance NAT hole-punch state machines for any pending FullCone connects.
-        AdvanceNatPunches(nowTicks);
+            // 2. Advance NAT hole-punch state machines for any pending FullCone connects.
+            AdvanceNatPunches(nowTicks);
 
-        // 3. Maintenance: keep-alive, timeout, reliable retransmit, segment-assembly timeout, rate-counter reset.
-        RunMaintenance(nowTicks);
+            // 3. Maintenance: keep-alive, timeout, reliable retransmit, segment-assembly timeout, rate-counter reset.
+            RunMaintenance(nowTicks);
 
-        // 4. Flush batched outbound ACKs.
-        if (_isAckBatchingEnabled)
-            FlushPendingAcks();
+            // 4. Flush batched outbound ACKs.
+            if (_isAckBatchingEnabled)
+                FlushPendingAcks();
 
-        // 4b. Send anything handed over from other threads, on this thread.
-        FlushQueuedRawSends();
+            // 4b. Send anything handed over from other threads, on this thread.
+            FlushQueuedRawSends();
 
-        // 5. Release any latency-simulator-delayed packets whose due time has elapsed.
-        _transmissionEngine.FlushDeferredSends(nowTicks);
+            // 5. Release any latency-simulator-delayed packets whose due time has elapsed.
+            _transmissionEngine.FlushDeferredSends(nowTicks);
+        }
+        finally
+        {
+            _pollDepth--;
 
-        // 6. Release the buffers of connections torn down since the last poll. Deferred to here so that no engine frame,
-        //    including a user handler that disconnected re-entrantly from inside PacketReceived, is still using them.
-        ReleaseTornDownConnections();
+            // 6. Release the buffers of connections torn down since the last poll. Deferred to the end of the outermost
+            //    poll so that no engine frame is still using them, including the frames beneath a user handler that
+            //    disconnected, stopped or disposed re-entrantly.
+            if (_pollDepth == 0)
+                ReleaseTornDownConnections();
+        }
     }
 
     /// <summary>
@@ -430,6 +454,8 @@ public sealed partial class SynapseManager : IDisposable
     /// Initiates an outgoing connection to the specified remote endpoint.
     /// Sends a handshake packet; the connection is considered established when the remote handshake response arrives
     /// (observed on a subsequent <see cref="Poll"/>).
+    /// An existing connection to the same endpoint is torn down first. When a <see cref="ConnectionClosed"/> handler
+    /// for it connects to that endpoint again, the connection it made is the one returned here as well.
     /// </summary>
     public SynapseConnection Connect(IPEndPoint endPoint)
     {
@@ -448,7 +474,18 @@ public sealed partial class SynapseManager : IDisposable
 
         // Tear the previous session down through the one teardown path rather than letting CreateNew drop it.
         if (Connections.ConnectionsByEndPoint.TryGetValue(endPoint, out SynapseConnection? previousConnection))
+        {
             TeardownConnection(previousConnection);
+
+            // A ConnectionClosed handler that stopped or disposed the engine must not be followed by a new session in its dead tables.
+            EnsureRunning();
+
+            /* A ConnectionClosed handler that connected to this endpoint again has already made the new session. That one is
+             * returned rather than replaced, because replacing it would drop it from the tables without a teardown: no
+             * ConnectionClosed or ConnectionReleased would ever reach whoever holds it, and it would never go back to its pool. */
+            if (Connections.ConnectionsByEndPoint.TryGetValue(endPoint, out SynapseConnection? reconnectedConnection))
+                return reconnectedConnection;
+        }
 
         SynapseConnection synapseConnection = Connections.CreateNew(endPoint, signature);
 
@@ -476,8 +513,8 @@ public sealed partial class SynapseManager : IDisposable
     {
         EnsureRunning();
 
-        /* A closed connection is never reused, so a reference to one can only be stale. Sending on it would park
-         * reliable buffers on a dead object and put datagrams on the wire for a session that no longer exists. */
+        /* Closed but not yet released: the session is over. Sending on it would park reliable buffers on a dead session
+         * and put datagrams on the wire for a peer that no longer has one. */
         if (synapseConnection.IsTornDown)
             throw new InvalidOperationException("Cannot send on a connection that has been closed.");
 
@@ -654,14 +691,20 @@ public sealed partial class SynapseManager : IDisposable
 
         _transmissionEngine?.ClearDeferredSends();
 
-        TeardownAllConnections();
+        // Cleared before the teardown raises ConnectionReleased, so no punch still points at a released connection.
+        // A punch that a ConnectionReleased handler registers by restarting the engine and connecting again survives.
         _natPunches.Clear();
+        TeardownAllConnections();
     }
 
     /// <summary>
     /// Frees every live connection's pooled buffers (reliable queue, reorder buffer, segmenters) and clears the
     /// connection tables. Safe because the engine is single-threaded and stopped.
     /// </summary>
+    /// <remarks>
+    /// When a handler stops or disposes the engine from inside a <see cref="Poll"/>, the release waits for that poll to
+    /// end, because the frames beneath the handler can still hold these connections in locals.
+    /// </remarks>
     private void TeardownAllConnections()
     {
         IReadOnlyList<SynapseConnection> connections = Connections.Connections;
@@ -680,7 +723,9 @@ public sealed partial class SynapseManager : IDisposable
         }
 
         Connections.Clear();
-        ReleaseTornDownConnections();
+
+        if (_pollDepth == 0)
+            ReleaseTornDownConnections();
     }
 
     /// <summary>
@@ -848,6 +893,7 @@ public sealed partial class SynapseManager : IDisposable
     /// <summary>
     /// Ingress callback for a peer reconnecting from the same endpoint: raises <see cref="ConnectionClosed"/> for the
     /// replaced session, then <see cref="ConnectionReleased"/>, because the reconnect has already released its buffers.
+    /// The object is not returned to the pool, because it goes on to carry the new session.
     /// </summary>
     private void OnConnectionClosedInternal(SynapseConnection synapseConnection)
     {
@@ -859,7 +905,7 @@ public sealed partial class SynapseManager : IDisposable
         }
         catch { }
 
-        // A handler that disconnected the connection above has queued it for release instead, and that release raises the event.
+        // A handler that disconnected the connection, or stopped the engine, above has queued it for release instead, and that release raises the event.
         if (!synapseConnection.IsTornDown)
             RaiseConnectionReleased(synapseConnection);
     }
@@ -948,7 +994,8 @@ public sealed partial class SynapseManager : IDisposable
     /// what stops a handler that disconnects the same connection re-entrantly from raising <c>ConnectionClosed</c> a
     /// second time and queueing a second release. The release runs at the end of <see cref="Poll"/> rather than here,
     /// because a user handler can call this re-entrantly from inside <c>PacketReceived</c> while the ingress loop still
-    /// holds the same connection in a local, and its buffers are still in use.
+    /// holds the same connection in a local, and its buffers are still in use. The same release returns the object to
+    /// the pool, which must not happen while any engine frame still holds it.
     /// </remarks>
     private void TeardownConnection(SynapseConnection synapseConnection)
     {
@@ -963,6 +1010,12 @@ public sealed partial class SynapseManager : IDisposable
         RaiseConnectionClosed(synapseConnection);
 
         _pendingReleases.Add(synapseConnection);
+
+        /* A ConnectionClosed handler that stopped or disposed the engine drained the queue before this connection was in
+         * it. Inside a poll, the end of that poll releases it. Outside one nothing else would: after Dispose never, and
+         * after Stop not until the engine is polled again. */
+        if (!_isStarted && _pollDepth == 0)
+            ReleaseTornDownConnections();
     }
 
     /// <summary>
@@ -989,20 +1042,22 @@ public sealed partial class SynapseManager : IDisposable
 
     /// <summary>
     /// Releases the pooled buffers of every connection queued by <see cref="TeardownConnection"/> and raises
-    /// <see cref="ConnectionReleased"/> for each. Called at the end of <see cref="Poll"/>, once no engine frame can
-    /// still be holding one, and again on shutdown.
+    /// <see cref="ConnectionReleased"/> for each. Called at the end of the outermost <see cref="Poll"/>, once no engine
+    /// frame can still be holding one, and on a shutdown made outside a poll.
     /// </summary>
     /// <remarks>
-    /// The connection object itself is deliberately <b>not</b> returned to its pool; it is left torn down, with its
-    /// identity intact, for the garbage collector. <c>Connect</c> and every connection event hand the raw object to the
-    /// application, and the pool is a static thread-local stack shared by every <see cref="SynapseManager"/> in the
-    /// process, so the very next connection made on this thread would be given the same object. An application still
-    /// holding the old reference, as Nucleus's relay link did, would then send to or disconnect an unrelated peer.
-    /// Recycling saved one allocation per connection, not per packet, which is not worth that. See F16 in
-    /// <c>docs/ROBUSTNESS_SWEEP.md</c>.
+    /// After its event, each connection object goes back to its pool. The pool is a static thread-local stack shared by
+    /// every <see cref="SynapseManager"/> on the thread, so the next <see cref="Connect"/> or inbound handshake on this
+    /// thread, from any manager, may be handed the same object for an unrelated peer. <see cref="ConnectionReleased"/> is
+    /// therefore the last point at which the application may hold the object. The event is raised before the return, so
+    /// its handlers still see the connection's identity intact. See F16 in <c>docs/ROBUSTNESS_SWEEP.md</c>.
     /// <para>
     /// Each connection leaves the queue before its event is raised, so a handler that polls, stops or disconnects
-    /// re-entrantly can neither release one twice nor raise its event twice.
+    /// re-entrantly can neither release one twice, raise its event twice, nor return it twice. It is still marked torn
+    /// down during the event, so a handler that disconnects it does nothing. It is out of every lookup table by then,
+    /// because only <see cref="TeardownConnection"/> and <see cref="TeardownAllConnections"/> queue it, and both remove
+    /// it first. The reconnect path raises the event without queueing the connection, and so never returns it here,
+    /// because the same object goes on to carry the new session.
     /// </para>
     /// </remarks>
     private void ReleaseTornDownConnections()
@@ -1015,6 +1070,8 @@ public sealed partial class SynapseManager : IDisposable
 
             synapseConnection.ReleasePooledResources();
             RaiseConnectionReleased(synapseConnection);
+
+            ResettableObjectPool<SynapseConnection>.Return(synapseConnection);
         }
     }
 

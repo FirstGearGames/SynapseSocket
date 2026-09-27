@@ -400,17 +400,19 @@ public sealed class SweepFindingTests
             "segmented payload never arrived");
         Assert.NotNull(serverSide.Reassembler);
 
+        ReleaseProbe releaseProbe = new(server, serverSide);
+
         // The peer disconnects. The server's teardown runs entirely on the ingress path.
         client.Disconnect(clientToServer);
 
         Assert.True(
-            TestHarness.PumpUntil(() => server.Connections.Count == 0, 3000, server, client),
-            "server never observed the remote disconnect");
+            TestHarness.PumpUntil(() => releaseProbe.IsReleased, 3000, server, client),
+            "server never released the remotely disconnected connection");
 
-        Assert.True(serverSide.Reassembler is null, "reassembler was not returned on remote disconnect");
-        Assert.True(serverSide.Splitter is null, "splitter was not returned on remote disconnect");
-        Assert.Empty(serverSide.ReorderBuffer);
-        Assert.Empty(serverSide.PendingReliableQueue);
+        Assert.True(releaseProbe.IsReassemblerReturned, "reassembler was not returned on remote disconnect");
+        Assert.True(releaseProbe.IsSplitterReturned, "splitter was not returned on remote disconnect");
+        Assert.True(releaseProbe.IsReorderBufferEmpty, "reorder buffer was not emptied on remote disconnect");
+        Assert.True(releaseProbe.IsPendingReliableQueueEmpty, "pending reliables were not returned on remote disconnect");
     }
 
     /// <summary>
@@ -450,81 +452,141 @@ public sealed class SweepFindingTests
             "segmented payload never arrived");
         Assert.NotNull(serverSide.Reassembler);
 
+        ReleaseProbe releaseProbe = new(server, serverSide);
+
         // Client goes silent; the server must time it out and release everything.
         client.Stop();
 
         Assert.True(
-            TestHarness.PumpUntil(() => server.Connections.Count == 0, 6000, server),
+            TestHarness.PumpUntil(() => releaseProbe.IsReleased, 6000, server),
             "server never timed the silent peer out");
 
-        Assert.True(serverSide.Reassembler is null, "reassembler was not returned on timeout");
-        Assert.True(serverSide.Splitter is null, "splitter was not returned on timeout");
-        Assert.Empty(serverSide.ReorderBuffer);
-        Assert.Empty(serverSide.PendingReliableQueue);
+        Assert.True(releaseProbe.IsReassemblerReturned, "reassembler was not returned on timeout");
+        Assert.True(releaseProbe.IsSplitterReturned, "splitter was not returned on timeout");
+        Assert.True(releaseProbe.IsReorderBufferEmpty, "reorder buffer was not emptied on timeout");
+        Assert.True(releaseProbe.IsPendingReliableQueueEmpty, "pending reliables were not returned on timeout");
     }
 
     /// <summary>
-    /// F16: a closed connection must never be handed out again, and a caller still holding it must not be able to
-    /// reach whatever session comes next.
+    /// F16: a closed connection object must not be handed out again before its
+    /// <see cref="SynapseManager.ConnectionReleased"/>. After it, the next connection made on the same thread may be
+    /// handed the same object, and that connection must arrive fully reset: the new endpoint, a clean session, and
+    /// nothing left of the old session's sequences or buffers.
     /// </summary>
     /// <remarks>
-    /// The connection pool is a static, thread-local LIFO stack, so with recycling on, the very next connection made on
-    /// this thread is given the object that was just closed. Nucleus's relay link kept such a reference past close,
-    /// which let a stale <c>Disconnect</c> or <c>Send</c> land on an unrelated live session.
+    /// The connection pool is a static, thread-local LIFO stack shared by every manager on the thread. Run on a new
+    /// thread, whose pool starts empty, the first connection made after the release is certain to be handed the released
+    /// object. The test keeps the closed object only to compare identities, which an application must not do past
+    /// <see cref="SynapseManager.ConnectionReleased"/>.
     /// </remarks>
     [Fact]
-    public void F16_ClosedConnection_IsNeverReissued_AndStaleCallsAreInert()
+    public void F16_ClosedConnection_IsReissuedOnlyAfterItsRelease_AndArrivesReset() => TestHarness.RunOnNewThread(AssertClosedConnectionIsReissuedOnlyAfterItsRelease);
+
+    /// <summary>
+    /// The body of <see cref="F16_ClosedConnection_IsReissuedOnlyAfterItsRelease_AndArrivesReset"/>, run on a new thread.
+    /// </summary>
+    private static void AssertClosedConnectionIsReissuedOnlyAfterItsRelease()
     {
-        int port = TestHarness.GetFreePort();
-        using SynapseManager server = new(TestHarness.ServerConfig(port));
+        int firstPort = TestHarness.GetFreePort();
+        int secondPort = TestHarness.GetFreePort();
+        int thirdPort = TestHarness.GetFreePort();
+        using SynapseManager firstServer = new(TestHarness.ServerConfig(firstPort));
+        using SynapseManager secondServer = new(TestHarness.ServerConfig(secondPort));
+        using SynapseManager thirdServer = new(TestHarness.ServerConfig(thirdPort));
         using SynapseManager client = new(TestHarness.ClientConfig());
 
-        TestHarness.EventRecorder serverEvents = new();
-        serverEvents.Attach(server);
+        TestHarness.EventRecorder thirdServerEvents = new();
+        thirdServerEvents.Attach(thirdServer);
 
-        server.Start();
+        int packetsReceivedByClient = 0;
+        client.PacketReceived += _ => packetsReceivedByClient++;
+
+        firstServer.Start();
+        secondServer.Start();
+        thirdServer.Start();
         client.Start();
 
-        IPEndPoint serverEndPoint = new(IPAddress.Loopback, port);
+        IPEndPoint firstEndPoint = new(IPAddress.Loopback, firstPort);
+        IPEndPoint secondEndPoint = new(IPAddress.Loopback, secondPort);
+        IPEndPoint thirdEndPoint = new(IPAddress.Loopback, thirdPort);
 
-        SynapseConnection first = client.Connect(serverEndPoint);
+        SynapseConnection first = client.Connect(firstEndPoint);
         Assert.True(
-            TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 1, 3000, server, client),
+            TestHarness.PumpUntil(() => first.State is ConnectionState.Connected && firstServer.Connections.Count == 1, 3000, firstServer, client),
             "the first handshake did not complete");
 
-        client.Disconnect(first);
+        // Advance both sequence spaces and rent a splitter, so anything the old session left behind would show.
+        client.Send(first, new byte[3000], isReliable: true);
+        firstServer.Send(firstServer.Connections.Connections[0], new byte[] { 1 }, isReliable: true);
         Assert.True(
-            TestHarness.PumpUntil(() => server.Connections.Count == 0, 3000, server, client),
-            "the server never saw the first connection close");
+            TestHarness.PumpUntil(() => packetsReceivedByClient == 1 && first.PendingReliableQueue.Count == 0, 3000, firstServer, client),
+            "the first session's reliable traffic was not delivered and acknowledged");
+        Assert.True(first.NextOutgoingSequence != 0 && first.NextExpectedSequence != 0, "the first session's sequences did not advance");
+        Assert.NotNull(first.Splitter);
 
-        SynapseConnection second = client.Connect(serverEndPoint);
-        Assert.True(
-            TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 2, 3000, server, client),
-            "the second handshake did not complete");
+        SynapseConnection? releasedConnection = null;
+        IPEndPoint? endPointAtRelease = null;
 
-        Assert.False(ReferenceEquals(first, second), "the closed connection object was handed out again for the new session");
+        client.ConnectionReleased += connectionEventArgs =>
+        {
+            releasedConnection = connectionEventArgs.Connection;
+            endPointAtRelease = connectionEventArgs.Connection.RemoteEndPoint;
+        };
 
-        // A caller still holding the closed connection must not be able to reach the live one.
-        Assert.Throws<InvalidOperationException>(() => client.Send(first, new byte[] { 1 }, isReliable: true));
+        // Closed outside a poll, so the release waits for the client's next poll. Until then the object is not reissued.
         client.Disconnect(first);
-        TestHarness.PumpFor(200, server, client);
+        SynapseConnection second = client.Connect(secondEndPoint);
 
-        Assert.Equal(ConnectionState.Connected, second.State);
-        Assert.Equal(1, server.Connections.Count);
+        Assert.False(ReferenceEquals(first, second), "the closed connection was handed out again before its ConnectionReleased");
+        Assert.Null(releasedConnection);
+
+        client.Poll();
+
+        Assert.Same(first, releasedConnection);
+        Assert.Equal(firstEndPoint, endPointAtRelease);
+
+        // The first connection made on this thread after the release is handed the released object.
+        SynapseConnection third = client.Connect(thirdEndPoint);
+
+        Assert.Same(first, third);
+        Assert.Equal(thirdEndPoint, third.RemoteEndPoint);
+        Assert.Equal(ConnectionState.Pending, third.State);
+        Assert.False(third.IsTornDown, "the reissued connection still reads as torn down");
+        Assert.True(third.NextOutgoingSequence == 0 && third.NextExpectedSequence == 0, "the reissued connection kept the old session's sequences");
+        Assert.Null(third.Splitter);
+        Assert.Null(third.Reassembler);
+        Assert.Empty(third.PendingReliableQueue);
+        Assert.Empty(third.ReorderBuffer);
+        Assert.Empty(third.PendingAcks);
+        Assert.Same(third, client.Connections.ConnectionsByEndPoint[thirdEndPoint]);
+        Assert.False(client.Connections.ConnectionsByEndPoint.ContainsKey(firstEndPoint), "the reissued connection is still listed under its old endpoint");
+
+        // Over the wire, a stale outgoing sequence would park the payload in the new peer's reorder buffer instead.
+        Assert.True(
+            TestHarness.PumpUntil(() => third.State is ConnectionState.Connected && thirdServer.Connections.Count == 1, 3000, thirdServer, client, firstServer, secondServer),
+            "the reissued connection's handshake did not complete");
+
+        client.Send(third, new byte[] { 2 }, isReliable: true);
+        thirdServer.Send(thirdServer.Connections.Connections[0], new byte[] { 3 }, isReliable: true);
+
+        Assert.True(
+            TestHarness.PumpUntil(() => thirdServerEvents.PacketsReceived == 1 && packetsReceivedByClient == 2, 3000, thirdServer, client, firstServer, secondServer),
+            "reliable traffic on the reissued connection was not delivered in both directions");
     }
 
     /// <summary>
-    /// M3: teardown must release everything a connection holds from the shared pools, and, with connection pooling
-    /// disabled after F16, must leave the connection object itself alone rather than recycle it.
+    /// M3: teardown must release everything a connection holds from the shared pools, raise
+    /// <see cref="SynapseManager.ConnectionReleased"/> while the connection is still intact, and then return the
+    /// connection object itself to its pool.
     /// </summary>
     /// <remarks>
-    /// The original M3 finding was that connections were never returned to their pool. Returning them turned out to be
-    /// unsafe for any application that keeps a connection past close (F16), so the object is now deliberately left to
-    /// the garbage collector. What must not leak is what the connection borrowed: its splitter, its reassembler and the
-    /// buffers behind its reliable queue and reorder buffer.
+    /// The original M3 finding was that connections were never returned to their pool. Returning them was unsafe for any
+    /// application that kept a connection past close (F16), so the return now waits for
+    /// <see cref="SynapseManager.ConnectionReleased"/>, the point by which every holder must have dropped it. The test
+    /// reads the object after that point only to prove it was returned and reset.
     /// </remarks>
     [Fact]
-    public void M3_Teardown_ReleasesPooledBuffersWithoutRecyclingTheConnection()
+    public void M3_Teardown_ReleasesPooledBuffers_ThenReturnsTheConnection()
     {
         int port = TestHarness.GetFreePort();
         using SynapseManager server = new(TestHarness.ServerConfig(port));
@@ -548,25 +610,24 @@ public sealed class SweepFindingTests
         server.Send(serverSide, new byte[3000], isReliable: false);
         Assert.NotNull(serverSide.Splitter);
 
+        ReleaseProbe releaseProbe = new(server, serverSide);
+
         client.Disconnect(clientToServer);
 
         Assert.True(
-            TestHarness.PumpUntil(() => server.Connections.Count == 0, 3000, server, client),
-            "server never observed the remote disconnect");
+            TestHarness.PumpUntil(() => releaseProbe.IsReleased, 3000, server, client),
+            "server never released the remotely disconnected connection");
 
-        // The release is deferred to the end of Poll, so give it one more.
-        server.Poll();
+        Assert.True(releaseProbe.IsSplitterReturned, "splitter was not returned before ConnectionReleased");
+        Assert.True(releaseProbe.IsReassemblerReturned, "reassembler was not returned before ConnectionReleased");
+        Assert.True(releaseProbe.IsPendingReliableQueueEmpty, "pending reliables were not returned before ConnectionReleased");
+        Assert.True(releaseProbe.IsReorderBufferEmpty, "reorder buffer was not emptied before ConnectionReleased");
+        Assert.True(releaseProbe.IsIntactAtRelease, "ConnectionReleased saw the connection after it had been reset");
 
-        Assert.Null(serverSide.Splitter);
-        Assert.Null(serverSide.Reassembler);
-        Assert.Empty(serverSide.PendingReliableQueue);
-        Assert.Empty(serverSide.ReorderBuffer);
-
-        // Not recycled: the identity is intact, so a caller that kept this reference is holding a dead connection
-        // rather than someone else's live one.
-        Assert.True(serverSide.IsTornDown);
-        Assert.Equal(ConnectionState.Disconnected, serverSide.State);
-        Assert.NotNull(serverSide.RemoteEndPoint);
+        // Returned once the event's handlers were done: OnReturn has cleared its identity for the next renter.
+        Assert.False(serverSide.IsTornDown, "the connection was not returned to its pool after ConnectionReleased");
+        Assert.Null(serverSide.RemoteEndPoint);
+        Assert.Equal(SynapseConnection.UnsetConnectionsIndex, serverSide.ConnectionsIndex);
     }
 
     /// <summary>
@@ -1655,17 +1716,25 @@ public sealed class SweepFindingTests
         client.Send(first, new byte[3000], isReliable: false);
         Assert.NotNull(first.Splitter);
 
+        ReleaseProbe firstReleaseProbe = new(client, first);
+
         // Connect again to the same endpoint. The first instance must be torn down, not silently discarded.
         SynapseConnection second = client.Connect(target);
+
+        // The replaced connection is only queued for release here, so the new session cannot have been handed it.
+        Assert.False(ReferenceEquals(first, second), "the second Connect was handed the replaced connection before its release");
+
+        Assert.True(
+            TestHarness.PumpUntil(() => firstReleaseProbe.IsReleased, 3000, server, client),
+            "the replaced connection was discarded without being released");
         TestHarness.PumpFor(300, server, client);
 
-        Assert.False(ReferenceEquals(first, second), "the second Connect reused the first connection instance");
         Assert.True(client.Connections.Count == 1, $"reconnecting left [{client.Connections.Count}] client connections for one endpoint");
-        Assert.True(first.IsTornDown, "the replaced connection was discarded without being torn down");
-        Assert.Equal(ConnectionState.Disconnected, first.State);
-        Assert.Null(first.Splitter);
-        Assert.Null(first.Reassembler);
-        Assert.Empty(first.PendingReliableQueue);
+        Assert.Same(second, client.Connections.ConnectionsByEndPoint[target]);
+        Assert.True(firstReleaseProbe.IsIntactAtRelease, "the replaced connection was not torn down, or had been reset, when it was released");
+        Assert.True(firstReleaseProbe.IsSplitterReturned, "the replaced connection's splitter was not returned");
+        Assert.True(firstReleaseProbe.IsReassemblerReturned, "the replaced connection's reassembler was not returned");
+        Assert.True(firstReleaseProbe.IsPendingReliableQueueEmpty, "the replaced connection's pending reliables were not returned");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1936,5 +2005,74 @@ public sealed class SweepFindingTests
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Records what one connection still holds at the moment its engine raises <see cref="SynapseManager.ConnectionReleased"/>
+    /// for it, then drops its reference, so a test can check the release without reading the connection afterwards.
+    /// </summary>
+    private sealed class ReleaseProbe
+    {
+        /// <summary>
+        /// True once the engine has released the watched connection.
+        /// </summary>
+        public bool IsReleased { get; private set; }
+        /// <summary>
+        /// True when the connection's splitter had been returned by the time it was released.
+        /// </summary>
+        public bool IsSplitterReturned { get; private set; }
+        /// <summary>
+        /// True when the connection's reassembler had been returned by the time it was released.
+        /// </summary>
+        public bool IsReassemblerReturned { get; private set; }
+        /// <summary>
+        /// True when the connection's reorder buffer was empty by the time it was released.
+        /// </summary>
+        public bool IsReorderBufferEmpty { get; private set; }
+        /// <summary>
+        /// True when the connection's pending reliable queue was empty by the time it was released.
+        /// </summary>
+        public bool IsPendingReliableQueueEmpty { get; private set; }
+        /// <summary>
+        /// True when the connection was still marked torn down, and still carried its remote endpoint, by the time it was
+        /// released. Both are cleared only when the object goes back to its pool, which must come after the event.
+        /// </summary>
+        public bool IsIntactAtRelease { get; private set; }
+        /// <summary>
+        /// The watched connection, cleared when it is released.
+        /// </summary>
+        private SynapseConnection? _synapseConnection;
+
+        /// <summary>
+        /// Watches <paramref name="synapseConnection"/> on <paramref name="synapseManager"/>.
+        /// </summary>
+        /// <param name="synapseManager">The engine that owns the connection.</param>
+        /// <param name="synapseConnection">The connection to watch.</param>
+        public ReleaseProbe(SynapseManager synapseManager, SynapseConnection synapseConnection)
+        {
+            _synapseConnection = synapseConnection;
+            synapseManager.ConnectionReleased += OnConnectionReleased;
+        }
+
+        /// <summary>
+        /// Records the watched connection's state when it is released, and drops the reference to it.
+        /// </summary>
+        /// <param name="connectionEventArgs">The released connection.</param>
+        private void OnConnectionReleased(ConnectionEventArgs connectionEventArgs)
+        {
+            SynapseConnection synapseConnection = connectionEventArgs.Connection;
+
+            if (!ReferenceEquals(synapseConnection, _synapseConnection))
+                return;
+
+            IsSplitterReturned = synapseConnection.Splitter is null;
+            IsReassemblerReturned = synapseConnection.Reassembler is null;
+            IsReorderBufferEmpty = synapseConnection.ReorderBuffer.Count == 0;
+            IsPendingReliableQueueEmpty = synapseConnection.PendingReliableQueue.Count == 0;
+            IsIntactAtRelease = synapseConnection.IsTornDown && synapseConnection.RemoteEndPoint is not null;
+            IsReleased = true;
+
+            _synapseConnection = null;
+        }
     }
 }

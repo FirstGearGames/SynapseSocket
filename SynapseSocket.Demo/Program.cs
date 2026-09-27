@@ -63,31 +63,46 @@ internal static class Program
         client.ConnectionClosed += (connectionEventArgs) => Console.WriteLine($"[client] connection closed: {connectionEventArgs.Connection.RemoteEndPoint}");
         client.ConnectionFailed += (connectionFailedEventArgs) => Console.WriteLine($"[client] failure: {connectionFailedEventArgs.Reason} {connectionFailedEventArgs.Message}");
 
+        // The engine may hand a released connection object to a later connection, so the reference is dropped here.
+        SynapseConnection? synapseConnection = null;
+        client.ConnectionReleased += (connectionEventArgs) =>
+        {
+            if (ReferenceEquals(connectionEventArgs.Connection, synapseConnection))
+                synapseConnection = null;
+        };
+
         client.Start();
         Console.WriteLine("[client] started");
 
         IPEndPoint serverEndPoint = new(IPAddress.Loopback, Port);
-        SynapseConnection synapseConnection = client.Connect(serverEndPoint);
+        synapseConnection = client.Connect(serverEndPoint);
 
         // Pump until the handshake completes (server handshake-ack arrives back).
         Pump(server, client, () => clientConnected, 2000);
 
-        // Send a reliable hello.
-        byte[] helloPayload = Encoding.UTF8.GetBytes("Hello from client (reliable)");
-        client.Send(synapseConnection, helloPayload, isReliable: true);
+        // Releases happen only while the engines are pumped, so one check covers the three sends.
+        if (synapseConnection is not null)
+        {
+            // Send a reliable hello.
+            byte[] helloPayload = Encoding.UTF8.GetBytes("Hello from client (reliable)");
+            client.Send(synapseConnection, helloPayload, isReliable: true);
 
-        byte[] fragmentedPayload = new byte[2500];
-        client.Send(synapseConnection, fragmentedPayload, isReliable: false);
+            byte[] fragmentedPayload = new byte[2500];
+            client.Send(synapseConnection, fragmentedPayload, isReliable: false);
 
-        // Send an unreliable ping.
-        byte[] pingPayload = Encoding.UTF8.GetBytes("Ping from client (unreliable)");
-        client.Send(synapseConnection, pingPayload, isReliable: false);
+            // Send an unreliable ping.
+            byte[] pingPayload = Encoding.UTF8.GetBytes("Ping from client (unreliable)");
+            client.Send(synapseConnection, pingPayload, isReliable: false);
+        }
 
         // Pump until an echo arrives.
         Pump(server, client, () => clientReplyReceived, 2000);
 
         Pump(server, client, () => false, 300);
-        client.Disconnect(synapseConnection);
+
+        if (synapseConnection is not null)
+            client.Disconnect(synapseConnection);
+
         Pump(server, client, () => false, 200);
 
         Console.WriteLine();

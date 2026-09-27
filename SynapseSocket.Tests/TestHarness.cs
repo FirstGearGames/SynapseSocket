@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using SynapseSocket.Core;
 using SynapseSocket.Core.Configuration;
@@ -99,6 +100,36 @@ public static class TestHarness
 
             Thread.Sleep(1);
         }
+    }
+
+    /// <summary>
+    /// Runs <paramref name="body"/> on a new thread, waits for it, and rethrows anything it threw.
+    /// </summary>
+    /// <param name="body">The test body.</param>
+    /// <remarks>
+    /// Connection objects are pooled per thread. A new thread starts with its own pool empty, so a test run this way
+    /// knows that the next connection its engines make is handed the object most recently returned on that thread.
+    /// </remarks>
+    public static void RunOnNewThread(Action body)
+    {
+        ExceptionDispatchInfo? failure = null;
+
+        Thread thread = new(() =>
+        {
+            try
+            {
+                body();
+            }
+            catch (Exception exception)
+            {
+                failure = ExceptionDispatchInfo.Capture(exception);
+            }
+        });
+
+        thread.Start();
+        thread.Join();
+
+        failure?.Throw();
     }
 
     /// <summary>

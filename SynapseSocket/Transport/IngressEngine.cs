@@ -1182,8 +1182,9 @@ internal sealed partial class IngressEngine
             synapseConnection.ResetForReconnect();
             ConnectionClosed?.Invoke(synapseConnection);
 
-            /* A ConnectionClosed handler that disconnected this connection has torn it down and removed it from the
-             * tables. Establishing the new session on it would hand the application a dead, untabled connection. */
+            /* A ConnectionClosed handler that disconnected this connection, or stopped the engine, has torn it down and
+             * removed it from the tables. Establishing the new session on it would hand the application a dead, untabled
+             * connection. The flag still holds here because the release it queued waits for this poll to end. */
             if (synapseConnection.IsTornDown)
                 return;
         }

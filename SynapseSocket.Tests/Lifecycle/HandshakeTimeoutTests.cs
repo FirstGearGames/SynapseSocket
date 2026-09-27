@@ -60,17 +60,31 @@ public class HandshakeTimeoutTests
 
         TestHarness.EventRecorder clientEventRecorder = new();
         clientEventRecorder.Attach(client);
+
+        // The state is read as the connection is released, and the reference is dropped there.
+        SynapseConnection? synapseConnection = null;
+        ConnectionState? releasedConnectionState = null;
+
+        client.ConnectionReleased += connectionEventArgs =>
+        {
+            if (!ReferenceEquals(connectionEventArgs.Connection, synapseConnection))
+                return;
+
+            releasedConnectionState = connectionEventArgs.Connection.State;
+            synapseConnection = null;
+        };
+
         client.Start();
 
         Stopwatch stopwatch = Stopwatch.StartNew();
-        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        synapseConnection = client.Connect(new(IPAddress.Loopback, port));
 
         Assert.True(TestHarness.PumpUntil(() => clientEventRecorder.ConnectionsClosed >= 1, CloseWaitMilliseconds, client), "The unanswered handshake was not closed before the idle timeout could have fired.");
 
         long elapsedMilliseconds = stopwatch.ElapsedMilliseconds;
 
         Assert.True(elapsedMilliseconds >= HandshakeTimeoutMilliseconds - ClockToleranceMilliseconds, $"The unanswered handshake closed after [{elapsedMilliseconds}] ms, before its [{HandshakeTimeoutMilliseconds}] ms timeout.");
-        Assert.Equal(ConnectionState.Disconnected, synapseConnection.State);
+        Assert.Equal(ConnectionState.Disconnected, releasedConnectionState);
         Assert.Equal(0, client.Connections.Count);
         Assert.Equal(1, clientEventRecorder.ConnectionsClosed);
         Assert.Equal(0, clientEventRecorder.ConnectionsEstablished);

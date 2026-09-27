@@ -81,7 +81,9 @@ internal static class Program
         /* --- Spin up joiners --- */
         List<SynapseManager> joinerSynapseManagers = new(JoinerCount);
         List<BeaconClient> joinerBeaconClients = new(JoinerCount);
-        List<SynapseConnection> joinerSynapseConnections = new(JoinerCount);
+        // Index for index with joinerSynapseManagers. A slot is nulled once its connection is released, because a
+        // released connection object may be handed to another engine's next connection on this thread.
+        List<SynapseConnection?> joinerSynapseConnections = new(JoinerCount);
 
         // Every engine that must be pumped while the demo runs (host + joiners). Rebuilt as joiners are added.
         List<SynapseManager> activeEngines = [hostSynapseManager];
@@ -106,6 +108,13 @@ internal static class Program
 
                 joinerSynapseManager.ConnectionEstablished += connectionEventArgs =>
                     Console.WriteLine($"[joiner {joinerIndex}] connected to host: {connectionEventArgs.Connection.RemoteEndPoint}");
+
+                int joinerSlot = i;
+                joinerSynapseManager.ConnectionReleased += connectionEventArgs =>
+                {
+                    if (joinerSlot < joinerSynapseConnections.Count && ReferenceEquals(joinerSynapseConnections[joinerSlot], connectionEventArgs.Connection))
+                        joinerSynapseConnections[joinerSlot] = null;
+                };
 
                 joinerSynapseManager.Start();
 
@@ -148,7 +157,12 @@ internal static class Program
         {
             /* --- Teardown joiners --- */
             for (int i = 0; i < joinerSynapseConnections.Count; i++)
-                joinerSynapseManagers[i].Disconnect(joinerSynapseConnections[i]);
+            {
+                SynapseConnection? joinerSynapseConnection = joinerSynapseConnections[i];
+
+                if (joinerSynapseConnection is not null)
+                    joinerSynapseManagers[i].Disconnect(joinerSynapseConnection);
+            }
 
             foreach (BeaconClient joinerBeaconClient in joinerBeaconClients)
                 joinerBeaconClient.Dispose();

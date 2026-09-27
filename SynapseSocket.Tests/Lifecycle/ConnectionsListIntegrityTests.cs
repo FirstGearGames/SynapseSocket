@@ -57,7 +57,7 @@ public class ConnectionsListIntegrityTests
     /// <summary>
     /// Tests that removing the tail clears the outgoing connection's recorded index, as removing from the middle does.
     /// </summary>
-    /// <remarks>The clear used to sit inside the swap branch, so a tail removal handed back a connection still carrying a live looking index. Nothing resets it afterwards, because a removed connection is not returned to its pool.</remarks>
+    /// <remarks>The clear used to sit inside the swap branch, so a tail removal handed back a connection still carrying a live looking index. Nothing else resets it until the connection goes back to its pool after its release, which a bare ConnectionManager never does.</remarks>
     [Fact]
     public void Remove_OfTheTail_ClearsTheOutgoingRecordedIndex()
     {

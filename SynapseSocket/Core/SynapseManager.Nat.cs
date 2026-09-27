@@ -105,8 +105,12 @@ public sealed partial class SynapseManager
             // The direct-handshake grace has elapsed, so probing begins on this tick.
             if (punch.AttemptsDone >= Config.NatTraversal.MaximumAttempts)
             {
-                RaiseConnectionFailed(punch.EndPoint, ConnectionRejectedReason.NatTraversalFailed, null);
+                // Removed before the handler runs, which may stop the engine or disconnect other pending connections.
                 _natPunches.RemoveAt(i);
+                RaiseConnectionFailed(punch.EndPoint, ConnectionRejectedReason.NatTraversalFailed, null);
+
+                // The handler can have shrunk the list beneath this index. Entries it shifted down are still visited.
+                i = Math.Min(i, _natPunches.Count);
                 continue;
             }
 
