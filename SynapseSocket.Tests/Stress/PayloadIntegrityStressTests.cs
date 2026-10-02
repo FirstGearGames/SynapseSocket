@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
+using CodeBoost.Performance;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
 using SynapseSocket.Core.Configuration;
@@ -219,7 +220,7 @@ public class PayloadIntegrityStressTests
             void DeferredConsumer(SynapseSocket.Core.Events.PacketReceivedEventArgs args)
             {
                 ArraySegment<byte> source = args.Payload;
-                byte[] copy = ArrayPool<byte>.Shared.Rent(source.Count);
+                byte[] copy = TrackedArrayPool<byte>.Rent(source.Count);
                 if (source.Array is not null)
                     Array.Copy(source.Array, source.Offset, copy, 0, source.Count);
 
@@ -256,7 +257,7 @@ public class PayloadIntegrityStressTests
                         string? violation = ValidatePattern(item.copy, item.length);
                         if (violation is not null)
                             corruptions.Add($"cycle {cycle}: DEFERRED-ALIASED {violation}");
-                        ArrayPool<byte>.Shared.Return(item.copy);
+                        TrackedArrayPool<byte>.Return(item.copy);
                     }
                     Thread.SpinWait(50);
                 }
@@ -516,7 +517,7 @@ public class PayloadIntegrityStressTests
 
         for (int i = 0; i < Rentals; i++)
         {
-            byte[] rental = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
+            byte[] rental = TrackedArrayPool<byte>.Rent(MaximumUdpDatagramSize);
             bool isDuplicate = false;
 
             foreach (byte[] existingRental in distinctRentals)
@@ -536,7 +537,7 @@ public class PayloadIntegrityStressTests
 
         // Only the distinct references go back, so a failing run leaves the pool no worse than it already is.
         foreach (byte[] rental in distinctRentals)
-            ArrayPool<byte>.Shared.Return(rental);
+            TrackedArrayPool<byte>.Return(rental);
 
         Assert.True(duplicateCount == 0, $"the shared pool handed out {duplicateCount} duplicate datagram buffer(s), so the ingress receive buffer was returned to it more than once");
     }
@@ -555,7 +556,7 @@ public class PayloadIntegrityStressTests
             {
                 int length = sizes[s];
                 uint seed = (uint)(0xCA_00_00_00 + cycle * 100 + repeat * 10 + s);
-                byte[] buffer = ArrayPool<byte>.Shared.Rent(length);
+                byte[] buffer = TrackedArrayPool<byte>.Rent(length);
                 byte[] pattern = MakePatternedPayload(seed, length);
                 Array.Copy(pattern, buffer, length);
                 canaries.Add((buffer, length, seed));
@@ -577,7 +578,7 @@ public class PayloadIntegrityStressTests
         for (int i = 0; i < count; i++)
         {
             uint seed = (uint)(0xDA_00_00_00 + cycle * 100 + i);
-            byte[] buffer = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
+            byte[] buffer = TrackedArrayPool<byte>.Rent(MaximumUdpDatagramSize);
             FillPattern(buffer, seed, MaximumUdpDatagramSize);
             canaries.Add((buffer, MaximumUdpDatagramSize, seed));
         }
@@ -607,7 +608,7 @@ public class PayloadIntegrityStressTests
     private static void ReturnCanaries(List<(byte[] buffer, int length, uint seed)> canaries)
     {
         foreach ((byte[] buffer, int _, uint _) in canaries)
-            ArrayPool<byte>.Shared.Return(buffer);
+            TrackedArrayPool<byte>.Return(buffer);
     }
 
     private static string FormatCorruptions(ConcurrentBag<string> corruptions)

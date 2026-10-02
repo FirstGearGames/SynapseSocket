@@ -1,5 +1,4 @@
 using System;
-using System.Buffers;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
@@ -589,7 +588,7 @@ public sealed partial class SynapseManager : IDisposable
         if (data.Array is null || data.Count == 0)
             return;
 
-        byte[] copy = ArrayPool<byte>.Shared.Rent(data.Count);
+        byte[] copy = TrackedArrayPool<byte>.Rent(data.Count);
         Buffer.BlockCopy(data.Array, data.Offset, copy, 0, data.Count);
 
         _queuedRawSends.Enqueue(new(copy, data.Count, target));
@@ -872,7 +871,7 @@ public sealed partial class SynapseManager : IDisposable
         finally
         {
             if (isPayloadRented && payload.Array is not null)
-                ArrayPool<byte>.Shared.Return(payload.Array);
+                TrackedArrayPool<byte>.Return(payload.Array);
         }
     }
 
@@ -1035,7 +1034,7 @@ public sealed partial class SynapseManager : IDisposable
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(queued.Buffer);
+                TrackedArrayPool<byte>.Return(queued.Buffer);
             }
         }
     }

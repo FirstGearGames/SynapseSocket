@@ -21,7 +21,7 @@ public sealed class PacketSplitter : PacketSegmenter
     /// <summary>
     /// Splits a payload into one or more wire-ready segments packed into a single rented backing buffer.
     /// Every element in the returned array is a slice of the same backing buffer, only <c>segments[0].Array</c> needs to be returned to <see cref="ArrayPool{T}.Shared"/>.
-    /// The outer <see cref="ArraySegment{T}"/> array is rented from <see cref="ArrayPool{T}"/> of <see cref="ArraySegment{T}"/> and must also be returned separately.
+    /// The outer <see cref="ArraySegment{T}"/> array is rented from <see cref="TrackedArrayPool{T0}"/> of <see cref="ArraySegment{T}"/> and must also be returned separately.
     /// Use <paramref name="segmentCount"/> (not the array length) to iterate, the rented outer array may be larger than needed.
     /// </summary>
     /// <param name="payload">The application payload to split into segments.</param>
@@ -50,7 +50,7 @@ public sealed class PacketSplitter : PacketSegmenter
         // Single backing buffer: all N segment packets packed contiguously.
         // N * headerSize is a slight over-estimate because the last segment payload may be smaller, but renting a touch more is cheaper than computing the exact size.
         int totalBufferSize = totalSegments * headerSize + payload.Length;
-        backingBuffer = ArrayPool<byte>.Shared.Rent(totalBufferSize);
+        backingBuffer = TrackedArrayPool<byte>.Rent(totalBufferSize);
         List<ArraySegment<byte>> segments = ListPool<ArraySegment<byte>>.Rent();
 
         int bufferOffset = 0;

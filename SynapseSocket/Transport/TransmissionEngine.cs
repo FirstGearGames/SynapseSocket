@@ -1,5 +1,4 @@
 using System;
-using System.Buffers;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
@@ -191,7 +190,7 @@ public sealed partial class TransmissionEngine
     {
         const PacketType Type = PacketType.None;
         int totalLength = PacketHeader.ComputeHeaderSize(Type) + payload.Count;
-        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(totalLength);
+        byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(totalLength);
         try
         {
             int written = PacketHeader.BuildPacket(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0, payload.AsSpan());
@@ -199,7 +198,7 @@ public sealed partial class TransmissionEngine
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(rentedBuffer, clearArray: false);
+            TrackedArrayPool<byte>.Return(rentedBuffer, clearArray: false);
         }
     }
 
@@ -220,7 +219,7 @@ public sealed partial class TransmissionEngine
         const PacketType Type = PacketType.Reliable;
         int totalLength = PacketHeader.ComputeHeaderSize(Type) + payload.Count;
 
-        byte[] packetBuffer = ArrayPool<byte>.Shared.Rent(totalLength);
+        byte[] packetBuffer = TrackedArrayPool<byte>.Rent(totalLength);
         int written = PacketHeader.BuildPacket(packetBuffer.AsSpan(), Type, sequence, 0, 0, 0, payload.AsSpan());
 
         List<ArraySegment<byte>> segments = ListPool<ArraySegment<byte>>.Rent();
@@ -284,7 +283,7 @@ public sealed partial class TransmissionEngine
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(backingBuffer);
+                TrackedArrayPool<byte>.Return(backingBuffer);
 
                 /* The reliable branch hands the list to PendingReliable, which returns it on ack or eviction.
                  * Nothing owns it here, so it has to go back explicitly, otherwise ListPool is permanently
@@ -303,7 +302,7 @@ public sealed partial class TransmissionEngine
     {
         const PacketType Type = PacketType.Ack;
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
-        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
+        byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(headerSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, sequence, 0, 0, 0);
         SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), synapseConnection);
     }
@@ -332,7 +331,7 @@ public sealed partial class TransmissionEngine
         {
             int sequenceCount = Math.Min(pendingAcks.Count, maximumPerDatagram);
             int totalLength = PacketHeader.TypeSize + (sequenceCount * PacketHeader.SequenceSize);
-            byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(totalLength);
+            byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(totalLength);
 
             rentedBuffer[0] = (byte)PacketType.Ack;
             int offset = PacketHeader.TypeSize;
@@ -361,7 +360,7 @@ public sealed partial class TransmissionEngine
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
         int totalLength = headerSize + bitmap.Length;
 
-        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(totalLength);
+        byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(totalLength);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, sequence, 0, 0, 0);
         bitmap.CopyTo(rentedBuffer.AsSpan(headerSize, bitmap.Length));
 
@@ -391,7 +390,7 @@ public sealed partial class TransmissionEngine
         const PacketType Type = PacketType.Handshake;
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
         int totalSize = headerSize + payload.Length;
-        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(totalSize);
+        byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(totalSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
         payload.CopyTo(rentedBuffer.AsSpan(headerSize, payload.Length));
         SendAndPoolBuffer(new(rentedBuffer, 0, totalSize), target);
@@ -405,7 +404,7 @@ public sealed partial class TransmissionEngine
     {
         const PacketType Type = PacketType.KeepAlive;
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
-        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
+        byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(headerSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
         SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), synapseConnection);
     }
@@ -418,7 +417,7 @@ public sealed partial class TransmissionEngine
     {
         const PacketType Type = PacketType.Disconnect;
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
-        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
+        byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(headerSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
         SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), synapseConnection);
     }
@@ -557,7 +556,7 @@ public sealed partial class TransmissionEngine
     }
 
     /// <summary>
-    /// Sends a packet and returns its backing buffer to the shared <see cref="ArrayPool{T}"/> afterwards,
+    /// Sends a packet and returns its backing buffer to the shared <see cref="TrackedArrayPool{T0}"/> afterwards,
     /// guaranteeing the rental is returned even if the send throws.
     /// </summary>
     /// <param name="segment">The wire-ready bytes to send; <see cref="ArraySegment{T}.Array"/> is returned to the pool after sending.</param>
@@ -570,7 +569,7 @@ public sealed partial class TransmissionEngine
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(segment.Array!, clearArray: false);
+            TrackedArrayPool<byte>.Return(segment.Array!, clearArray: false);
         }
     }
 

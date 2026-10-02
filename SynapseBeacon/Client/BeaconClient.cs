@@ -1,11 +1,11 @@
 using System;
-using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using CodeBoost.Performance;
 using SynapseBeacon.Wire;
 using SynapseSocket.Core;
 using SynapseSocket.Security;
@@ -343,7 +343,7 @@ public sealed class BeaconClient : IDisposable
     /// <param name="cookie">Cookie the server issued for this client's address.</param>
     private void SendProvenJoinSession(uint sessionId, byte[] nonce, ReadOnlySpan<byte> cookie)
     {
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(BeaconWireFormat.ProvenJoinBytes);
+        byte[] buffer = TrackedArrayPool<byte>.Rent(BeaconWireFormat.ProvenJoinBytes);
 
         try
         {
@@ -356,7 +356,7 @@ public sealed class BeaconClient : IDisposable
         finally
         {
             // Matches every other send here: an exception out of EnqueueRaw must not strand the rental.
-            ArrayPool<byte>.Shared.Return(buffer);
+            TrackedArrayPool<byte>.Return(buffer);
         }
     }
 
@@ -368,7 +368,7 @@ public sealed class BeaconClient : IDisposable
         RandomNumberGenerator.Fill(_sessionRequestNonce);
 
         int size = 1 + BeaconWireFormat.NonceBytes;
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(size);
+        byte[] buffer = TrackedArrayPool<byte>.Rent(size);
         buffer[0] = (byte)BeaconPacketType.RequestSession;
         _sessionRequestNonce.CopyTo(buffer, 1);
 
@@ -385,7 +385,7 @@ public sealed class BeaconClient : IDisposable
         _pendingRegistrationNonces[sessionId] = nonce;
 
         int size = 1 + BeaconWireFormat.SessionIdBytes + BeaconWireFormat.NonceBytes;
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(size);
+        byte[] buffer = TrackedArrayPool<byte>.Rent(size);
 
         BeaconWireFormat.WriteTypeAndSessionId(buffer.AsSpan(), BeaconPacketType.JoinSession, sessionId);
         nonce.CopyTo(buffer, 1 + BeaconWireFormat.SessionIdBytes);
@@ -424,7 +424,7 @@ public sealed class BeaconClient : IDisposable
     private Task SendTypeAndSessionIdAsync(BeaconPacketType type, uint sessionId, CancellationToken cancellationToken)
     {
         const int Size = 1 + BeaconWireFormat.SessionIdBytes;
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(Size);
+        byte[] buffer = TrackedArrayPool<byte>.Rent(Size);
         BeaconWireFormat.WriteTypeAndSessionId(buffer.AsSpan(), type, sessionId);
         return SendAndReturnAsync(buffer, Size, cancellationToken);
     }
@@ -444,7 +444,7 @@ public sealed class BeaconClient : IDisposable
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(buffer);
+            TrackedArrayPool<byte>.Return(buffer);
         }
 
         return Task.CompletedTask;

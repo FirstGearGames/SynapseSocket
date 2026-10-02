@@ -281,7 +281,7 @@ public sealed class PacketReassembler : PacketSegmenter
             if (_receivedCount == 0)
                 FirstReceivedTicks = Clock.Ticks;
 
-            byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(segmentData.Length);
+            byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(segmentData.Length);
             segmentData.CopyTo(rentedBuffer);
 
             int segmentLength = segmentData.Length;
@@ -322,7 +322,7 @@ public sealed class PacketReassembler : PacketSegmenter
                 return false;
             }
 
-            byte[] reassembledBytes = ArrayPool<byte>.Shared.Rent((int)_totalLength);
+            byte[] reassembledBytes = TrackedArrayPool<byte>.Rent((int)_totalLength);
 
             int offset = 0;
             for (int i = 0; i < SegmentCount; i++)

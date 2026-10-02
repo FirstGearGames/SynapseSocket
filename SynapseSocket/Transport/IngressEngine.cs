@@ -312,10 +312,10 @@ internal sealed partial class IngressEngine
         _receivedSocketAddress = new(_socket.AddressFamily);
         _endPointTemplate = (IPEndPoint)_anyEndPoint;
 #endif
-        _receiveBuffer = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
+        _receiveBuffer = TrackedArrayPool<byte>.Rent(MaximumUdpDatagramSize);
 
         if (_packetTransform is not null)
-            _transformBuffer = ArrayPool<byte>.Shared.Rent(MaximumUdpDatagramSize);
+            _transformBuffer = TrackedArrayPool<byte>.Rent(MaximumUdpDatagramSize);
 
         _receiveSockAddr = new byte[NativeSocket.SockAddrSize];
 
@@ -410,13 +410,13 @@ internal sealed partial class IngressEngine
     {
         if (_receiveBuffer is not null)
         {
-            ArrayPool<byte>.Shared.Return(_receiveBuffer, clearArray: false);
+            TrackedArrayPool<byte>.Return(_receiveBuffer, clearArray: false);
             _receiveBuffer = null;
         }
 
         if (_transformBuffer is not null)
         {
-            ArrayPool<byte>.Shared.Return(_transformBuffer, clearArray: false);
+            TrackedArrayPool<byte>.Return(_transformBuffer, clearArray: false);
             _transformBuffer = null;
         }
 
@@ -727,7 +727,7 @@ internal sealed partial class IngressEngine
             }
             else
             {
-                byte[] payloadCopyBuffer = ArrayPool<byte>.Shared.Rent(fastPayloadLength);
+                byte[] payloadCopyBuffer = TrackedArrayPool<byte>.Rent(fastPayloadLength);
                 Buffer.BlockCopy(buffer, PacketHeader.TypeSize, payloadCopyBuffer, 0, fastPayloadLength);
                 PayloadDelivered?.Invoke(synapseConnection, new(payloadCopyBuffer, 0, fastPayloadLength), isReliable: false, isPayloadRented: true);
             }
@@ -888,7 +888,7 @@ internal sealed partial class IngressEngine
         {
             case PacketType.Reliable:
             {
-                byte[] payloadBuffer = ArrayPool<byte>.Shared.Rent(payloadLength);
+                byte[] payloadBuffer = TrackedArrayPool<byte>.Rent(payloadLength);
                 Buffer.BlockCopy(buffer, headerSize, payloadBuffer, 0, payloadLength);
 
                 EnqueueOrSendAck(synapseConnection, sequence);
@@ -1006,7 +1006,7 @@ internal sealed partial class IngressEngine
             if (unchecked((ushort)(sequence - synapseConnection.NextExpectedSequence)) >= 32768)
             {
                 if (payload.Array is not null)
-                    ArrayPool<byte>.Shared.Return(payload.Array);
+                    TrackedArrayPool<byte>.Return(payload.Array);
                 return;
             }
 
@@ -1017,14 +1017,14 @@ internal sealed partial class IngressEngine
             if (synapseConnection.ReorderBuffer.Count >= _effectiveMaximumOutOfOrderReliablePackets)
             {
                 if (payload.Array is not null)
-                    ArrayPool<byte>.Shared.Return(payload.Array);
+                    TrackedArrayPool<byte>.Return(payload.Array);
 
                 ViolationOccurred?.Invoke(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.Oversized, 0, ViolationReorderBufferExceeded, ViolationAction.KickAndBlacklist);
                 return;
             }
 
             if (!synapseConnection.ReorderBuffer.TryAdd(sequence, payload) && payload.Array is not null)
-                ArrayPool<byte>.Shared.Return(payload.Array);
+                TrackedArrayPool<byte>.Return(payload.Array);
 
             return;
         }

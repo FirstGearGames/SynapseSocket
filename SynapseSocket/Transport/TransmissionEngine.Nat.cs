@@ -1,6 +1,6 @@
 using System;
-using System.Buffers;
 using System.Net;
+using CodeBoost.Performance;
 using SynapseSocket.Packets;
 
 namespace SynapseSocket.Transport;
@@ -15,7 +15,7 @@ public sealed partial class TransmissionEngine
         const PacketType Type = PacketType.NatProbe;
 
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
-        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(headerSize);
+        byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(headerSize);
 
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
         SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), target);
@@ -31,7 +31,7 @@ public sealed partial class TransmissionEngine
 
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
         int totalSize = headerSize + token.Length;
-        byte[] rentedBuffer = ArrayPool<byte>.Shared.Rent(totalSize);
+        byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(totalSize);
 
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
         token.CopyTo(rentedBuffer.AsSpan(headerSize));

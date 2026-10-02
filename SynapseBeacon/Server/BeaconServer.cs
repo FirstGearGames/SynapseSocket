@@ -7,6 +7,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using CodeBoost.Performance;
 using SynapseBeacon.Wire;
 
 namespace SynapseBeacon.Server;
@@ -381,7 +382,7 @@ public sealed class BeaconServer : IDisposable
     private void SendSessionCreated(IPEndPoint to, uint sessionId, ReadOnlySpan<byte> nonce)
     {
         int size = 1 + BeaconWireFormat.SessionIdBytes + nonce.Length;
-        byte[] packet = ArrayPool<byte>.Shared.Rent(size);
+        byte[] packet = TrackedArrayPool<byte>.Rent(size);
 
         BeaconWireFormat.WriteTypeAndSessionId(packet.AsSpan(), BeaconPacketType.SessionCreated, sessionId);
         nonce.CopyTo(packet.AsSpan(1 + BeaconWireFormat.SessionIdBytes));
@@ -408,14 +409,14 @@ public sealed class BeaconServer : IDisposable
     private void SendPeerReady(IPEndPoint to, IPEndPoint peer, ReadOnlySpan<byte> nonce)
     {
         int bufferSize = 1 + BeaconWireFormat.MaxPeerEndPointBytes + nonce.Length;
-        byte[] packet = ArrayPool<byte>.Shared.Rent(bufferSize);
+        byte[] packet = TrackedArrayPool<byte>.Rent(bufferSize);
 
         packet[0] = (byte)BeaconPacketType.PeerReady;
         int payloadLength = BeaconWireFormat.WritePeerEndPoint(packet.AsSpan(1), peer);
 
         if (payloadLength == 0)
         {
-            ArrayPool<byte>.Shared.Return(packet);
+            TrackedArrayPool<byte>.Return(packet);
             return;
         }
 
@@ -433,7 +434,7 @@ public sealed class BeaconServer : IDisposable
     private void SendJoinChallenge(IPEndPoint to, ReadOnlySpan<byte> nonce)
     {
         int size = 1 + BeaconWireFormat.CookieBytes + nonce.Length;
-        byte[] packet = ArrayPool<byte>.Shared.Rent(size);
+        byte[] packet = TrackedArrayPool<byte>.Rent(size);
 
         packet[0] = (byte)BeaconPacketType.JoinChallenge;
         ComputeCookie(to, DateTime.UtcNow.Ticks / CookieTimeBucketTicks, packet.AsSpan(1, BeaconWireFormat.CookieBytes));
@@ -472,7 +473,7 @@ public sealed class BeaconServer : IDisposable
         /* Carries the joiner's nonce back for the same reason PeerReady does: without it a rejection forged from
          * the server's address fails every join the client has in flight, not merely the one it names. */
         int size = 1 + nonce.Length;
-        byte[] packet = ArrayPool<byte>.Shared.Rent(size);
+        byte[] packet = TrackedArrayPool<byte>.Rent(size);
 
         packet[0] = (byte)BeaconPacketType.SessionNotFound;
         nonce.CopyTo(packet.AsSpan(1));
@@ -491,7 +492,7 @@ public sealed class BeaconServer : IDisposable
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(packet);
+            TrackedArrayPool<byte>.Return(packet);
         }
     }
 

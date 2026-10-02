@@ -1,7 +1,7 @@
 using System;
-using System.Buffers;
 using System.Collections.Generic;
 using System.Net;
+using CodeBoost.Performance;
 using SynapseSocket.Core.Configuration;
 using SynapseSocket.Packets;
 
@@ -92,7 +92,7 @@ public sealed class LatencySimulator
 
         // Copy into a private buffer: the caller's backing array may be returned to the pool
         // (e.g. on reliable-packet ACK) before the delay elapses, which would corrupt in-flight data.
-        byte[] owned = ArrayPool<byte>.Shared.Rent(segment.Count);
+        byte[] owned = TrackedArrayPool<byte>.Rent(segment.Count);
         segment.AsSpan().CopyTo(owned);
 
         _deferred.Add(new Deferred
@@ -138,7 +138,7 @@ public sealed class LatencySimulator
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(deferred.Buffer);
+                TrackedArrayPool<byte>.Return(deferred.Buffer);
             }
         }
 
@@ -153,7 +153,7 @@ public sealed class LatencySimulator
     public void Clear()
     {
         foreach (Deferred deferred in _deferred)
-            ArrayPool<byte>.Shared.Return(deferred.Buffer);
+            TrackedArrayPool<byte>.Return(deferred.Buffer);
 
         _deferred.Clear();
     }

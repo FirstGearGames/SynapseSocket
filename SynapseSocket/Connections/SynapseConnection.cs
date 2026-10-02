@@ -423,7 +423,7 @@ public sealed partial class SynapseConnection : IPoolResettable
 
             if (BackingArray is not null)
             {
-                ArrayPool<byte>.Shared.Return(BackingArray);
+                TrackedArrayPool<byte>.Return(BackingArray);
                 BackingArray = null;
             }
 
