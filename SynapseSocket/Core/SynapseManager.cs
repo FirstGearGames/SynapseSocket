@@ -368,6 +368,7 @@ public sealed partial class SynapseManager : IDisposable
             ingressEngine.ConnectionEstablished += OnConnectionEstablishedInternal;
             ingressEngine.ConnectionClosed += OnConnectionClosedInternal;
             ingressEngine.TeardownRequested += TeardownConnection;
+            ingressEngine.DeliveryCompleted += Disconnect;
             ingressEngine.ConnectionFailed += RaiseConnectionFailed;
             ingressEngine.ViolationOccurred += HandleViolation;
             ingressEngine.UnhandledException += OnUnhandledException;
@@ -513,8 +514,9 @@ public sealed partial class SynapseManager : IDisposable
         EnsureRunning();
 
         /* Closed but not yet released: the session is over. Sending on it would park reliable buffers on a dead session
-         * and put datagrams on the wire for a peer that no longer has one. */
-        if (synapseConnection.IsTornDown)
+         * and put datagrams on the wire for a peer that no longer has one. A connection closing after delivery is refused
+         * too, since every reliable send would put its close off again. */
+        if (synapseConnection.IsTornDown || synapseConnection.IsClosing)
             throw new InvalidOperationException("Cannot send on a connection that has been closed.");
 
         if (payload.Count <= MaximumPayloadSize)
@@ -611,6 +613,36 @@ public sealed partial class SynapseManager : IDisposable
     }
 
     /// <summary>
+    /// Gracefully disconnects a connection once the peer has acknowledged every reliable payload already sent on it, notifying the peer
+    /// then. Disconnects at once when nothing is outstanding, and does nothing for a connection that is already closed.
+    /// </summary>
+    /// <param name="synapseConnection">The connection to close.</param>
+    /// <remarks>
+    /// <para>
+    /// <see cref="Disconnect"/> tears the connection down in the call, and its unacknowledged reliable payloads with it, so a payload
+    /// lost on its first send is never resent. Here the connection stays until the peer has acknowledged them, which is what lets a
+    /// last message, such as the reason for a kick, survive loss. Nothing new goes on the wire: the resends and the disconnect are the
+    /// packets either path sends.
+    /// </para>
+    /// <para>
+    /// While it waits the connection is closing: <see cref="Send"/> refuses it and nothing it sends is delivered. The ordinary limits
+    /// still bound it, so a peer that never acknowledges is dropped by the retry limit or the timeout, each of which raises
+    /// <see cref="ConnectionClosed"/> as it does for any connection.
+    /// </para>
+    /// </remarks>
+    public void DisconnectAfterDelivery(SynapseConnection synapseConnection)
+    {
+        if (synapseConnection.IsTornDown || synapseConnection.PendingReliableQueue.Count == 0)
+        {
+            Disconnect(synapseConnection);
+
+            return;
+        }
+
+        synapseConnection.IsClosing = true;
+    }
+
+    /// <summary>
     /// Central violation handler.
     /// Constructs a <see cref="ViolationEventArgs"/> from the supplied parameters, invokes
     /// <see cref="ViolationDetected"/> (if subscribed) to obtain the desired <see cref="ViolationAction"/>,
@@ -682,6 +714,16 @@ public sealed partial class SynapseManager : IDisposable
     /// </summary>
     private void ShutdownCore()
     {
+        /* A connection closing after delivery still owes the peer the goodbye the application handed to this engine, so it is sent
+         * while the sockets are open rather than left for the peer to time out. */
+        IReadOnlyList<SynapseConnection> connections = Connections.Connections;
+
+        for (int i = 0; i < connections.Count; i++)
+        {
+            if (connections[i].IsClosing)
+                _transmissionEngine?.SendDisconnect(connections[i]);
+        }
+
         CloseSockets();
 
         for (int i = 0; i < _ingressEngines.Count; i++)

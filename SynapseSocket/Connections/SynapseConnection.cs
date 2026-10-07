@@ -161,6 +161,13 @@ public sealed partial class SynapseConnection : IPoolResettable
     [PoolResettableMember]
     internal bool IsTornDown;
     /// <summary>
+    /// True while this connection is closing after delivery: the application has asked for it to be disconnected once the peer has
+    /// acknowledged every reliable payload already sent, and until then <c>Send</c> refuses it and nothing it sends is delivered.
+    /// </summary>
+    /// <seealso cref="SynapseSocket.Core.SynapseManager.DisconnectAfterDelivery"/>
+    [PoolResettableMember]
+    internal bool IsClosing;
+    /// <summary>
     /// Handshake attempts made while this connection has been Pending, including the initial one from Connect.
     /// </summary>
     [PoolResettableMember]
@@ -240,6 +247,7 @@ public sealed partial class SynapseConnection : IPoolResettable
         UnansweredKeepAlives = 0;
         LastKeepAliveSentTicks = 0;
         LastHandshakeSentTicks = 0;
+        IsClosing = false;
         State = ConnectionState.Disconnected;
     }
 
@@ -281,6 +289,7 @@ public sealed partial class SynapseConnection : IPoolResettable
     public void OnReturn()
     {
         IsTornDown = false;
+        IsClosing = false;
         HandshakeAttempts = 0;
         RemoteEndPoint = null;
 #if NET8_0_OR_GREATER

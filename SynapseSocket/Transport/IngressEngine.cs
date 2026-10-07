@@ -44,6 +44,11 @@ internal sealed partial class IngressEngine
     /// </summary>
     internal event ConnectionHandler? TeardownRequested;
     /// <summary>
+    /// Raised when an acknowledgement leaves a connection that is closing after delivery with nothing outstanding, so the manager can
+    /// disconnect it. The ingress engine must not touch the connection after raising this.
+    /// </summary>
+    internal event ConnectionHandler? DeliveryCompleted;
+    /// <summary>
     /// Raised when a connection attempt is rejected before it can be established.
     /// </summary>
     internal event ConnectionFailedCallbackHandler? ConnectionFailed;
@@ -716,6 +721,10 @@ internal sealed partial class IngressEngine
              * <see cref="SynapseConnection.HandshakeStartedTicks"/>, which inbound traffic never refreshes. */
             synapseConnection.LastReceivedTicks = nowTicks;
 
+            // A connection closing after delivery hands the application nothing more, so its data is dropped on arrival.
+            if (synapseConnection.IsClosing)
+                return;
+
             int fastPayloadLength = length - PacketHeader.TypeSize;
 
             if (!_copyReceivedPayloads)
@@ -839,6 +848,9 @@ internal sealed partial class IngressEngine
                         // Every segment confirmed: the message is delivered, so drop it like a full ack would.
                         synapseConnection.PendingReliableQueue.Remove(sequence);
                         SynapseConnection.ReleasePendingReliable(partiallyAcked);
+
+                        if (synapseConnection.IsClosing && synapseConnection.PendingReliableQueue.Count == 0)
+                            DeliveryCompleted?.Invoke(synapseConnection);
                     }
                 }
 
@@ -858,9 +870,17 @@ internal sealed partial class IngressEngine
                         SynapseConnection.ReleasePendingReliable(acked);
                 }
 
+                // The last acknowledgement a connection closing after delivery was waiting for is what lets it close.
+                if (synapseConnection.IsClosing && synapseConnection.PendingReliableQueue.Count == 0)
+                    DeliveryCompleted?.Invoke(synapseConnection);
+
                 return;
             }
         }
+
+        // A connection closing after delivery is read only for the acknowledgements and the disconnect above; its data is dropped on arrival.
+        if (synapseConnection.IsClosing)
+            return;
 
         int payloadLength = length - headerSize;
 
