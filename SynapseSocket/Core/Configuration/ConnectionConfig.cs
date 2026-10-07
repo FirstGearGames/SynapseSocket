@@ -59,6 +59,20 @@ public sealed class ConnectionConfig
     public uint HandshakeMaximumAttempts = 10;
 
     /// <summary>
+    /// Seconds a host name passed to <see cref="SynapseSocket.Core.SynapseManager.Connect(string, int?)"/> may take to resolve
+    /// before the connect is abandoned with <see cref="SynapseSocket.Core.Events.ConnectionRejectedReason.HostResolutionFailed"/>.
+    /// Defaults to 5.
+    /// </summary>
+    /// <remarks>Covers the DNS lookup only. The handshake that follows has its own <see cref="HandshakeTimeoutMilliseconds"/>.</remarks>
+    public ushort HostResolveTimeoutSeconds = 5;
+
+    /// <summary>
+    /// Seconds an address resolved for a host name stays in <see cref="SynapseConfig.HostAddressCache"/>, so a connect to the same
+    /// name inside that window skips the lookup. Defaults to 60. Zero caches nothing.
+    /// </summary>
+    public ushort ResolvedAddressCacheSeconds = 60;
+
+    /// <summary>
     /// Sentinel value: pass as <see cref="HandshakeTimeoutMilliseconds"/> to hold a pending handshake to
     /// <see cref="TimeoutMilliseconds"/>.
     /// </summary>

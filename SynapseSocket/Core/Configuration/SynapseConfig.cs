@@ -158,6 +158,17 @@ public sealed class SynapseConfig
     public ConnectionConfig Connection = new();
 
     /// <summary>
+    /// Addresses resolved for host names passed to <see cref="SynapseManager.Connect(string, int?)"/>, each kept for
+    /// <see cref="ConnectionConfig.ResolvedAddressCacheSeconds"/>.
+    /// </summary>
+    /// <remarks>
+    /// Each configuration gets its own cache by default. Hand the same instance to every <see cref="SynapseManager"/> that should share
+    /// lookups, such as one engine per connect attempt, so a reconnect inside the window skips DNS. Read and written only on the thread
+    /// that calls <see cref="SynapseManager.Poll"/> and <see cref="SynapseManager.Connect(string, int?)"/>.
+    /// </remarks>
+    public HostAddressCache HostAddressCache = new();
+
+    /// <summary>
     /// Reliable delivery channel settings: pending queue limit, resend interval, and retry cap.
     /// </summary>
     public ReliableConfig Reliable = new();

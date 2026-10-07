@@ -410,6 +410,13 @@ public sealed partial class SynapseManager : IDisposable
             for (int i = 0; i < _ingressEngines.Count; i++)
                 _ingressEngines[i].RunMaintenance(nowTicks);
 
+            // 1c. Connect any host name lookups that have resolved, and fail those that did not.
+            AdvanceHostResolutions(nowTicks);
+
+            // The connect or a failure handler may have stopped or disposed this manager.
+            if (!_isStarted || _isDisposed)
+                return;
+
             // 2. Advance NAT hole-punch state machines for any pending FullCone connects.
             AdvanceNatPunches(nowTicks);
 
@@ -501,8 +508,7 @@ public sealed partial class SynapseManager : IDisposable
     }
 
     /// <summary>
-    /// Resolves <paramref name="host"/> through DNS and connects to the first address whose family has a bound socket,
-    /// falling back to the first resolved address. An IP address is parsed without a network lookup.
+    /// Connects to <paramref name="host"/>, which is an IP address or a host name resolved through DNS without blocking.
     /// <para>
     /// <paramref name="port"/> is required but nullable, and decides how <paramref name="host"/> is read:
     /// <list type="bullet">
@@ -514,18 +520,24 @@ public sealed partial class SynapseManager : IDisposable
     /// </list>
     /// </para>
     /// <para>
-    /// The lookup blocks the calling thread; resolve ahead of time and call <see cref="Connect(IPEndPoint)"/> where that matters.
+    /// An IP address, or a host name whose address is still in <see cref="SynapseConfig.HostAddressCache"/>, connects at once exactly
+    /// as <see cref="Connect(IPEndPoint)"/> does, and its connection is returned. Any other host name returns <see langword="null"/>:
+    /// the lookup runs in the background, <see cref="Poll"/> connects to the address it finds (the first whose family has a bound
+    /// socket, else the first), and the connection then arrives through <see cref="ConnectionEstablished"/> like any other. The address
+    /// is cached for <see cref="ConnectionConfig.ResolvedAddressCacheSeconds"/>.
     /// </para>
     /// <para>
-    /// Every failure raises <see cref="ConnectionFailed"/> with <see cref="ConnectionRejectedReason.HostResolutionFailed"/> and a
-    /// message naming the host and the cause before it throws. A port outside 1 to 65535, or a <see langword="null"/> port with
-    /// a <paramref name="host"/> that is not in <c>host:port</c> form, throws <see cref="ArgumentException"/>. A lookup that fails
-    /// or finds no addresses throws <see cref="SocketException"/>, and an empty or over-long host name throws <see cref="ArgumentException"/>.
+    /// A lookup that fails, finds no address, or outlasts <see cref="ConnectionConfig.HostResolveTimeoutSeconds"/> raises
+    /// <see cref="ConnectionFailed"/> with <see cref="ConnectionRejectedReason.HostResolutionFailed"/> and a message naming the host and
+    /// the cause, from <see cref="Poll"/>. A malformed call raises the same event and then throws <see cref="ArgumentException"/>: a port
+    /// outside 1 to 65535, a <see langword="null"/> port with a <paramref name="host"/> not in <c>host:port</c> form, or an empty or
+    /// over-long host name.
     /// </para>
     /// </summary>
     /// <param name="host">The host name or IP address, carrying <c>:port</c> only when <paramref name="port"/> is <see langword="null"/>.</param>
     /// <param name="port">The remote port from 1 to 65535, or <see langword="null"/> to parse the port from <paramref name="host"/>.</param>
-    public SynapseConnection Connect(string host, int? port)
+    /// <returns>The connection when it could start at once, or <see langword="null"/> while a host name resolves.</returns>
+    public SynapseConnection? Connect(string host, int? port)
     {
         EnsureRunning();
 
@@ -559,38 +571,12 @@ public sealed partial class SynapseManager : IDisposable
                 host = host.Substring(1, host.Length - 2);
         }
 
-        IPAddress[] addresses;
+        if (IPAddress.TryParse(host, out IPAddress? address) || Config.HostAddressCache.TryGet(host, Clock.Ticks, out address))
+            return Connect(new IPEndPoint(address, resolvedPort));
 
-        try
-        {
-            addresses = Dns.GetHostAddresses(host);
-        }
-        catch (Exception exception) when (exception is SocketException or ArgumentException)
-        {
-            RaiseConnectionFailed(null, ConnectionRejectedReason.HostResolutionFailed, $"DNS lookup for '{host}' failed: {exception.Message}");
+        BeginHostResolution(host, resolvedPort);
 
-            throw;
-        }
-
-        if (addresses.Length == 0)
-        {
-            RaiseConnectionFailed(null, ConnectionRejectedReason.HostResolutionFailed, $"DNS lookup for '{host}' returned no addresses.");
-
-            throw new SocketException((int)SocketError.HostNotFound);
-        }
-
-        IPAddress chosenAddress = addresses[0];
-
-        foreach (IPAddress address in addresses)
-        {
-            if (IsFamilyBound(address.AddressFamily))
-            {
-                chosenAddress = address;
-                break;
-            }
-        }
-
-        return Connect(new IPEndPoint(chosenAddress, resolvedPort));
+        return null;
     }
 
     /// <summary>
@@ -829,6 +815,7 @@ public sealed partial class SynapseManager : IDisposable
         // Cleared before the teardown raises ConnectionReleased, so no punch still points at a released connection.
         // A punch that a ConnectionReleased handler registers by restarting the engine and connecting again survives.
         _natPunches.Clear();
+        _hostResolutions.Clear();
         TeardownAllConnections();
     }
 

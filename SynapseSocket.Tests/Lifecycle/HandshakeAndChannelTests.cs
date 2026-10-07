@@ -45,38 +45,71 @@ public class HandshakeAndChannelTests
     }
 
     [Fact]
-    public void Connect_By_Host_Name_Resolves_And_Establishes()
+    public void Connect_By_Host_Name_Resolves_Without_Blocking_And_Establishes()
     {
         int port = TestHarness.GetFreePort();
         using SynapseManager server = new(TestHarness.ServerConfig(port));
         using SynapseManager client = new(TestHarness.ClientConfig());
+        SynapseConnection? establishedConnection = null;
+        client.ConnectionEstablished += (connectionEventArgs) => establishedConnection = connectionEventArgs.Connection;
 
         server.Start();
         client.Start();
 
-        // "localhost" can resolve to ::1 first; the overload must pick the address family the client actually bound.
-        SynapseConnection synapseConnection = client.Connect("localhost", port);
+        // A host name is looked up in the background, so nothing is connected yet when the call returns.
+        Assert.Null(client.Connect("localhost", port));
 
-        Assert.True(TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 2000, server, client),
+        // "localhost" can resolve to ::1 first; the engine must pick the address family the client actually bound.
+        Assert.True(TestHarness.PumpUntil(() => establishedConnection is { State: ConnectionState.Connected }, 2000, server, client),
             "connection by host name never established");
     }
 
     [Theory]
-    [InlineData("localhost:{0}")]
-    [InlineData("127.0.0.1:{0}")]
-    public void Connect_By_Host_And_Port_String_Establishes(string format)
+    [InlineData("localhost:{0}", false)]
+    [InlineData("127.0.0.1:{0}", true)]
+    public void Connect_By_Host_And_Port_String_Establishes(string format, bool isConnectedAtOnce)
     {
         int port = TestHarness.GetFreePort();
         using SynapseManager server = new(TestHarness.ServerConfig(port));
         using SynapseManager client = new(TestHarness.ClientConfig());
+        SynapseConnection? establishedConnection = null;
+        client.ConnectionEstablished += (connectionEventArgs) => establishedConnection = connectionEventArgs.Connection;
 
         server.Start();
         client.Start();
 
-        SynapseConnection synapseConnection = client.Connect(string.Format(format, port), port: null);
+        // An IP address connects at once; a host name returns nothing until it resolves.
+        SynapseConnection? synapseConnection = client.Connect(string.Format(format, port), port: null);
+        Assert.Equal(isConnectedAtOnce, synapseConnection is not null);
 
-        Assert.True(TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 2000, server, client),
+        Assert.True(TestHarness.PumpUntil(() => establishedConnection is { State: ConnectionState.Connected }, 2000, server, client),
             "connection by host:port string never established");
+    }
+
+    [Fact]
+    public void Connect_By_Cached_Host_Name_Connects_At_Once()
+    {
+        int port = TestHarness.GetFreePort();
+        HostAddressCache hostAddressCache = new();
+        using SynapseManager server = new(TestHarness.ServerConfig(port));
+        using SynapseManager firstClient = new(TestHarness.ClientConfig(config => config.HostAddressCache = hostAddressCache));
+        using SynapseManager secondClient = new(TestHarness.ClientConfig(config => config.HostAddressCache = hostAddressCache));
+        bool isFirstEstablished = false;
+        firstClient.ConnectionEstablished += (_) => isFirstEstablished = true;
+
+        server.Start();
+        firstClient.Start();
+        secondClient.Start();
+
+        Assert.Null(firstClient.Connect("localhost", port));
+        Assert.True(TestHarness.PumpUntil(() => isFirstEstablished, 2000, server, firstClient), "first connection by host name never established");
+
+        // The second engine shares the cache, so the name it was handed resolves without a lookup.
+        SynapseConnection? cachedConnection = secondClient.Connect("localhost", port);
+
+        Assert.NotNull(cachedConnection);
+        Assert.True(TestHarness.PumpUntil(() => cachedConnection.State == ConnectionState.Connected, 2000, server, secondClient),
+            "connection by cached host name never established");
     }
 
     [Theory]
@@ -115,16 +148,25 @@ public class HandshakeAndChannelTests
     }
 
     [Fact]
-    public void Connect_By_Unresolvable_Host_Raises_ConnectionFailed_And_Throws()
+    public void Connect_By_Unresolvable_Host_Raises_ConnectionFailed_From_Poll()
     {
         using SynapseManager client = new(TestHarness.ClientConfig());
+        ConnectionRejectedReason? failedReason = null;
         string? failedMessage = null;
-        client.ConnectionFailed += (connectionFailedEventArgs) => failedMessage = connectionFailedEventArgs.Message;
+        client.ConnectionFailed += (connectionFailedEventArgs) =>
+        {
+            failedReason = connectionFailedEventArgs.Reason;
+            failedMessage = connectionFailedEventArgs.Message;
+        };
         client.Start();
 
         // The .invalid top-level domain is reserved and never resolves (RFC 6761).
-        Assert.ThrowsAny<System.Net.Sockets.SocketException>(() => client.Connect("synapse.invalid:7777", port: null));
+        Assert.Null(client.Connect("synapse.invalid:7777", port: null));
+        Assert.True(TestHarness.PumpUntil(() => failedMessage is not null, 10000, client), "an unresolvable host never reported its failure");
+
+        Assert.Equal(ConnectionRejectedReason.HostResolutionFailed, failedReason);
         Assert.Contains("synapse.invalid", failedMessage);
+        Assert.Empty(client.Connections.Connections);
     }
 
     [Fact]
