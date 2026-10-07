@@ -501,53 +501,63 @@ public sealed partial class SynapseManager : IDisposable
     }
 
     /// <summary>
-    /// Connects to a remote given as one <c>host:port</c> string, such as <c>"play.example.com:7777"</c>,
-    /// <c>"127.0.0.1:7777"</c> or <c>"[::1]:7777"</c>. An IPv6 address must be wrapped in square brackets so its own
-    /// colons are not read as the port separator. The host is resolved exactly as <see cref="Connect(string, int)"/> does.
-    /// <para>
-    /// A string with no port, an unbracketed IPv6 address, or a port outside 1 to 65535 raises
-    /// <see cref="ConnectionFailed"/> with <see cref="ConnectionRejectedReason.HostResolutionFailed"/> and then throws
-    /// <see cref="ArgumentException"/>. A failed lookup raises the same event and throws <see cref="SocketException"/>.
-    /// </para>
-    /// </summary>
-    /// <param name="hostAndPort">The host name or IP address, a colon, then the port.</param>
-    public SynapseConnection Connect(string hostAndPort)
-    {
-        EnsureRunning();
-
-        if (!TryParseHostAndPort(hostAndPort, out string host, out int port))
-        {
-            string message = $"'{hostAndPort}' is not in host:port form. Wrap an IPv6 address in square brackets, such as [::1]:7777, and use a port from 1 to 65535.";
-            RaiseConnectionFailed(null, ConnectionRejectedReason.HostResolutionFailed, message);
-
-            throw new ArgumentException(message, nameof(hostAndPort));
-        }
-
-        return Connect(host, port);
-    }
-
-    /// <summary>
     /// Resolves <paramref name="host"/> through DNS and connects to the first address whose family has a bound socket,
-    /// falling back to the first resolved address. <paramref name="host"/> is a host name such as <c>"play.example.com"</c>
-    /// or an IP address such as <c>"127.0.0.1"</c> or <c>"::1"</c> (brackets around an IPv6 address are accepted);
-    /// an IP address is parsed without a network lookup. To pass the port inside the string, use <see cref="Connect(string)"/>.
+    /// falling back to the first resolved address. An IP address is parsed without a network lookup.
+    /// <para>
+    /// <paramref name="port"/> is required but nullable, and decides how <paramref name="host"/> is read:
+    /// <list type="bullet">
+    /// <item>A port value: <paramref name="host"/> is the host alone, such as <c>"play.example.com"</c>, <c>"127.0.0.1"</c>,
+    /// <c>"::1"</c> or <c>"[::1]"</c>, and must not carry a port of its own.</item>
+    /// <item><see langword="null"/>: the port is parsed from <paramref name="host"/>, which must then be in <c>host:port</c> form,
+    /// such as <c>"play.example.com:7777"</c>, <c>"127.0.0.1:7777"</c> or <c>"[::1]:7777"</c>. An IPv6 address must be wrapped
+    /// in square brackets so its own colons are not read as the port separator.</item>
+    /// </list>
+    /// </para>
     /// <para>
     /// The lookup blocks the calling thread; resolve ahead of time and call <see cref="Connect(IPEndPoint)"/> where that matters.
     /// </para>
     /// <para>
-    /// When the lookup fails or finds no addresses, <see cref="ConnectionFailed"/> is raised with
-    /// <see cref="ConnectionRejectedReason.HostResolutionFailed"/> and a message naming the host and the cause, then
-    /// <see cref="SocketException"/> is thrown. An empty or over-long host name throws <see cref="ArgumentException"/> after the same event.
+    /// Every failure raises <see cref="ConnectionFailed"/> with <see cref="ConnectionRejectedReason.HostResolutionFailed"/> and a
+    /// message naming the host and the cause before it throws. A port outside 1 to 65535, or a <see langword="null"/> port with
+    /// a <paramref name="host"/> that is not in <c>host:port</c> form, throws <see cref="ArgumentException"/>. A lookup that fails
+    /// or finds no addresses throws <see cref="SocketException"/>, and an empty or over-long host name throws <see cref="ArgumentException"/>.
     /// </para>
     /// </summary>
-    /// <param name="host">The host name or IP address to connect to.</param>
-    /// <param name="port">The remote port, from 1 to 65535.</param>
-    public SynapseConnection Connect(string host, int port)
+    /// <param name="host">The host name or IP address, carrying <c>:port</c> only when <paramref name="port"/> is <see langword="null"/>.</param>
+    /// <param name="port">The remote port from 1 to 65535, or <see langword="null"/> to parse the port from <paramref name="host"/>.</param>
+    public SynapseConnection Connect(string host, int? port)
     {
         EnsureRunning();
 
-        if (host.Length > 1 && host[0] == '[' && host[host.Length - 1] == ']')
-            host = host.Substring(1, host.Length - 2);
+        int resolvedPort;
+
+        if (port is null)
+        {
+            if (!TryParseHostAndPort(host, out string parsedHost, out resolvedPort))
+            {
+                string message = $"'{host}' is not in host:port form, which a null port requires. Wrap an IPv6 address in square brackets, such as [::1]:7777, and use a port from 1 to 65535.";
+                RaiseConnectionFailed(null, ConnectionRejectedReason.HostResolutionFailed, message);
+
+                throw new ArgumentException(message, nameof(host));
+            }
+
+            host = parsedHost;
+        }
+        else
+        {
+            resolvedPort = port.Value;
+
+            if (resolvedPort < 1 || resolvedPort > ushort.MaxValue)
+            {
+                string message = $"Port [{resolvedPort}] for '{host}' is outside 1 to 65535.";
+                RaiseConnectionFailed(null, ConnectionRejectedReason.HostResolutionFailed, message);
+
+                throw new ArgumentException(message, nameof(port));
+            }
+
+            if (host.Length > 1 && host[0] == '[' && host[host.Length - 1] == ']')
+                host = host.Substring(1, host.Length - 2);
+        }
 
         IPAddress[] addresses;
 
@@ -580,7 +590,7 @@ public sealed partial class SynapseManager : IDisposable
             }
         }
 
-        return Connect(new IPEndPoint(chosenAddress, port));
+        return Connect(new IPEndPoint(chosenAddress, resolvedPort));
     }
 
     /// <summary>
@@ -1215,8 +1225,9 @@ public sealed partial class SynapseManager : IDisposable
     }
 
     /// <summary>
-    /// Splits <c>host:port</c> or <c>[ipv6]:port</c> at the last colon. A host with more than one colon outside
-    /// brackets is an unbracketed IPv6 address, whose port cannot be told apart from its last group, so it is refused.
+    /// Splits <c>host:port</c> or <c>[ipv6]:port</c> at the last colon, returning a bracketed IPv6 host without its brackets.
+    /// A host with more than one colon outside brackets is an unbracketed IPv6 address, whose port cannot be told apart
+    /// from its last group, so it is refused.
     /// </summary>
     private static bool TryParseHostAndPort(string hostAndPort, out string host, out int port)
     {
@@ -1233,10 +1244,15 @@ public sealed partial class SynapseManager : IDisposable
 
         host = hostAndPort.Substring(0, separatorIndex);
 
-        if (host[0] == '[')
-            return host.Length > 2 && host[host.Length - 1] == ']';
+        if (host[0] != '[')
+            return host.IndexOf(':') < 0;
 
-        return host.IndexOf(':') < 0;
+        if (host.Length <= 2 || host[host.Length - 1] != ']')
+            return false;
+
+        host = host.Substring(1, host.Length - 2);
+
+        return true;
     }
 
 

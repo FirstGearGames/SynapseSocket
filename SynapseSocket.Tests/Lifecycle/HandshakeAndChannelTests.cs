@@ -73,7 +73,7 @@ public class HandshakeAndChannelTests
         server.Start();
         client.Start();
 
-        SynapseConnection synapseConnection = client.Connect(string.Format(format, port));
+        SynapseConnection synapseConnection = client.Connect(string.Format(format, port), port: null);
 
         Assert.True(TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 2000, server, client),
             "connection by host:port string never established");
@@ -95,7 +95,22 @@ public class HandshakeAndChannelTests
         client.ConnectionFailed += (connectionFailedEventArgs) => failedReason = connectionFailedEventArgs.Reason;
         client.Start();
 
-        Assert.Throws<ArgumentException>(() => client.Connect(hostAndPort));
+        Assert.Throws<ArgumentException>(() => client.Connect(hostAndPort, port: null));
+        Assert.Equal(ConnectionRejectedReason.HostResolutionFailed, failedReason);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(65536)]
+    public void Connect_With_Out_Of_Range_Port_Raises_ConnectionFailed_And_Throws(int port)
+    {
+        using SynapseManager client = new(TestHarness.ClientConfig());
+        ConnectionRejectedReason? failedReason = null;
+        client.ConnectionFailed += (connectionFailedEventArgs) => failedReason = connectionFailedEventArgs.Reason;
+        client.Start();
+
+        Assert.Throws<ArgumentException>(() => client.Connect("localhost", port));
         Assert.Equal(ConnectionRejectedReason.HostResolutionFailed, failedReason);
     }
 
@@ -108,7 +123,7 @@ public class HandshakeAndChannelTests
         client.Start();
 
         // The .invalid top-level domain is reserved and never resolves (RFC 6761).
-        Assert.ThrowsAny<System.Net.Sockets.SocketException>(() => client.Connect("synapse.invalid:7777"));
+        Assert.ThrowsAny<System.Net.Sockets.SocketException>(() => client.Connect("synapse.invalid:7777", port: null));
         Assert.Contains("synapse.invalid", failedMessage);
     }
 
