@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
@@ -41,7 +42,7 @@ public sealed partial class SynapseManager : IDisposable
     /// Raised once a closed connection's pooled buffers have been released, which is the last point to drop every
     /// reference kept to it. Once the handlers return, the object goes back to a pool shared by every
     /// <see cref="SynapseManager"/> on this thread, and may be handed to a new session, for any peer, by the next
-    /// <see cref="Connect"/> or inbound handshake. A reference kept past this event may therefore point at somebody
+    /// <see cref="Connect(IPEndPoint)"/> or inbound handshake. A reference kept past this event may therefore point at somebody
     /// else's session. When the peer reconnected from the same endpoint, the same object instead goes straight on to
     /// carry the new session and <see cref="ConnectionEstablished"/> follows.
     /// <para>
@@ -500,6 +501,89 @@ public sealed partial class SynapseManager : IDisposable
     }
 
     /// <summary>
+    /// Connects to a remote given as one <c>host:port</c> string, such as <c>"play.example.com:7777"</c>,
+    /// <c>"127.0.0.1:7777"</c> or <c>"[::1]:7777"</c>. An IPv6 address must be wrapped in square brackets so its own
+    /// colons are not read as the port separator. The host is resolved exactly as <see cref="Connect(string, int)"/> does.
+    /// <para>
+    /// A string with no port, an unbracketed IPv6 address, or a port outside 1 to 65535 raises
+    /// <see cref="ConnectionFailed"/> with <see cref="ConnectionRejectedReason.HostResolutionFailed"/> and then throws
+    /// <see cref="ArgumentException"/>. A failed lookup raises the same event and throws <see cref="SocketException"/>.
+    /// </para>
+    /// </summary>
+    /// <param name="hostAndPort">The host name or IP address, a colon, then the port.</param>
+    public SynapseConnection Connect(string hostAndPort)
+    {
+        EnsureRunning();
+
+        if (!TryParseHostAndPort(hostAndPort, out string host, out int port))
+        {
+            string message = $"'{hostAndPort}' is not in host:port form. Wrap an IPv6 address in square brackets, such as [::1]:7777, and use a port from 1 to 65535.";
+            RaiseConnectionFailed(null, ConnectionRejectedReason.HostResolutionFailed, message);
+
+            throw new ArgumentException(message, nameof(hostAndPort));
+        }
+
+        return Connect(host, port);
+    }
+
+    /// <summary>
+    /// Resolves <paramref name="host"/> through DNS and connects to the first address whose family has a bound socket,
+    /// falling back to the first resolved address. <paramref name="host"/> is a host name such as <c>"play.example.com"</c>
+    /// or an IP address such as <c>"127.0.0.1"</c> or <c>"::1"</c> (brackets around an IPv6 address are accepted);
+    /// an IP address is parsed without a network lookup. To pass the port inside the string, use <see cref="Connect(string)"/>.
+    /// <para>
+    /// The lookup blocks the calling thread; resolve ahead of time and call <see cref="Connect(IPEndPoint)"/> where that matters.
+    /// </para>
+    /// <para>
+    /// When the lookup fails or finds no addresses, <see cref="ConnectionFailed"/> is raised with
+    /// <see cref="ConnectionRejectedReason.HostResolutionFailed"/> and a message naming the host and the cause, then
+    /// <see cref="SocketException"/> is thrown. An empty or over-long host name throws <see cref="ArgumentException"/> after the same event.
+    /// </para>
+    /// </summary>
+    /// <param name="host">The host name or IP address to connect to.</param>
+    /// <param name="port">The remote port, from 1 to 65535.</param>
+    public SynapseConnection Connect(string host, int port)
+    {
+        EnsureRunning();
+
+        if (host.Length > 1 && host[0] == '[' && host[host.Length - 1] == ']')
+            host = host.Substring(1, host.Length - 2);
+
+        IPAddress[] addresses;
+
+        try
+        {
+            addresses = Dns.GetHostAddresses(host);
+        }
+        catch (Exception exception) when (exception is SocketException or ArgumentException)
+        {
+            RaiseConnectionFailed(null, ConnectionRejectedReason.HostResolutionFailed, $"DNS lookup for '{host}' failed: {exception.Message}");
+
+            throw;
+        }
+
+        if (addresses.Length == 0)
+        {
+            RaiseConnectionFailed(null, ConnectionRejectedReason.HostResolutionFailed, $"DNS lookup for '{host}' returned no addresses.");
+
+            throw new SocketException((int)SocketError.HostNotFound);
+        }
+
+        IPAddress chosenAddress = addresses[0];
+
+        foreach (IPAddress address in addresses)
+        {
+            if (IsFamilyBound(address.AddressFamily))
+            {
+                chosenAddress = address;
+                break;
+            }
+        }
+
+        return Connect(new IPEndPoint(chosenAddress, port));
+    }
+
+    /// <summary>
     /// Sends an unreliable payload on the given connection.
     /// When the payload exceeds the MTU, behaviour is controlled by <see cref="SegmentConfig.UnreliableMode"/>:
     /// <list type="bullet">
@@ -827,6 +911,20 @@ public sealed partial class SynapseManager : IDisposable
     }
 
     /// <summary>
+    /// Whether a socket is bound for the given address family.
+    /// </summary>
+    private bool IsFamilyBound(AddressFamily addressFamily)
+    {
+        foreach (IPEndPoint boundEndPoint in _boundEndPoints)
+        {
+            if (boundEndPoint.AddressFamily == addressFamily)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// OS-connects the bound socket whose address family matches the remote, switching its ingress drain and every send
     /// addressed to the remote onto the endpoint-free connected socket calls.
     /// </summary>
@@ -1088,7 +1186,7 @@ public sealed partial class SynapseManager : IDisposable
     /// </summary>
     /// <remarks>
     /// After its event, each connection object goes back to its pool. The pool is a static thread-local stack shared by
-    /// every <see cref="SynapseManager"/> on the thread, so the next <see cref="Connect"/> or inbound handshake on this
+    /// every <see cref="SynapseManager"/> on the thread, so the next <see cref="Connect(IPEndPoint)"/> or inbound handshake on this
     /// thread, from any manager, may be handed the same object for an unrelated peer. <see cref="ConnectionReleased"/> is
     /// therefore the last point at which the application may hold the object. The event is raised before the return, so
     /// its handlers still see the connection's identity intact. See F16 in <c>docs/ROBUSTNESS_SWEEP.md</c>.
@@ -1114,6 +1212,31 @@ public sealed partial class SynapseManager : IDisposable
 
             ResettableObjectPool<SynapseConnection>.Return(synapseConnection);
         }
+    }
+
+    /// <summary>
+    /// Splits <c>host:port</c> or <c>[ipv6]:port</c> at the last colon. A host with more than one colon outside
+    /// brackets is an unbracketed IPv6 address, whose port cannot be told apart from its last group, so it is refused.
+    /// </summary>
+    private static bool TryParseHostAndPort(string hostAndPort, out string host, out int port)
+    {
+        host = string.Empty;
+        port = 0;
+
+        int separatorIndex = hostAndPort.LastIndexOf(':');
+
+        if (separatorIndex <= 0)
+            return false;
+
+        if (!int.TryParse(hostAndPort.Substring(separatorIndex + 1), NumberStyles.None, CultureInfo.InvariantCulture, out port) || port < 1 || port > ushort.MaxValue)
+            return false;
+
+        host = hostAndPort.Substring(0, separatorIndex);
+
+        if (host[0] == '[')
+            return host.Length > 2 && host[host.Length - 1] == ']';
+
+        return host.IndexOf(':') < 0;
     }
 
 

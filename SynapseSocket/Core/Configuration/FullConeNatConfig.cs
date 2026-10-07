@@ -2,7 +2,7 @@ namespace SynapseSocket.Core.Configuration;
 
 /// <summary>
 /// Settings specific to <see cref="NatTraversalMode.FullCone"/> hole punching.
-/// Both peers must already know each other's external endpoint before calling <see cref="SynapseSocket.Core.SynapseManager.Connect"/>.
+/// Both peers must already know each other's external endpoint before calling <see cref="SynapseSocket.Core.SynapseManager.Connect(System.Net.IPEndPoint)"/>.
 /// </summary>
 public sealed class FullConeNatConfig
 {

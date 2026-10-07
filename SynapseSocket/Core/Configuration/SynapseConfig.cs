@@ -138,7 +138,7 @@ public sealed class SynapseConfig
     public bool EnableTelemetry = false;
 
     /// <summary>
-    /// OS-connects the bound socket to the single remote passed to <see cref="SynapseManager.Connect"/>, so datagrams flow
+    /// OS-connects the bound socket to the single remote passed to <see cref="SynapseManager.Connect(IPEndPoint)"/>, so datagrams flow
     /// through the endpoint-free Receive and Send socket calls instead of ReceiveFrom and SendTo.
     /// </summary>
     /// <remarks>
@@ -147,8 +147,8 @@ public sealed class SynapseConfig
     /// other way around either cost. A connected socket touches no endpoint at all in steady state, on every runtime.
     /// The OS also filters inbound datagrams to the connected remote, so this mode is only for an engine that talks to exactly
     /// one peer: it cannot host multiple remotes, and it cannot receive the third-party probes full-cone NAT traversal relies on
-    /// (<see cref="SynapseManager.Connect"/> rejects the combination). The socket connects to the first
-    /// <see cref="SynapseManager.Connect"/> target whose address family matches a bound socket.
+    /// (<see cref="SynapseManager.Connect(IPEndPoint)"/> rejects the combination). The socket connects to the first
+    /// <see cref="SynapseManager.Connect(IPEndPoint)"/> target whose address family matches a bound socket.
     /// </remarks>
     public bool ConnectedSocketEnabled = false;
 

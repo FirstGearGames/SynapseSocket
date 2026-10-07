@@ -35,7 +35,7 @@ public class SegmentationTests
         server.Start();
         client.Start();
 
-        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 2000, server, client);
 
         byte[] payload = new byte[4096];
@@ -63,7 +63,7 @@ public class SegmentationTests
         server.Start();
         client.Start();
 
-        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 2000, server, client);
 
         byte[] oversizedPayload = new byte[1024];

@@ -77,7 +77,7 @@ public class HandshakeTimeoutTests
         client.Start();
 
         Stopwatch stopwatch = Stopwatch.StartNew();
-        synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        synapseConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
 
         Assert.True(TestHarness.PumpUntil(() => clientEventRecorder.ConnectionsClosed >= 1, CloseWaitMilliseconds, client), "The unanswered handshake was not closed before the idle timeout could have fired.");
 
@@ -110,7 +110,7 @@ public class HandshakeTimeoutTests
         server.Start();
         client.Start();
 
-        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => synapseConnection.State is ConnectionState.Connected && server.Connections.Count == 1, 2000, server, client), "The handshake never completed on both sides.");
 
         TestHarness.PumpFor(HandshakeTimeoutMilliseconds * 4, server, client);
@@ -213,7 +213,7 @@ public class HandshakeTimeoutTests
         client.Start();
 
         Stopwatch stopwatch = Stopwatch.StartNew();
-        client.Connect(new(IPAddress.Loopback, port));
+        client.Connect(new IPEndPoint(IPAddress.Loopback, port));
 
         Assert.True(TestHarness.PumpUntil(() => clientEventRecorder.ConnectionsClosed >= 1, CloseWaitMilliseconds, client), "The unanswered handshake never timed out on the idle timeout.");
 

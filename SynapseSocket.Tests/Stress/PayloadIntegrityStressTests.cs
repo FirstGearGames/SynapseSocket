@@ -139,7 +139,7 @@ public class PayloadIntegrityStressTests
             server.Start();
             client.Start();
 
-            SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+            SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
             TestHarness.PumpUntil(() => connection.State == ConnectionState.Connected, 2000, server, client);
 
             // Hold a batch of shared-pool canaries across this cycle's traffic. If the engine returns one of its
@@ -240,7 +240,7 @@ public class PayloadIntegrityStressTests
             server.Start();
             client.Start();
 
-            SynapseConnection toServer = client.Connect(new(IPAddress.Loopback, port));
+            SynapseConnection toServer = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
             TestHarness.PumpUntil(() => toServer.State == ConnectionState.Connected && toClient is not null, 2000, server, client);
 
             List<(byte[] buffer, int length, uint seed)> canaries = RentCanaries(cycle);
@@ -338,7 +338,7 @@ public class PayloadIntegrityStressTests
             server.Start();
             client.Start();
 
-            SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+            SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
             TestHarness.PumpUntil(() => connection.State == ConnectionState.Connected, 2_000, server, client);
 
             List<(byte[] buffer, int length, uint seed)> canaries = RentCanaries(cycle);
@@ -411,7 +411,7 @@ public class PayloadIntegrityStressTests
             server.Start();
             client.Start();
 
-            SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+            SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
             TestHarness.PumpUntil(() => connection.State == ConnectionState.Connected, 2_000, server, client);
 
             // Warm up first. The receive buffer can only reach the pool once unreliable payloads have actually been
@@ -492,7 +492,7 @@ public class PayloadIntegrityStressTests
             server.Start();
             client.Start();
 
-            SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+            SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
             Assert.True(TestHarness.PumpUntil(() => connection.State == ConnectionState.Connected, 2_000, server, client), "the client never connected");
 
             for (int message = 0; message < Messages; message++)

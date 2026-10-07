@@ -51,7 +51,7 @@ public class ConnectionReleasedTests
         server.Start();
         client.Start();
 
-        SynapseConnection clientConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection clientConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => server.Connections.Count == 1 && clientConnection.State is ConnectionState.Connected, WaitMilliseconds, server, client), "The handshake did not complete.");
 
         SynapseConnection serverConnection = server.Connections.Connections[0];
@@ -88,8 +88,8 @@ public class ConnectionReleasedTests
         firstClient.Start();
         secondClient.Start();
 
-        firstClient.Connect(new(IPAddress.Loopback, port));
-        secondClient.Connect(new(IPAddress.Loopback, port));
+        firstClient.Connect(new IPEndPoint(IPAddress.Loopback, port));
+        secondClient.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => serverEventLog.Count(EventKind.Established) == 2, WaitMilliseconds, server, firstClient, secondClient), "The handshakes did not complete.");
 
         List<SynapseConnection> openConnections = [.. server.Connections.Connections];
@@ -147,9 +147,9 @@ public class ConnectionReleasedTests
         secondClient.Start();
         thirdClient.Start();
 
-        firstClient.Connect(new(IPAddress.Loopback, port));
-        secondClient.Connect(new(IPAddress.Loopback, port));
-        thirdClient.Connect(new(IPAddress.Loopback, port));
+        firstClient.Connect(new IPEndPoint(IPAddress.Loopback, port));
+        secondClient.Connect(new IPEndPoint(IPAddress.Loopback, port));
+        thirdClient.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => serverEventLog.Count(EventKind.Established) == 3, WaitMilliseconds, server, firstClient, secondClient, thirdClient), "The handshakes did not complete.");
 
         List<SynapseConnection> openConnections = [.. server.Connections.Connections];
@@ -179,11 +179,11 @@ public class ConnectionReleasedTests
         firstClient.Start();
         secondClient.Start();
 
-        SynapseConnection firstClientConnection = firstClient.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection firstClientConnection = firstClient.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => serverEventLog.Count(EventKind.Established) == 1, WaitMilliseconds, server, firstClient), "The first handshake did not complete.");
         SynapseConnection firstServerConnection = server.Connections.Connections[0];
 
-        secondClient.Connect(new(IPAddress.Loopback, port));
+        secondClient.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => serverEventLog.Count(EventKind.Established) == 2, WaitMilliseconds, server, firstClient, secondClient), "The second handshake did not complete.");
         SynapseConnection secondServerConnection = server.Connections.Connections[0] == firstServerConnection ? server.Connections.Connections[1] : server.Connections.Connections[0];
 
@@ -226,7 +226,7 @@ public class ConnectionReleasedTests
         List<SynapseConnection> rentedConnections = [];
 
         for (int i = 0; i < releasedConnections.Count + SpareConnectionCount; i++)
-            rentedConnections.Add(renter.Connect(new(IPAddress.Loopback, TestHarness.GetFreePort())));
+            rentedConnections.Add(renter.Connect(new IPEndPoint(IPAddress.Loopback, TestHarness.GetFreePort())));
 
         Assert.True(rentedConnections.Distinct().Count() == rentedConnections.Count, "The pool handed one connection object out twice, so it had been returned twice.");
 
@@ -319,7 +319,7 @@ public class ConnectionReleasedTests
         server.Start();
         client.Start();
 
-        client.Connect(new(IPAddress.Loopback, port));
+        client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => serverEventLog.Count(EventKind.Established) == 1, WaitMilliseconds, server, client), "The handshake did not complete.");
         SynapseConnection serverConnection = server.Connections.Connections[0];
 
@@ -348,7 +348,7 @@ public class ConnectionReleasedTests
         server.Start();
         client.Start();
 
-        SynapseConnection clientConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection clientConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => serverEventLog.Count(EventKind.Established) == 1 && clientConnection.State is ConnectionState.Connected, WaitMilliseconds, server, client), "The handshake did not complete.");
 
         int releasedCountInsideHandler = -1;
@@ -426,7 +426,7 @@ public class ConnectionReleasedTests
         server.Start();
         client.Start();
 
-        SynapseConnection clientConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection clientConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => clientEventLog.Count(EventKind.Established) == 1, WaitMilliseconds, server, client), "The handshake did not complete.");
         Assert.Single(client.Connections.ConnectionsBySignature);
 
@@ -528,7 +528,7 @@ public class ConnectionReleasedTests
         };
 
         client.Start();
-        client.Connect(new(IPAddress.Loopback, TestHarness.GetFreePort()));
+        client.Connect(new IPEndPoint(IPAddress.Loopback, TestHarness.GetFreePort()));
 
         Assert.True(TestHarness.PumpUntil(() => !client.IsRunning, WaitMilliseconds, client), "The hole-punch never gave up.");
         Assert.Equal(new[] { EventKind.Released }, clientEventLog.Kinds);
@@ -594,7 +594,7 @@ public class ConnectionReleasedTests
         server.Start();
         client.Start();
 
-        SynapseConnection clientConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection clientConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => server.Connections.Count == 1 && clientConnection.State is ConnectionState.Connected, WaitMilliseconds, server, client), "The handshake did not complete.");
 
         // The manager drops its engines on shutdown, so the engine is held here to inspect it afterwards.

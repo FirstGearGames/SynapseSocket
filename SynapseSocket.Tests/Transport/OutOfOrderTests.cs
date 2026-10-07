@@ -49,7 +49,7 @@ public class OutOfOrderTests
         server.Start();
         client.Start();
 
-        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 3000, server, client),
             "client did not reach Connected state");
 
@@ -104,7 +104,7 @@ public class OutOfOrderTests
         server.Start();
         client.Start();
 
-        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 3000, server, client),
             "client did not reach Connected state");
 
@@ -151,7 +151,7 @@ public class OutOfOrderTests
         server.Start();
         client.Start();
 
-        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 3000, server, client),
             "client did not reach Connected state");
 

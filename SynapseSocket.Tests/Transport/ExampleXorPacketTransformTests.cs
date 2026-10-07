@@ -206,7 +206,7 @@ public class ExampleXorPacketTransformTests
         server.Start();
         client.Start();
 
-        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 5000, server, client), "peers never completed the masked handshake");
 
         return synapseConnection;

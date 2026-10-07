@@ -185,7 +185,7 @@ public class PacketTransformTests
         server.Start();
         client.Start();
 
-        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
 
         Assert.False(TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 1500, server, client), "an untransformed peer completed the handshake against a transformed engine");
         Assert.Contains(ViolationReason.TransformRejected, violationReasons);
@@ -249,7 +249,7 @@ public class PacketTransformTests
         server.Start();
         client.Start();
 
-        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 5000, server, client), "peers never completed the handshake through the transform");
 
         return synapseConnection;

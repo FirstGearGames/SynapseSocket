@@ -38,7 +38,7 @@ public class ConnectedSocketTests
         server.Start();
         client.Start();
 
-        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 2000, server, client), "The connected-socket client never completed the handshake.");
 
         client.Send(synapseConnection, Encoding.UTF8.GetBytes("ping-unreliable"), isReliable: false);
@@ -71,6 +71,6 @@ public class ConnectedSocketTests
 
         client.Start();
 
-        Assert.Throws<InvalidOperationException>(() => client.Connect(new(IPAddress.Loopback, port)));
+        Assert.Throws<InvalidOperationException>(() => client.Connect(new IPEndPoint(IPAddress.Loopback, port)));
     }
 }

@@ -56,7 +56,7 @@ public class SignatureValidatorTests
         server.Start();
         client.Start();
 
-        client.Connect(new(IPAddress.Loopback, port));
+        client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => eventRecorder.ConnectionsEstablished >= 1, 2000, server, client));
         Assert.True(validator.Calls >= 1, "custom validator should be called at least once");
     }
@@ -77,7 +77,7 @@ public class SignatureValidatorTests
 
         server.Start();
         client.Start();
-        client.Connect(new(IPAddress.Loopback, port));
+        client.Connect(new IPEndPoint(IPAddress.Loopback, port));
 
         Assert.True(TestHarness.PumpUntil(
             () => eventRecorder.FailureReasons.Contains(ConnectionRejectedReason.SignatureRejected), 2000, server, client));
@@ -101,7 +101,7 @@ public class SignatureValidatorTests
 
         server.Start();
         client.Start();
-        client.Connect(new(IPAddress.Loopback, port));
+        client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         TestHarness.PumpUntil(() => eventRecorder.ConnectionsEstablished >= 1, 2000, server, client);
 
         // Server should have created the connection with the FIXED signature.

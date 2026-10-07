@@ -22,7 +22,7 @@ public class TelemetryAndLatencyTests
         server.Start();
         client.Start();
 
-        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 2000, server, client);
 
         client.Send(synapseConnection, Encoding.UTF8.GetBytes("abc"), isReliable: false);
@@ -54,7 +54,7 @@ public class TelemetryAndLatencyTests
         client.Start();
 
         // Handshake is exempt from the sim, so the connection establishes normally.
-        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => eventRecorder.ConnectionsEstablished >= 1, 2000, server, client));
 
         // Data packets are subject to 100% loss and must never arrive.
@@ -82,7 +82,7 @@ public class TelemetryAndLatencyTests
         client.Start();
 
         // Handshake is exempt. Connect first, then measure a data packet's trip time.
-        SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => eventRecorder.ConnectionsEstablished >= 1, 2000, server, client));
 
         DateTime startTime = DateTime.UtcNow;
@@ -121,7 +121,7 @@ public class TelemetryAndLatencyTests
         server.Start();
         client.Start();
 
-        SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => recorder.ConnectionsEstablished >= 1, 5000, server, client));
 
         for (int i = 0; i < PacketCount; i++)
@@ -157,7 +157,7 @@ public class TelemetryAndLatencyTests
         server.Start();
         client.Start();
 
-        SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => recorder.ConnectionsEstablished >= 1, 5000, server, client));
 
         // Pump for two keep-alive cycles with room for latency.
@@ -189,7 +189,7 @@ public class TelemetryAndLatencyTests
         client.Start();
 
         // Handshake is exempt. Connect first, then measure a data packet's trip time.
-        SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => recorder.ConnectionsEstablished >= 1, 2000, server, client));
 
         DateTime sent = DateTime.UtcNow;
@@ -224,7 +224,7 @@ public class TelemetryAndLatencyTests
         server.Start();
         client.Start();
 
-        SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => recorder.ConnectionsEstablished >= 1, 2000, server, client));
 
         ArraySegment<byte> payload = new(new byte[] { 0xAB });
@@ -255,7 +255,7 @@ public class TelemetryAndLatencyTests
         server.Start();
         client.Start();
 
-        SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => recorder.ConnectionsEstablished >= 1, 5000, server, client));
 
         for (int i = 0; i < PacketCount; i++)
@@ -284,7 +284,7 @@ public class TelemetryAndLatencyTests
         client.Start();
 
         DateTime sent = DateTime.UtcNow;
-        client.Connect(new(IPAddress.Loopback, port));
+        client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => recorder.ConnectionsEstablished >= 1, 2000, server, client));
         double elapsedMs = (DateTime.UtcNow - sent).TotalMilliseconds;
 
@@ -313,7 +313,7 @@ public class TelemetryAndLatencyTests
         server.Start();
         client.Start();
 
-        SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => recorder.ConnectionsEstablished >= 1, 3000, server, client),
             "connection should establish. Handshake is exempt from the sim");
 
@@ -350,7 +350,7 @@ public class TelemetryAndLatencyTests
         server.Start();
         client.Start();
 
-        client.Connect(new(IPAddress.Loopback, port));
+        client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => serverSideConnection != null, 3000, server, client),
             "server should see the connection");
 

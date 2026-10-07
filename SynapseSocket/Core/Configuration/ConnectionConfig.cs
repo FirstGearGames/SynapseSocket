@@ -23,7 +23,7 @@ public sealed class ConnectionConfig
     /// </summary>
     /// <remarks>
     /// A connection waits on its handshake while it is <see cref="SynapseSocket.Connections.ConnectionState.Pending"/>,
-    /// which in practice is an outgoing <see cref="SynapseSocket.Core.SynapseManager.Connect"/> the remote has not yet
+    /// which in practice is an outgoing <see cref="SynapseSocket.Core.SynapseManager.Connect(System.Net.IPEndPoint)"/> the remote has not yet
     /// answered. An inbound handshake is answered and promoted to
     /// <see cref="SynapseSocket.Connections.ConnectionState.Connected"/> in the same pass that registers it, so a
     /// server never holds a connection in this state. A handshake that times out raises the same

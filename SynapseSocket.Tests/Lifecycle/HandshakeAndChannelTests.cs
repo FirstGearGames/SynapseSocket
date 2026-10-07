@@ -3,6 +3,7 @@ using System.Net;
 using System.Text;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
+using SynapseSocket.Core.Events;
 using Xunit;
 using SynapseSocket.Core.Configuration;
 
@@ -25,7 +26,7 @@ public class HandshakeAndChannelTests
         server.Start();
         client.Start();
 
-        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         TestHarness.PumpUntil(() => serverEventRecorder.ConnectionsEstablished >= 1 && clientEventRecorder.ConnectionsEstablished >= 1, 2000, server, client);
 
         return (server, client, synapseConnection, serverEventRecorder, clientEventRecorder);
@@ -41,6 +42,74 @@ public class HandshakeAndChannelTests
             Assert.Equal(1, serverEventRecorder.ConnectionsEstablished);
             Assert.Equal(1, clientEventRecorder.ConnectionsEstablished);
         }
+    }
+
+    [Fact]
+    public void Connect_By_Host_Name_Resolves_And_Establishes()
+    {
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port));
+        using SynapseManager client = new(TestHarness.ClientConfig());
+
+        server.Start();
+        client.Start();
+
+        // "localhost" can resolve to ::1 first; the overload must pick the address family the client actually bound.
+        SynapseConnection synapseConnection = client.Connect("localhost", port);
+
+        Assert.True(TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 2000, server, client),
+            "connection by host name never established");
+    }
+
+    [Theory]
+    [InlineData("localhost:{0}")]
+    [InlineData("127.0.0.1:{0}")]
+    public void Connect_By_Host_And_Port_String_Establishes(string format)
+    {
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port));
+        using SynapseManager client = new(TestHarness.ClientConfig());
+
+        server.Start();
+        client.Start();
+
+        SynapseConnection synapseConnection = client.Connect(string.Format(format, port));
+
+        Assert.True(TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 2000, server, client),
+            "connection by host:port string never established");
+    }
+
+    [Theory]
+    [InlineData("localhost")]
+    [InlineData("localhost:")]
+    [InlineData(":7777")]
+    [InlineData("localhost:0")]
+    [InlineData("localhost:65536")]
+    [InlineData("localhost:77a")]
+    [InlineData("::1:7777")]
+    [InlineData("[]:7777")]
+    public void Connect_By_Malformed_Host_And_Port_Raises_ConnectionFailed_And_Throws(string hostAndPort)
+    {
+        using SynapseManager client = new(TestHarness.ClientConfig());
+        ConnectionRejectedReason? failedReason = null;
+        client.ConnectionFailed += (connectionFailedEventArgs) => failedReason = connectionFailedEventArgs.Reason;
+        client.Start();
+
+        Assert.Throws<ArgumentException>(() => client.Connect(hostAndPort));
+        Assert.Equal(ConnectionRejectedReason.HostResolutionFailed, failedReason);
+    }
+
+    [Fact]
+    public void Connect_By_Unresolvable_Host_Raises_ConnectionFailed_And_Throws()
+    {
+        using SynapseManager client = new(TestHarness.ClientConfig());
+        string? failedMessage = null;
+        client.ConnectionFailed += (connectionFailedEventArgs) => failedMessage = connectionFailedEventArgs.Message;
+        client.Start();
+
+        // The .invalid top-level domain is reserved and never resolves (RFC 6761).
+        Assert.ThrowsAny<System.Net.Sockets.SocketException>(() => client.Connect("synapse.invalid:7777"));
+        Assert.Contains("synapse.invalid", failedMessage);
     }
 
     [Fact]
@@ -117,7 +186,7 @@ public class HandshakeAndChannelTests
         server.Start();
         client.Start();
 
-        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 2000, server, client);
         client.Send(synapseConnection, Encoding.UTF8.GetBytes("ping"), isReliable: true);
 

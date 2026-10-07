@@ -81,7 +81,7 @@ public sealed class ConnectionStressTests
             for (int i = 0; i < ClientCount; i++)
             {
                 clients[i].Start();
-                clientToServerConnections[i] = clients[i].Connect(new(IPAddress.Loopback, port));
+                clientToServerConnections[i] = clients[i].Connect(new IPEndPoint(IPAddress.Loopback, port));
             }
 
             Assert.True(TestHarness.PumpUntil(() => Volatile.Read(ref connectedCount) >= ClientCount, 60000, allEngines),
@@ -199,7 +199,7 @@ public sealed class ConnectionStressTests
                 int closeTarget = totalClientClosedCount + ClientCount;
 
                 for (int i = 0; i < ClientCount; i++)
-                    connections[i] = clients[i].Connect(new(IPAddress.Loopback, port));
+                    connections[i] = clients[i].Connect(new IPEndPoint(IPAddress.Loopback, port));
 
                 Assert.True(TestHarness.PumpUntil(() => Volatile.Read(ref totalConnectedCount) >= connectTarget, ConnectWaitMs, allEngines),
                     $"Only {totalConnectedCount} / {connectTarget} clients connected.");

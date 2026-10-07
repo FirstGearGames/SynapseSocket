@@ -63,7 +63,7 @@ public sealed class GarbageCollectionTests
             for (int i = 0; i < ClientCount; i++)
             {
                 clients[i].Start();
-                clientToServerConnections[i] = clients[i].Connect(new(IPAddress.Loopback, port));
+                clientToServerConnections[i] = clients[i].Connect(new IPEndPoint(IPAddress.Loopback, port));
             }
 
             Assert.True(TestHarness.PumpUntil(() => connectedClientCount >= ClientCount, 5000, allEngines),

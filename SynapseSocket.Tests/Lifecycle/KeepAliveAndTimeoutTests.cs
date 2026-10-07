@@ -60,7 +60,7 @@ public class KeepAliveAndTimeoutTests
         server.Start();
         client.Start();
 
-        SynapseConnection synapseConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection synapseConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         TestHarness.PumpUntil(() => synapseConnection.State == ConnectionState.Connected, 2000, server, client);
 
         // Pump for longer than ConnectionTimeoutMilliseconds; keep-alive should keep both sides alive.
@@ -103,7 +103,7 @@ public class KeepAliveAndTimeoutTests
         server.Start();
         client.Start();
 
-        SynapseConnection clientConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection clientConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(
                 () => clientConnection.State == ConnectionState.Connected && server.Connections.Count == 1, 2000, server, client),
             "expected the handshake to complete on both sides");

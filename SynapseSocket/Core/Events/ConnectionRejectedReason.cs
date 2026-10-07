@@ -35,5 +35,11 @@ public enum ConnectionRejectedReason : byte
     /// The engine has reached <see cref="SynapseSocket.Core.Configuration.SynapseConfig.MaximumConcurrentConnections"/>
     /// and cannot accept new peers until an existing connection closes.
     /// </summary>
-    ServerFull
+    ServerFull,
+
+    /// <summary>
+    /// An outbound connect by host name could not proceed: the host string was malformed, or its DNS lookup failed
+    /// or returned no addresses. The event message carries the host and the cause.
+    /// </summary>
+    HostResolutionFailed
 }

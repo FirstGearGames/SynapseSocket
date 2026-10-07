@@ -36,7 +36,7 @@ public class DisconnectAfterDeliveryTests
         server.Start();
         client.Start();
 
-        SynapseConnection clientConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection clientConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => server.Connections.Count == 1 && clientConnection.State is ConnectionState.Connected, WaitMilliseconds, server, client), "The handshake did not complete.");
 
         SynapseConnection serverConnection = server.Connections.Connections[0];
@@ -72,7 +72,7 @@ public class DisconnectAfterDeliveryTests
         server.Start();
         client.Start();
 
-        SynapseConnection clientConnection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection clientConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => server.Connections.Count == 1 && clientConnection.State is ConnectionState.Connected, WaitMilliseconds, server, client), "The handshake did not complete.");
 
         SynapseConnection serverConnection = server.Connections.Connections[0];

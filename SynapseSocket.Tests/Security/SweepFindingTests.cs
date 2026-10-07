@@ -148,7 +148,7 @@ public sealed class SweepFindingTests
         server.Start();
         client.Start();
 
-        SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(
             TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 1, 3000, server, client),
             "handshake did not complete");
@@ -383,7 +383,7 @@ public sealed class SweepFindingTests
         server.Start();
         client.Start();
 
-        SynapseConnection clientToServer = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection clientToServer = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(
             TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 1, 3000, server, client),
             "handshake did not complete");
@@ -436,7 +436,7 @@ public sealed class SweepFindingTests
         server.Start();
         client.Start();
 
-        SynapseConnection clientToServer = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection clientToServer = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(
             TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 1, 3000, server, client),
             "handshake did not complete");
@@ -598,7 +598,7 @@ public sealed class SweepFindingTests
         server.Start();
         client.Start();
 
-        SynapseConnection clientToServer = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection clientToServer = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(
             TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 1, 3000, server, client),
             "handshake did not complete");
@@ -653,7 +653,7 @@ public sealed class SweepFindingTests
         server.Start();
         client.Start();
 
-        SynapseConnection clientToServer = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection clientToServer = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(
             TestHarness.PumpUntil(() => Volatile.Read(ref established) == 1, 3000, server, client),
             "handshake did not complete");
@@ -1028,7 +1028,7 @@ public sealed class SweepFindingTests
         client.Start();
 
         // The peer is not listening yet, so this first handshake goes nowhere at all.
-        client.Connect(new(IPAddress.Loopback, port));
+        client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         TestHarness.PumpFor(400, client);
 
         using SynapseManager server = new(TestHarness.ServerConfig(port));
@@ -1068,7 +1068,7 @@ public sealed class SweepFindingTests
         client.Start();
 
         // Nothing is bound on that port, so the handshake is never answered.
-        client.Connect(new(IPAddress.Loopback, port));
+        client.Connect(new IPEndPoint(IPAddress.Loopback, port));
 
         Assert.True(
             TestHarness.PumpUntil(() => clientEvents.ViolationReasons.Contains(ViolationReason.Timeout), 5000, client),
@@ -1146,7 +1146,7 @@ public sealed class SweepFindingTests
         server.Start();
         client.Start();
 
-        SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(
             TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 1, 3000, server, client),
             "handshake did not complete");
@@ -1247,7 +1247,7 @@ public sealed class SweepFindingTests
         server.Start();
         client.Start();
 
-        SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(
             TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 1, 3000, server, client),
             "handshake did not complete");
@@ -1432,7 +1432,7 @@ public sealed class SweepFindingTests
         server.Start();
         client.Start();
 
-        SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(TestHarness.PumpUntil(() => server.Connections.Count == 1, 3000, server, client), "handshake failed");
 
         byte[] payload = new byte[64];
@@ -1555,7 +1555,7 @@ public sealed class SweepFindingTests
         server.Start();
         client.Start();
 
-        SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(
             TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 1, 3000, server, client),
             "handshake did not complete");
@@ -1759,7 +1759,7 @@ public sealed class SweepFindingTests
         server.Start();
         client.Start();
 
-        SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(
             TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 1, 3000, server, client),
             "handshake did not complete");
@@ -1801,7 +1801,7 @@ public sealed class SweepFindingTests
         server.Start();
         client.Start();
 
-        SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(
             TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 1, 3000, server, client),
             "handshake did not complete");
@@ -1852,7 +1852,7 @@ public sealed class SweepFindingTests
         server.Start();
         client.Start();
 
-        SynapseConnection connection = client.Connect(new(IPAddress.Loopback, port));
+        SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
         Assert.True(
             TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 1, 3000, server, client),
             "handshake did not complete");
