@@ -1287,6 +1287,10 @@ internal sealed partial class IngressEngine
     /// <param name="staleTicks">Age threshold in ticks; entries older than this are removed.</param>
     private static void RemoveExpiredEntries<TKey>(ConcurrentDictionary<TKey, long> dictionary, long nowTicks, long staleTicks) where TKey : notnull
     {
+        // Enumerating a ConcurrentDictionary allocates its enumerator, and in steady state these caches are empty: nothing to expire, nothing to allocate.
+        if (dictionary.IsEmpty)
+            return;
+
         foreach (KeyValuePair<TKey, long> entry in dictionary)
         {
             if (nowTicks - entry.Value > staleTicks)
