@@ -95,6 +95,37 @@ public class TelemetryAndLatencyTests
     }
 
     /// <summary>
+    /// A goodbye still held by the latency simulator when the engine stops must reach the peer, not be cleared with the queue.
+    /// Otherwise the peer learns of the departure only when its resends or its timeout run out.
+    /// </summary>
+    [Fact]
+    public void LatencySimulator_Disconnect_Then_Stop_Still_Tells_The_Peer()
+    {
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port));
+        using SynapseManager client = new(TestHarness.ClientConfig(c =>
+        {
+            c.LatencySimulator.Enabled = true;
+            c.LatencySimulator.BaseLatencyMilliseconds = 200;
+        }));
+
+        TestHarness.EventRecorder recorder = new();
+        recorder.Attach(server);
+
+        server.Start();
+        client.Start();
+
+        SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
+        Assert.True(TestHarness.PumpUntil(() => recorder.ConnectionsEstablished >= 1 && connection.State == ConnectionState.Connected, 3000, server, client), "The handshake did not complete.");
+
+        // The goodbye is queued behind 200 ms of simulated latency, and the engine stops before it is due.
+        client.Disconnect(connection);
+        client.Stop();
+
+        Assert.True(TestHarness.PumpUntil(() => recorder.ConnectionsClosed >= 1, 1000, server), "The server was never told the client left.");
+    }
+
+    /// <summary>
     /// Regression test for use-after-free when latency exceeds the reliable resend interval.
     /// With BaseLatencyMilliseconds (400) > ResendMilliseconds (250), the maintenance step fires
     /// retransmits while the original packet is still queued in the sim. When the ACK arrives the

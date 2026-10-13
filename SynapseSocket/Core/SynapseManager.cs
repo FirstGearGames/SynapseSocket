@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using CodeBoost.Performance;
@@ -199,6 +200,15 @@ public sealed partial class SynapseManager : IDisposable
     /// <see cref="Poll"/>.
     /// </summary>
     private readonly System.Collections.Concurrent.ConcurrentQueue<QueuedRawSend> _queuedRawSends = new();
+    /// <summary>
+    /// The input to <see cref="SioUdpConnectionReset"/> that switches connection-reset reporting off.
+    /// </summary>
+    private static readonly byte[] DisabledConnectionResetReporting = [0, 0, 0, 0];
+    /// <summary>
+    /// The Windows <c>SIO_UDP_CONNRESET</c> control code (<c>0x9800000C</c>), which governs whether an ICMP port-unreachable is
+    /// reported as a connection reset on the socket's next receive.
+    /// </summary>
+    private const int SioUdpConnectionReset = -1744830452;
 
     /// <summary>
     /// The ingress engines, one per socket. Diagnostic surface.
@@ -324,6 +334,21 @@ public sealed partial class SynapseManager : IDisposable
             try
             {
                 socket = new(bindEndPoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+
+                /* Windows reports an ICMP port-unreachable as a connection reset on the socket's next receive. On a socket shared by
+                 * every peer, a server still sending to a client that has left then spends its receives on those reports instead of
+                 * on the peers that remain, and they stop hearing acknowledgements. Nothing in a UDP session can use the report. */
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    try
+                    {
+                        socket.IOControl(SioUdpConnectionReset, DisabledConnectionResetReporting, null);
+                    }
+                    catch (Exception exception) when (exception is SocketException or NotSupportedException)
+                    {
+                        // A runtime without the control keeps the reports, and the receive loop skips each one it reads.
+                    }
+                }
 
                 if (bindEndPoint.AddressFamily == AddressFamily.InterNetworkV6)
                     socket.SetSocketOption(SocketOptionLevel.IPv6, SocketOptionName.IPv6Only, false);
@@ -803,6 +828,11 @@ public sealed partial class SynapseManager : IDisposable
             if (connections[i].IsClosing)
                 _transmissionEngine?.SendDisconnect(connections[i]);
         }
+
+        /* What the latency simulator still holds goes out now, while the sockets are open: the goodbyes just above, and one a
+         * Disconnect queued just before Stop. Clearing them unsent left the peer to find out only when its resends ran out. Their
+         * loss was already rolled when they were queued, so only the remaining delay is skipped. */
+        _transmissionEngine?.FlushDeferredSends(long.MaxValue);
 
         CloseSockets();
 

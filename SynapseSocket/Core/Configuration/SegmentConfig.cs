@@ -27,7 +27,7 @@ public sealed class SegmentConfig
 
     /// <summary>
     /// Maximum number of simultaneous in-progress segment assemblies per connection.
-    /// Excess assemblies are treated as a protocol violation. Set to <see cref="DisabledMaximumConcurrentAssembliesPerConnection"/> (0) to disable the limit.
+    /// A segment that would open one more evicts the oldest incomplete unreliable assembly, or is dropped when every open assembly is reliable; the sender resends a dropped reliable segment. Set to <see cref="DisabledMaximumConcurrentAssembliesPerConnection"/> (0) to disable the limit.
     /// Default is 16.
     /// </summary>
     public uint MaximumConcurrentAssembliesPerConnection = 16;

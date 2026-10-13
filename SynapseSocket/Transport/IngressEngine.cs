@@ -202,6 +202,10 @@ internal sealed partial class IngressEngine
     /// </summary>
     private const string ViolationSegmentMismatch = "Segment resent with mismatched segment count or reliability flag.";
     /// <summary>
+    /// Violation detail reported when a segment carries more payload than one transmission unit.
+    /// </summary>
+    private const string ViolationSegmentLargerThanTransmissionUnit = "Segment payload larger than the maximum transmission unit.";
+    /// <summary>
     /// Violation detail reported when a peer holds more out-of-order reliable packets than the reorder buffer allows.
     /// </summary>
     private const string ViolationReorderBufferExceeded = "Reorder buffer capacity exceeded.";
@@ -499,8 +503,11 @@ internal sealed partial class IngressEngine
                      * managed overload below allocates a SocketAddress, an IPEndPoint and an IPAddress every time. */
                     receivedLength = NativeSocket.ReceiveFrom(_socket, _receiveBuffer, MaximumUdpDatagramSize, _receiveSockAddr!, out nativeSockAddrLength);
 
+                    /* A failed receive consumes only its own error, such as a connection reset reported for an earlier send, so the
+                     * datagrams behind it are still read, as the managed path does. Ending the drain here let a stream of those
+                     * reports starve every peer on the socket. */
                     if (receivedLength < 0)
-                        break;
+                        continue;
                 }
                 else
                 {
@@ -947,10 +954,7 @@ internal sealed partial class IngressEngine
                             _sender.SendSegmentAck(synapseConnection, sequence, receivedBitmap);
                     }
                     else if (isProtocolViolation)
-                    {
-                        _telemetry.OnSecurityDroppedReceived();
-                        ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Malformed, length, ViolationSegmentMismatch, ViolationAction.KickAndBlacklist);
-                    }
+                        ReportSegmentViolation(fromEndPoint, synapseConnection, payloadLength, length);
                 }
 
                 return;
@@ -968,15 +972,29 @@ internal sealed partial class IngressEngine
                         PayloadDelivered?.Invoke(synapseConnection, assembledPayload, isReliable: false, isPayloadRented: true);
                     }
                     else if (isProtocolViolation)
-                    {
-                        _telemetry.OnSecurityDroppedReceived();
-                        ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Malformed, length, ViolationSegmentMismatch, ViolationAction.KickAndBlacklist);
-                    }
+                        ReportSegmentViolation(fromEndPoint, synapseConnection, payloadLength, length);
                 }
 
                 return;
             }
         }
+    }
+
+    /// <summary>
+    /// Reports a segment the reassembler refused as a protocol violation, naming which check it failed.
+    /// </summary>
+    /// <param name="fromEndPoint">The sender.</param>
+    /// <param name="synapseConnection">The sender's connection.</param>
+    /// <param name="payloadLength">The segment's payload length.</param>
+    /// <param name="length">The whole datagram's length.</param>
+    private void ReportSegmentViolation(IPEndPoint fromEndPoint, SynapseConnection synapseConnection, int payloadLength, int length)
+    {
+        _telemetry.OnSecurityDroppedReceived();
+
+        if (payloadLength > _effectiveMaximumTransmissionUnit)
+            ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Oversized, length, ViolationSegmentLargerThanTransmissionUnit, ViolationAction.KickAndBlacklist);
+        else
+            ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Malformed, length, ViolationSegmentMismatch, ViolationAction.KickAndBlacklist);
     }
 
     /// <summary>

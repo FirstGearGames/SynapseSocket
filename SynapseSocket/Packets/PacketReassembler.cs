@@ -68,6 +68,7 @@ public sealed class PacketReassembler : PacketSegmenter
     /// The completed <see cref="SegmentAssembly"/> is automatically returned to the pool.
     /// If a protocol violation is detected (e.g. the same segmentId is seen with a different segmentCount or reliability flag than previously declared), <paramref name="isProtocolViolation"/> is set to true, the stale assembly is evicted, and the method returns false.
     /// Callers should treat this as grounds for kicking/blacklisting the peer.
+    /// A segment that would open an assembly beyond the concurrent limit first evicts the oldest incomplete unreliable assembly. When every open assembly is reliable, the segment is dropped without a violation, and the sender's retransmission brings it back once a slot frees.
     /// </summary>
     /// <param name="segmentId">Stream identifier shared by all segments of the same logical message.</param>
     /// <param name="segmentIndex">Zero-based position of this segment within the stream.</param>
@@ -100,11 +101,9 @@ public sealed class PacketReassembler : PacketSegmenter
         {
             if (!_currentSegments.TryGetValue(segmentId, out SegmentAssembly? segmentAssembly))
             {
-                if (_currentSegments.Count >= _maximumConcurrentAssemblies)
-                {
-                    isProtocolViolation = true;
+                // At the cap the segment is dropped, not reported: a reliable one is resent, and an unreliable one may be lost.
+                if (_currentSegments.Count >= _maximumConcurrentAssemblies && !TryEvictOldestUnreliableAssembly())
                     return false;
-                }
 
                 segmentAssembly = ResettableObjectPool<SegmentAssembly>.Rent();
                 segmentAssembly.Initialize(segmentCount, isReliable);
@@ -191,6 +190,38 @@ public sealed class PacketReassembler : PacketSegmenter
                 ListPool<ushort>.Return(toRemove);
             }
         }
+    }
+
+    /// <summary>
+    /// Makes room for a new assembly by evicting the oldest incomplete unreliable one. Must be called under <see cref="_lock"/>.
+    /// </summary>
+    /// <returns>True when an assembly was evicted; false when every open assembly is reliable.</returns>
+    /// <remarks>
+    /// An incomplete unreliable assembly is usually waiting on a segment that was lost and will never be resent, so it would
+    /// otherwise hold its slot until the assembly timeout, and a few seconds of loss filled the reassembler with them. A reliable
+    /// assembly is never evicted, because its missing segments are on their way.
+    /// </remarks>
+    private bool TryEvictOldestUnreliableAssembly()
+    {
+        SegmentAssembly? oldestAssembly = null;
+        ushort oldestSegmentId = 0;
+
+        foreach (KeyValuePair<ushort, SegmentAssembly> keyValuePair in _currentSegments)
+        {
+            if (keyValuePair.Value.IsReliable || (oldestAssembly is not null && keyValuePair.Value.FirstReceivedTicks >= oldestAssembly.FirstReceivedTicks))
+                continue;
+
+            oldestAssembly = keyValuePair.Value;
+            oldestSegmentId = keyValuePair.Key;
+        }
+
+        if (oldestAssembly is null)
+            return false;
+
+        _currentSegments.Remove(oldestSegmentId);
+        ResettableObjectPool<SegmentAssembly>.Return(oldestAssembly);
+
+        return true;
     }
 
     /// <inheritdoc/>

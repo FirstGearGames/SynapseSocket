@@ -6,6 +6,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using CodeBoost.Performance;
 using SynapseBeacon.Client;
 using SynapseBeacon.Server;
 using SynapseBeacon.Wire;
@@ -53,6 +54,14 @@ public sealed class SweepFindingTests
     private static byte[] BuildReliable(ushort sequence, byte payload)
     {
         return [(byte)PacketType.Reliable, (byte)(sequence & 0xFF), (byte)((sequence >> 8) & 0xFF), payload];
+    }
+
+    /// <summary>
+    /// Builds a wire-format unreliable segment, one of two, carrying three payload bytes.
+    /// </summary>
+    private static byte[] BuildUnreliableSegment(ushort segmentId, byte segmentIndex)
+    {
+        return [(byte)PacketType.Segmented, (byte)(segmentId & 0xFF), (byte)((segmentId >> 8) & 0xFF), segmentIndex, 2, 0x11, 0x22, 0x33];
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -729,6 +738,44 @@ public sealed class SweepFindingTests
             $"one Poll processed {processed} datagrams against a budget of {Budget}. The drain has no per-poll bound");
     }
 
+    /// <summary>
+    /// Windows reports each ICMP port-unreachable as a connection reset on the socket's next receive. A server still sending to a
+    /// peer that has left must not spend its receive budget on those reports, or the peers that remain stop being heard.
+    /// </summary>
+    [Fact]
+    public void ConnectionResetReports_DoNotSpendTheReceiveBudget()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        const int Budget = 2;
+        const int SendsToTheDepartedPeer = 40;
+
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port, config => config.MaximumReceivesPerPoll = Budget));
+        server.Start();
+
+        // Nothing listens on this port any more, so every datagram sent to it comes back as a port-unreachable.
+        IPEndPoint departedPeer = new(IPAddress.Loopback, TestHarness.GetFreePort());
+
+        for (int i = 0; i < SendsToTheDepartedPeer; i++)
+            server.SendRaw(departedPeer, new([(byte)PacketType.None, 1]));
+
+        Thread.Sleep(200);
+
+        using Socket remainingPeer = TestHarness.CreateRawSocket();
+        remainingPeer.SendTo(BuildHandshake(), new IPEndPoint(IPAddress.Loopback, port));
+        Thread.Sleep(100);
+
+        // Three polls read six datagrams, plenty for the one handshake unless the reports queued ahead of it count as well.
+        for (int i = 0; i < 3; i++)
+            server.Poll();
+
+        Assert.True(
+            server.Connections.Count == 1,
+            "the remaining peer's handshake was not read: connection-reset reports for the departed peer used up the receive budget");
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // M14: a throwing PacketReceived subscriber must not abort the delivery loop
     // ─────────────────────────────────────────────────────────────────────────
@@ -895,6 +942,8 @@ public sealed class SweepFindingTests
             config.MaximumTransmissionUnit = 600;
             config.MaximumPacketSize = 1400;
         }));
+        TestHarness.EventRecorder recorder = new();
+        recorder.Attach(server);
         server.Start();
 
         IPEndPoint target = new(IPAddress.Loopback, port);
@@ -920,6 +969,74 @@ public sealed class SweepFindingTests
             serverSide.Reassembler is null || !serverSide.Reassembler.HasAssemblies,
             "a segment carrying more than the MTU was accepted into reassembly, so the MTU-based size precheck " +
             "does not actually bound the assembled payload");
+        Assert.True(
+            recorder.ViolationReasons.Contains(ViolationReason.Oversized),
+            $"a segment larger than the MTU was reported as [{string.Join(", ", recorder.ViolationReasons)}], the same as a segment resent with a mismatched count");
+    }
+
+    /// <summary>
+    /// A peer whose unreliable split messages each lose a segment leaves those assemblies incomplete. Reaching the concurrent
+    /// assembly limit that way must make room for the next message, not kick and blacklist an honest peer.
+    /// </summary>
+    [Fact]
+    public void IncompleteUnreliableAssemblies_AtTheLimit_MakeRoomInsteadOfKicking()
+    {
+        const int Limit = 4;
+
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port, config => config.Segment.MaximumConcurrentAssembliesPerConnection = Limit));
+        TestHarness.EventRecorder recorder = new();
+        recorder.Attach(server);
+        server.Start();
+
+        IPEndPoint target = new(IPAddress.Loopback, port);
+        using Socket peer = TestHarness.CreateRawSocket();
+
+        peer.SendTo(BuildHandshake(), target);
+        Assert.True(TestHarness.PumpUntil(() => server.Connections.Count == 1, 3000, server), "handshake did not land");
+
+        // Twice the limit of messages whose second segment is lost, then one that arrives whole.
+        for (ushort segmentId = 1; segmentId <= Limit * 2; segmentId++)
+            peer.SendTo(BuildUnreliableSegment(segmentId, segmentIndex: 0), target);
+
+        const ushort WholeSegmentId = Limit * 2 + 1;
+        peer.SendTo(BuildUnreliableSegment(WholeSegmentId, segmentIndex: 0), target);
+        peer.SendTo(BuildUnreliableSegment(WholeSegmentId, segmentIndex: 1), target);
+
+        Assert.True(TestHarness.PumpUntil(() => recorder.PacketsReceived == 1, 2000, server), "the whole message was not delivered once the limit was reached");
+        Assert.True(
+            server.Connections.Count == 1 && recorder.Violations == 0,
+            $"reaching the assembly limit with incomplete unreliable messages raised [{string.Join(", ", recorder.ViolationReasons)}] instead of making room");
+    }
+
+    /// <summary>
+    /// A reliable assembly's missing segments are being resent, so a full reassembler holding only reliable assemblies must drop
+    /// the new segment, without a violation, rather than evict one of them.
+    /// </summary>
+    [Fact]
+    public void ReliableAssemblies_AtTheLimit_DropTheNewSegmentWithoutAViolation()
+    {
+        PacketReassembler reassembler = ResettableObjectPool<PacketReassembler>.Rent();
+
+        try
+        {
+            reassembler.Initialize(maximumTransmissionUnit: 600, maximumSegments: 255, maximumConcurrentAssemblies: 2);
+            byte[] segmentData = [0x11, 0x22, 0x33];
+            byte[] bitmap = new byte[PacketHeader.SegmentAckBitmapSize];
+
+            for (ushort segmentId = 1; segmentId <= 3; segmentId++)
+            {
+                reassembler.TryReassemble(segmentId, segmentIndex: 0, segmentCount: 2, segmentData, isReliable: true, out _, out bool isProtocolViolation, out _);
+                Assert.False(isProtocolViolation, $"reliable segment [{segmentId}] against a limit of 2 was reported as a protocol violation");
+            }
+
+            Assert.True(reassembler.TryWriteReceivedBitmap(1, bitmap, out _) && reassembler.TryWriteReceivedBitmap(2, bitmap, out _), "a reliable assembly was evicted to make room");
+            Assert.False(reassembler.TryWriteReceivedBitmap(3, bitmap, out _), "a reliable segment beyond the limit was buffered");
+        }
+        finally
+        {
+            ResettableObjectPool<PacketReassembler>.Return(reassembler);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
