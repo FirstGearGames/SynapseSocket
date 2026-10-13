@@ -1039,6 +1039,103 @@ public sealed class SweepFindingTests
         }
     }
 
+    /// <summary>
+    /// Builds a wire-format unreliable segment, one of two, carrying more payload than a 600-byte MTU allows.
+    /// </summary>
+    private static byte[] BuildOversizedSegment()
+    {
+        byte[] oversizedSegment = new byte[1 + 4 + 1000];
+        oversizedSegment[0] = (byte)PacketType.Segmented;
+        oversizedSegment[1] = 7;
+        oversizedSegment[4] = 2;
+
+        return oversizedSegment;
+    }
+
+    /// <summary>
+    /// Every observer of a violation is told the action the deciding handler settled on, while the offending connection is still
+    /// live, and the action is then applied.
+    /// </summary>
+    [Fact]
+    public void ViolationObserved_TellsEveryObserverTheSettledAction()
+    {
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port, config => config.MaximumTransmissionUnit = 600));
+
+        List<string> observations = [];
+        server.ViolationDetected += _ => ViolationAction.Kick;
+        server.ViolationObserved += (in ViolationEventArgs violationEventArgs) => observations.Add($"first {violationEventArgs.Reason} {violationEventArgs.Action} {violationEventArgs.Connection is not null}");
+        server.ViolationObserved += (in ViolationEventArgs violationEventArgs) => observations.Add($"second {violationEventArgs.Reason} {violationEventArgs.Action} {violationEventArgs.Connection is not null}");
+        server.Start();
+
+        IPEndPoint target = new(IPAddress.Loopback, port);
+        using Socket peer = TestHarness.CreateRawSocket();
+
+        peer.SendTo(BuildHandshake(), target);
+        Assert.True(TestHarness.PumpUntil(() => server.Connections.Count == 1, 3000, server), "handshake did not land");
+
+        peer.SendTo(BuildOversizedSegment(), target);
+        Assert.True(TestHarness.PumpUntil(() => server.Connections.Count == 0, 2000, server), "the settled kick was not applied");
+
+        string[] expectedObservations = ["first Oversized Kick True", "second Oversized Kick True"];
+        Assert.Equal(expectedObservations, observations);
+    }
+
+    /// <summary>
+    /// An observer that throws is reported through <see cref="SynapseManager.UnhandledException"/> and does not stop the engine from
+    /// applying the action.
+    /// </summary>
+    [Fact]
+    public void ViolationObserved_ThrowingObserver_IsReported_AndTheActionStillApplies()
+    {
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port, config => config.MaximumTransmissionUnit = 600));
+
+        List<Exception> unhandledExceptions = [];
+        server.ViolationObserved += (in ViolationEventArgs _) => throw new InvalidOperationException("observer failed");
+        server.UnhandledException += unhandledExceptions.Add;
+        server.Start();
+
+        IPEndPoint target = new(IPAddress.Loopback, port);
+        using Socket peer = TestHarness.CreateRawSocket();
+
+        peer.SendTo(BuildHandshake(), target);
+        Assert.True(TestHarness.PumpUntil(() => server.Connections.Count == 1, 3000, server), "handshake did not land");
+
+        peer.SendTo(BuildOversizedSegment(), target);
+        Assert.True(TestHarness.PumpUntil(() => server.Connections.Count == 0, 2000, server), "a throwing observer stopped the kick");
+        Assert.True(unhandledExceptions is [InvalidOperationException { Message: "observer failed" }], $"the observer's exception was reported as [{string.Join(", ", unhandledExceptions)}]");
+    }
+
+    /// <summary>
+    /// Observing a violation allocates nothing, so a flood of offending datagrams costs observers no garbage.
+    /// </summary>
+    [Fact]
+    public void ViolationObserved_AllocatesNothing()
+    {
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port));
+
+        int observedCount = 0;
+        server.ViolationObserved += (in ViolationEventArgs _) => observedCount++;
+        server.Start();
+
+        IPEndPoint offender = new(IPAddress.Loopback, 9);
+
+        // Warm the JIT before measuring.
+        server.HandleViolation(offender, 0, ViolationReason.Malformed, 0, null, ViolationAction.Ignore);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+
+        for (int i = 0; i < 1000; i++)
+            server.HandleViolation(offender, 0, ViolationReason.Malformed, 0, null, ViolationAction.Ignore);
+
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.True(observedCount == 1001, $"observed [{observedCount}] of 1001 violations");
+        Assert.True(allocated == 0, $"observing 1000 violations allocated [{allocated}] bytes");
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // H12: malformed headers must not cost a managed exception each
     // ─────────────────────────────────────────────────────────────────────────

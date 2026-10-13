@@ -829,12 +829,13 @@ internal sealed partial class IngressEngine
         {
             case PacketType.Disconnect:
             {
-                // Capture identity before teardown: TeardownRequested queues the instance for the pool, and OnReturn
-                // clears Signature and RemoteEndPoint.
-                ulong disconnectSignature = synapseConnection.Signature;
+                /* Reported before the teardown, so the violation's observers still find the connection live, and torn down
+                 * whatever action was settled. A kick has already torn it down, which the teardown checks for, and a handler
+                 * that stopped the engine has released it, so nothing more is done then. */
+                ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.PeerDisconnect, packetSize: 0, details: null, ViolationAction.Ignore);
 
-                TeardownRequested?.Invoke(synapseConnection);
-                ViolationOccurred?.Invoke(fromEndPoint, disconnectSignature, ViolationReason.PeerDisconnect, packetSize: 0, details: null, ViolationAction.Ignore);
+                if (IsRunning)
+                    TeardownRequested?.Invoke(synapseConnection);
 
                 return;
             }

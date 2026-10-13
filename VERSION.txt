@@ -1,1 +1,1 @@
-SynapseSocket 1.2.0
+SynapseSocket 1.3.0

@@ -75,6 +75,16 @@ public sealed partial class SynapseManager : IDisposable
     /// </summary>
     public event ViolationHandler? ViolationDetected;
     /// <summary>
+    /// Raised for every violation once its action is settled, after <see cref="ViolationDetected"/> has decided it and before the
+    /// engine applies it, so <see cref="ViolationEventArgs.Connection"/> is still live. Any number of handlers can observe, and none
+    /// can change the action.
+    /// </summary>
+    /// <remarks>
+    /// Raised on the thread calling <see cref="Poll"/>, without allocating. Handlers must not block, and must not stop the engine or
+    /// disconnect from inside it. An exception a handler throws is passed to <see cref="UnhandledException"/>.
+    /// </remarks>
+    public event ViolationObservedHandler? ViolationObserved;
+    /// <summary>
     /// Raised when an unexpected exception escapes the engine's own work during <see cref="Poll"/>, or escapes one of
     /// the application's event handlers that the engine invokes.
     /// Subscribe to route engine errors into your logging system (e.g., Unity's Debug.LogException).
@@ -751,7 +761,8 @@ public sealed partial class SynapseManager : IDisposable
     /// Central violation handler.
     /// Constructs a <see cref="ViolationEventArgs"/> from the supplied parameters, invokes
     /// <see cref="ViolationDetected"/> (if subscribed) to obtain the desired <see cref="ViolationAction"/>,
-    /// and applies that action. Falls back to <paramref name="initialAction"/> when no subscriber is attached.
+    /// tells <see cref="ViolationObserved"/> the settled action, and applies it. Falls back to
+    /// <paramref name="initialAction"/> when no subscriber is attached.
     /// </summary>
     internal void HandleViolation(IPEndPoint endPoint, ulong signature, ViolationReason violationReason, int packetSize, string? details, ViolationAction initialAction = ViolationAction.KickAndBlacklist)
     {
@@ -769,6 +780,17 @@ public sealed partial class SynapseManager : IDisposable
             catch
             {
                 /* never let a listener crash the ingress path */
+            }
+
+            violationEventArgs.Action = returnedViolationAction;
+
+            try
+            {
+                ViolationObserved?.Invoke(in violationEventArgs);
+            }
+            catch (Exception listenerException)
+            {
+                UnhandledException?.Invoke(listenerException);
             }
 
             switch (returnedViolationAction)

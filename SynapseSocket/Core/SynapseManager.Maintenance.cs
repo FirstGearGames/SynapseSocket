@@ -167,12 +167,15 @@ public sealed partial class SynapseManager
         // Default initial action is Kick (disconnect without blacklisting); a listener can escalate or downgrade.
         if (isTimedOut)
         {
-            // Capture identity before teardown: the instance is queued for the pool and OnReturn clears both.
+            // Captured before the violation, whose kick queues the instance for the pool, where OnReturn clears both.
             IPEndPoint timedOutEndPoint = synapseConnection.RemoteEndPoint;
             ulong timedOutSignature = synapseConnection.Signature;
 
-            TeardownConnection(synapseConnection);
+            /* Reported before the teardown, so the violation's observers still find the connection live, and torn down whatever
+             * action was settled, since a timed-out connection has nothing left to keep. The teardown goes by endpoint, so it does
+             * nothing once the kick has run, or once a handler has stopped the engine and released everything. */
             HandleViolation(timedOutEndPoint, timedOutSignature, ViolationReason.Timeout, 0, null, ViolationAction.Kick);
+            DisconnectAndBlacklist(timedOutEndPoint, canBlacklist: false);
 
             return false;
         }
