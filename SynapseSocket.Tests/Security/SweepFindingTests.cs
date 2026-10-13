@@ -885,6 +885,40 @@ public sealed class SweepFindingTests
             $"a packet was delivered twice after a send threw mid-drain: [{string.Join(", ", sent)}]");
     }
 
+    /// <summary>
+    /// A delayed send that throws is reported once, after the rest of the flush has gone out, so the report cannot abandon the
+    /// queue's compaction and nothing is sent twice.
+    /// </summary>
+    [Fact]
+    public void LatencySimulatorFlush_ReportsAFailedSend_OnceTheRestHaveGoneOut()
+    {
+        LatencySimulator simulator = new(new() { Enabled = true, BaseLatencyMilliseconds = 50 });
+        IPEndPoint target = new(IPAddress.Loopback, 9999);
+        long nowTicks = 1_000_000_000L;
+        List<string> events = [];
+
+        simulator.SendFailed += exception => events.Add($"failed {exception.Message}");
+
+        for (byte i = 0; i < 3; i++)
+            simulator.Process(new([(byte)PacketType.None, i]), target, nowTicks, (_, _) => { });
+
+        long dueTicks = nowTicks + 100 * TimeSpan.TicksPerMillisecond;
+
+        simulator.Flush(dueTicks, (segment, _) =>
+        {
+            byte index = segment.Array![segment.Offset + 1];
+
+            if (index == 1)
+                throw new InvalidOperationException("send failed");
+
+            events.Add($"sent {index}");
+        });
+        simulator.Flush(dueTicks, (segment, _) => events.Add($"sent again {segment.Array![segment.Offset + 1]}"));
+
+        string[] expectedEvents = ["sent 0", "sent 2", "failed send failed"];
+        Assert.Equal(expectedEvents, events);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // M5 / M13: remote-controlled memory bounds
     // ─────────────────────────────────────────────────────────────────────────

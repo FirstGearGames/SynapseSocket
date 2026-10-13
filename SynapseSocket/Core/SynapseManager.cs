@@ -287,6 +287,7 @@ public sealed partial class SynapseManager : IDisposable
         Connections = new();
         Telemetry = new(Config.EnableTelemetry);
         _latencySimulator = new(Config.LatencySimulator);
+        _latencySimulator.SendFailed += OnUnhandledException;
         _isSegmentingEnabled = Config.Segment.ReliableEnabled || Config.Segment.UnreliableMode != UnreliableSegmentMode.Disabled;
         /* Unreliable requires a couple bytes less for segmenting when being sent out
          * of order, which would require different maximum payload sizes between reliable

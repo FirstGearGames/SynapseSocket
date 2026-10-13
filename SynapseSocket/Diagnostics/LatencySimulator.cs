@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Net;
 using CodeBoost.Performance;
 using SynapseSocket.Core.Configuration;
+using SynapseSocket.Core.Events;
 using SynapseSocket.Packets;
 
 namespace SynapseSocket.Diagnostics;
@@ -20,6 +21,12 @@ namespace SynapseSocket.Diagnostics;
 public sealed class LatencySimulator
 {
     /// <summary>
+    /// Raised by <see cref="Flush"/> when sending a delayed packet throws, with the first such exception of that flush. The packet is
+    /// dropped either way. Raised once the flush has finished, so a throwing handler cannot leave packets queued to go out twice.
+    /// </summary>
+    public event UnhandledExceptionHandler? SendFailed;
+
+    /// <summary>
     /// True if the simulator is enabled.
     /// </summary>
     public bool IsEnabled => _config.Enabled;
@@ -36,10 +43,10 @@ public sealed class LatencySimulator
     private readonly List<Deferred> _deferred = [];
 
     /// <summary>
-    /// Random source for loss/jitter/reorder rolls. The engine drives the simulator from one thread,
-    /// so a single instance is sufficient.
+    /// Random source for loss/jitter/reorder rolls, seeded from <see cref="LatencySimulatorConfig.Seed"/> when one is set. The
+    /// engine drives the simulator from one thread, so a single instance is sufficient.
     /// </summary>
-    private readonly Random _random = new();
+    private readonly Random _random;
 
     /// <summary>
     /// Creates a simulator from the provided configuration.
@@ -48,6 +55,7 @@ public sealed class LatencySimulator
     public LatencySimulator(LatencySimulatorConfig config)
     {
         _config = config ?? throw new ArgumentNullException(nameof(config));
+        _random = _config.Seed == LatencySimulatorConfig.UnsetSeed ? new() : new(_config.Seed);
     }
 
     /// <summary>
@@ -113,6 +121,7 @@ public sealed class LatencySimulator
     public void Flush(long nowTicks, Action<ArraySegment<byte>, IPEndPoint> sender)
     {
         int writeIndex = 0;
+        Exception? firstSendFailure = null;
 
         for (int readIndex = 0; readIndex < _deferred.Count; readIndex++)
         {
@@ -129,12 +138,13 @@ public sealed class LatencySimulator
             {
                 sender(new ArraySegment<byte>(deferred.Buffer, 0, deferred.Count), deferred.Target);
             }
-            catch
+            catch (Exception exception)
             {
                 /* A failed send consumes the entry like any other. Letting the exception escape would abandon the
                  * compaction below, leaving already-sent entries queued to go out a second time from buffers that
-                 * are already back in the pool, duplicate delivery on top of a double return. Dropping the packet
-                 * is exactly what this component exists to simulate. */
+                 * are already back in the pool, duplicate delivery on top of a double return. The failure is kept
+                 * and reported once the compaction is done, so a throwing handler cannot abandon it either. */
+                firstSendFailure ??= exception;
             }
             finally
             {
@@ -144,6 +154,9 @@ public sealed class LatencySimulator
 
         if (writeIndex < _deferred.Count)
             _deferred.RemoveRange(writeIndex, _deferred.Count - writeIndex);
+
+        if (firstSendFailure is not null)
+            SendFailed?.Invoke(firstSendFailure);
     }
 
     /// <summary>

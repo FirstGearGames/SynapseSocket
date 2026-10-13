@@ -6,6 +6,8 @@ using System.Text;
 using System.Threading;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
+using SynapseSocket.Diagnostics;
+using SynapseSocket.Packets;
 using Xunit;
 
 namespace SynapseSocket.Tests.Diagnostics;
@@ -92,6 +94,70 @@ public class TelemetryAndLatencyTests
 
         Assert.True(elapsedTime.TotalMilliseconds >= 150,
             $"expected >=150ms elapsed, got {elapsedTime.TotalMilliseconds:F0}ms");
+    }
+
+    /// <summary>
+    /// A delayed packet whose send fails is reported through <see cref="SynapseManager.UnhandledException"/> instead of vanishing.
+    /// </summary>
+    [Fact]
+    public void LatencySimulator_FailedDelayedSend_IsReportedAsAnUnhandledException()
+    {
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port, c =>
+        {
+            c.LatencySimulator.Enabled = true;
+            c.LatencySimulator.BaseLatencyMilliseconds = 1;
+        }));
+
+        List<Exception> unhandledExceptions = [];
+        server.UnhandledException += unhandledExceptions.Add;
+        server.Start();
+
+        // The server binds IPv4 only, so a datagram addressed to an IPv6 endpoint cannot be sent once its delay is up.
+        server.SendRaw(new IPEndPoint(IPAddress.IPv6Loopback, 9), new([(byte)PacketType.None, 1]));
+
+        Assert.True(TestHarness.PumpUntil(() => unhandledExceptions.Count > 0, 1000, server), "the failed delayed send was never reported");
+    }
+
+    /// <summary>
+    /// Two simulators given the same seed make the same loss and delay choices for the same packets, and a different seed makes
+    /// different ones, so a run under simulated conditions can be repeated.
+    /// </summary>
+    [Fact]
+    public void LatencySimulator_SameSeed_RepeatsTheSameChoices()
+    {
+        Assert.Equal(RecordSimulatorChoices(seed: 1234), RecordSimulatorChoices(seed: 1234));
+        Assert.NotEqual(RecordSimulatorChoices(seed: 1234), RecordSimulatorChoices(seed: 4321));
+    }
+
+    /// <summary>
+    /// Sends 64 packets through a simulator with loss, jitter and reordering, and records when each surviving one is released.
+    /// </summary>
+    /// <param name="seed">The simulator's seed.</param>
+    /// <returns>Each released packet's index and the millisecond it was released at, in release order.</returns>
+    private static List<string> RecordSimulatorChoices(int seed)
+    {
+        const long StartTicks = 1_000_000_000L;
+
+        LatencySimulator simulator = new(new()
+        {
+            Enabled = true,
+            BaseLatencyMilliseconds = 10,
+            JitterMilliseconds = 40,
+            PacketLossChance = 0.3,
+            ReorderChance = 0.2,
+            Seed = seed,
+        });
+        IPEndPoint target = new(IPAddress.Loopback, 9999);
+        List<string> releases = [];
+
+        for (byte i = 0; i < 64; i++)
+            simulator.Process(new([(byte)PacketType.None, i]), target, StartTicks, (segment, _) => releases.Add($"{segment.Array![segment.Offset + 1]}@0"));
+
+        for (int millisecond = 1; millisecond <= 200; millisecond++)
+            simulator.Flush(StartTicks + millisecond * TimeSpan.TicksPerMillisecond, (segment, _) => releases.Add($"{segment.Array![segment.Offset + 1]}@{millisecond}"));
+
+        return releases;
     }
 
     /// <summary>

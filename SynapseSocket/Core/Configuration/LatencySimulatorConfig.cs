@@ -40,4 +40,19 @@ public sealed class LatencySimulatorConfig
     /// Only used when <see cref="ReorderChance"/> is greater than zero.
     /// </summary>
     public uint OutOfOrderExtraDelayMilliseconds = 100;
+
+    /// <summary>
+    /// The seed for the random choices behind loss, jitter and reordering, so a run can be repeated with the same choices for the
+    /// same packets. <see cref="UnsetSeed"/> (0, the default) leaves them unseeded, different on every run.
+    /// </summary>
+    /// <remarks>
+    /// Read once, when the engine is constructed. The same seed repeats the choices, but a networked run can still differ, since how
+    /// many packets are sent and when depends on timing.
+    /// </remarks>
+    public int Seed = UnsetSeed;
+
+    /// <summary>
+    /// Sentinel value: pass as <see cref="Seed"/> to leave the simulator unseeded.
+    /// </summary>
+    public const int UnsetSeed = 0;
 }
