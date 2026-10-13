@@ -5,6 +5,7 @@ using System.Net;
 using System.Threading;
 using CodeBoost.CodeAnalysis;
 using CodeBoost.Extensions;
+using CodeBoost.Networking;
 using CodeBoost.Performance;
 using SynapseSocket.Core;
 using SynapseSocket.Packets;

@@ -7,6 +7,7 @@ using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using CodeBoost.Networking;
 using CodeBoost.Performance;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
@@ -258,6 +259,10 @@ internal sealed partial class IngressEngine
     /// Receive buffer rented for this engine's lifetime and reused across every <see cref="Drain"/>.
     /// </summary>
     private byte[]? _receiveBuffer;
+    /// <summary>
+    /// The received-segment bitmap written for a segment acknowledgement, reused for every one; the engine is single-threaded.
+    /// </summary>
+    private readonly byte[] _receivedBitmapBuffer = new byte[PacketHeader.SegmentAckBitmapSize];
     /// <summary>
     /// Buffer the reversed packet is assembled into, rented alongside <see cref="_receiveBuffer"/> and reused for every
     /// datagram. Null when no <see cref="SynapseConfig.PacketTransform"/> is configured, so an engine without one
@@ -936,7 +941,7 @@ internal sealed partial class IngressEngine
                      * immediately return it was a second copy and a pool round-trip per segment. */
                     PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
 
-                    if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, buffer.AsSpan(headerSize, payloadLength), isReliable: true, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation, out bool isDuplicateSegment))
+                    if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, new(buffer, headerSize, payloadLength), isReliable: true, nowTicks, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation, out bool isDuplicateSegment))
                     {
                         EnqueueOrSendAck(synapseConnection, sequence);
                         DeliverOrdered(synapseConnection, sequence, assembledPayload, isReliable: true);
@@ -949,10 +954,8 @@ internal sealed partial class IngressEngine
                          * burst finished and something was lost. Reporting immediately avoids the sender's first
                          * blind retransmit of everything. A duplicate segment covers the case where the last one
                          * was itself lost, so the only signal is the sender retransmitting. */
-                        Span<byte> receivedBitmap = stackalloc byte[PacketHeader.SegmentAckBitmapSize];
-
-                        if (reassembler.TryWriteReceivedBitmap(segmentId, receivedBitmap, out _))
-                            _sender.SendSegmentAck(synapseConnection, sequence, receivedBitmap);
+                        if (reassembler.TryWriteReceivedBitmap(segmentId, new(_receivedBitmapBuffer), out _))
+                            _sender.SendSegmentAck(synapseConnection, sequence, _receivedBitmapBuffer);
                     }
                     else if (isProtocolViolation)
                         ReportSegmentViolation(fromEndPoint, synapseConnection, payloadLength, length);
@@ -968,7 +971,7 @@ internal sealed partial class IngressEngine
                     // See the reliable case: the assembly copies internally, so the intermediate rental was dead weight.
                     PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
 
-                    if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, buffer.AsSpan(headerSize, payloadLength), isReliable: false, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation, out _))
+                    if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, new(buffer, headerSize, payloadLength), isReliable: false, nowTicks, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation, out _))
                     {
                         PayloadDelivered?.Invoke(synapseConnection, assembledPayload, isReliable: false, isPayloadRented: true);
                     }

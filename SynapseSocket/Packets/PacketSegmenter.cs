@@ -8,11 +8,8 @@ namespace SynapseSocket.Packets;
 /// Abstract base for packet segmentation helpers.
 /// Holds shared configuration (MTU and segment limit) set via <see cref="Initialize"/> after renting from a pool.
 /// <para>
-/// Two concrete subclasses cover the two sides of the pipeline:
-/// <list type="bullet">
-/// <item><see cref="PacketSplitter"/>: send side; splits outbound payloads into wire-ready segment packets.</item>
-/// <item><see cref="PacketReassembler"/>: receive side; feeds arriving segments into reassembly buffers.</item>
-/// </list>
+/// <see cref="PacketSplitter"/> is the send side, splitting outbound payloads into wire-ready segment packets. The receive side is
+/// CodeBoost's <see cref="CodeBoost.Networking.PacketReassembler"/>, shared with every other layer that splits payloads.
 /// </para>
 /// </summary>
 public abstract class PacketSegmenter : IPoolResettable
