@@ -314,6 +314,7 @@ public sealed partial class SynapseConnection : IPoolResettable
         ReleasePooledResources();
 
         /* Security. */
+        IsRateLimitExempt = false;
         _inboundRateCountersResetTick = 0;
         _receivedByPacketCount = 0;
         _receivedByBytesCount = 0;

@@ -198,7 +198,8 @@ public sealed class SecurityProvider
 
     /// <summary>
     /// Applies the per-peer packet and byte rate limits to a datagram from an already-established connection.
-    /// Returns <see cref="FilterResult.Allowed"/> unchanged when security is disabled.
+    /// Returns <see cref="FilterResult.Allowed"/> unchanged when security is disabled, and skips the rate limits for a
+    /// connection marked <see cref="SynapseConnection.IsRateLimitExempt"/>.
     /// </summary>
     /// <param name="synapseConnection">The established connection the datagram arrived on.</param>
     /// <param name="packetLength">Size of the datagram in bytes.</param>
@@ -210,6 +211,9 @@ public sealed class SecurityProvider
 
         if (packetLength <= 0 || packetLength > _maximumPacketSize)
             return FilterResult.Oversized;
+
+        if (synapseConnection.IsRateLimitExempt)
+            return FilterResult.Allowed;
 
         // Packet-count and byte-count caps run as paired per-receive checks against
         // counters that the maintenance loop resets once per second. They catch two

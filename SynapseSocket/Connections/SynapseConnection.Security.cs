@@ -5,6 +5,15 @@ namespace SynapseSocket.Connections;
 
 public sealed partial class SynapseConnection
 {
+    /// <summary>
+    /// True to exempt this connection from the per-connection packet and byte rate limits.
+    /// </summary>
+    /// <remarks>
+    /// For a peer whose traffic for many others arrives on this one connection, such as the server side of a relayed room, which sends
+    /// every client's packets down a single link. The oversized packet check and every other security check still apply. Cleared when
+    /// the connection returns to its pool.
+    /// </remarks>
+    public bool IsRateLimitExempt { get; set; }
 
     /// <summary>
     /// Number of packets received by this connection since <see cref="_inboundRateCountersResetTick"/> was last set.
