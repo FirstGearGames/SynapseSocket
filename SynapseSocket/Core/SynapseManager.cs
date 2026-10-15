@@ -780,9 +780,10 @@ public sealed partial class SynapseManager : IDisposable
             {
                 returnedViolationAction = ViolationDetected?.Invoke(ref violationEventArgs) ?? initialAction;
             }
-            catch
+            catch (Exception listenerException)
             {
-                /* never let a listener crash the ingress path */
+                // Never let a listener crash the ingress path: the engine's default action stands, and the fault is reported.
+                UnhandledException?.Invoke(listenerException);
             }
 
             violationEventArgs.Action = returnedViolationAction;
@@ -821,7 +822,11 @@ public sealed partial class SynapseManager : IDisposable
                     return;
             }
         }
-        catch { }
+        catch (Exception enforcementException)
+        {
+            // Enforcing the action failed, so the offender may still be connected; reported rather than hidden.
+            UnhandledException?.Invoke(enforcementException);
+        }
     }
 
     /// <summary>
