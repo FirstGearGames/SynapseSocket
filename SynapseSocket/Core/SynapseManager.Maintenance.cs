@@ -175,7 +175,7 @@ public sealed partial class SynapseManager
             /* Reported before the teardown, so the violation's observers still find the connection live, and torn down whatever
              * action was settled, since a timed-out connection has nothing left to keep. The teardown goes by endpoint, so it does
              * nothing once the kick has run, or once a handler has stopped the engine and released everything. */
-            HandleViolation(timedOutEndPoint, timedOutSignature, ViolationReason.Timeout, 0, default, ViolationAction.Kick);
+            HandleViolation(timedOutEndPoint, timedOutSignature, ViolationReason.Timeout, 0, logEntry: default, ViolationAction.Kick);
             DisconnectAndBlacklist(timedOutEndPoint, canBlacklist: false);
 
             return false;

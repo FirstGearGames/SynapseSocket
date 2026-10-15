@@ -673,7 +673,7 @@ internal sealed partial class IngressEngine
             if (_packetTransform is not null && !TryTransformInbound(fromEndPoint, ref buffer, ref receivedLength))
             {
                 _telemetry.OnSecurityDroppedReceived();
-                ViolationOccurred?.Invoke(fromEndPoint, signature, ViolationReason.TransformRejected, receivedLength, default, ViolationAction.Drop);
+                ViolationOccurred?.Invoke(fromEndPoint, signature, ViolationReason.TransformRejected, receivedLength, logEntry: default, ViolationAction.Drop);
 
                 return;
             }
@@ -813,7 +813,7 @@ internal sealed partial class IngressEngine
             {
                 _telemetry.OnSecurityDroppedReceived();
                 ulong unknownSignature = synapseConnection?.Signature ?? _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
-                ViolationOccurred?.Invoke(fromEndPoint, unknownSignature, ViolationReason.UnknownPacket, length, default, ViolationAction.KickAndBlacklist);
+                ViolationOccurred?.Invoke(fromEndPoint, unknownSignature, ViolationReason.UnknownPacket, length, logEntry: default, ViolationAction.KickAndBlacklist);
                 return;
             }
 
