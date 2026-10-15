@@ -6,6 +6,7 @@ using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using CodeBoost.Logging;
 using CodeBoost.Performance;
 using SynapseSocket.Connections;
 using SynapseSocket.Diagnostics;
@@ -766,18 +767,18 @@ public sealed partial class SynapseManager : IDisposable
     /// tells <see cref="ViolationObserved"/> the settled action, and applies it. Falls back to
     /// <paramref name="initialAction"/> when no subscriber is attached.
     /// </summary>
-    internal void HandleViolation(IPEndPoint endPoint, ulong signature, ViolationReason violationReason, int packetSize, string? details, ViolationAction initialAction = ViolationAction.KickAndBlacklist)
+    internal void HandleViolation(IPEndPoint endPoint, ulong signature, ViolationReason violationReason, int packetSize, LogEntry logEntry, ViolationAction initialAction = ViolationAction.KickAndBlacklist)
     {
         Connections.ConnectionsByEndPoint.TryGetValue(endPoint, out SynapseConnection? synapseConnection);
 
-        ViolationEventArgs violationEventArgs = new(endPoint, signature, violationReason, synapseConnection, packetSize, details, initialAction);
+        ViolationEventArgs violationEventArgs = new(endPoint, signature, violationReason, synapseConnection, packetSize, logEntry, initialAction);
         ViolationAction returnedViolationAction = initialAction;
 
         try
         {
             try
             {
-                returnedViolationAction = ViolationDetected?.Invoke(violationEventArgs) ?? initialAction;
+                returnedViolationAction = ViolationDetected?.Invoke(ref violationEventArgs) ?? initialAction;
             }
             catch
             {

@@ -1,5 +1,6 @@
 using System;
 using System.Net;
+using CodeBoost.Logging;
 using SynapseSocket.Connections;
 using SynapseSocket.Security;
 
@@ -34,7 +35,7 @@ internal delegate void ConnectionFailedCallbackHandler(IPEndPoint? endPoint, Con
 /// <summary>
 /// Fired by the ingress path when a violation is detected.
 /// </summary>
-internal delegate void ViolationCallbackHandler(IPEndPoint endPoint, ulong signature, ViolationReason violationReason, int packetSize, string? details, ViolationAction initialViolationAction);
+internal delegate void ViolationCallbackHandler(IPEndPoint endPoint, ulong signature, ViolationReason violationReason, int packetSize, LogEntry logEntry, ViolationAction initialViolationAction);
 
 /// <summary>
 /// Raised when the ingress path receives a datagram whose first byte is not a recognised

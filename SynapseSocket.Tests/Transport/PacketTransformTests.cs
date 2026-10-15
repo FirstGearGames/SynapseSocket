@@ -141,7 +141,7 @@ public class PacketTransformTests
         using SynapseManager client = new(TestHarness.ClientConfig(PinPacketSizeToMtu));
 
         List<ViolationReason> violationReasons = [];
-        server.ViolationDetected += violationEventArgs =>
+        server.ViolationDetected += (ref ViolationEventArgs violationEventArgs) =>
         {
             violationReasons.Add(violationEventArgs.Reason);
             return violationEventArgs.Action;
@@ -173,7 +173,7 @@ public class PacketTransformTests
         using SynapseManager client = new(TestHarness.ClientConfig());
 
         List<ViolationReason> violationReasons = [];
-        server.ViolationDetected += violationEventArgs =>
+        server.ViolationDetected += (ref ViolationEventArgs violationEventArgs) =>
         {
             violationReasons.Add(violationEventArgs.Reason);
             return violationEventArgs.Action;

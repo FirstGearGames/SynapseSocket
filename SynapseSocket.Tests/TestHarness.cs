@@ -170,7 +170,7 @@ public static class TestHarness
                 Interlocked.Increment(ref _failures);
                 FailureReasons.Add(connectionFailedEventArgs.Reason);
             };
-            engine.ViolationDetected += (violationEventArgs) =>
+            engine.ViolationDetected += (ref ViolationEventArgs violationEventArgs) =>
             {
                 Interlocked.Increment(ref _violations);
                 ViolationReasons.Add(violationEventArgs.Reason);

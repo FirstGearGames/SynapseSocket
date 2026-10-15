@@ -1,4 +1,5 @@
 using System.Net;
+using CodeBoost.Logging;
 using SynapseSocket.Connections;
 
 namespace SynapseSocket.Core.Events;
@@ -30,9 +31,11 @@ public struct ViolationEventArgs
     /// </summary>
     public int PacketSize { get; private set; }
     /// <summary>
-    /// Optional details string providing additional context.
+    /// The line logged for this violation, or an unset entry to log nothing. Seeded by the engine with a constant message;
+    /// a <see cref="SynapseManager.ViolationDetected"/> handler may add one, change its level or message, or clear it with <see langword="default"/>.
     /// </summary>
-    public string? Details { get; private set; }
+    /// <remarks>The engine never writes this itself; the application logs it from <see cref="SynapseManager.ViolationObserved"/>.</remarks>
+    public LogEntry Log;
     /// <summary>
     /// The default action the engine would take for the ViolationReason.
     /// <para>
@@ -46,14 +49,14 @@ public struct ViolationEventArgs
     /// <summary>
     /// Initialises a new instance of <see cref="ViolationEventArgs"/>.
     /// </summary>
-    public ViolationEventArgs(IPEndPoint endPoint, ulong signature, ViolationReason violationReason, SynapseConnection? synapseConnection, int packetSize, string? details, ViolationAction initialAction)
+    public ViolationEventArgs(IPEndPoint endPoint, ulong signature, ViolationReason violationReason, SynapseConnection? synapseConnection, int packetSize, LogEntry logEntry, ViolationAction initialAction)
     {
         EndPoint = endPoint;
         Signature = signature;
         Reason = violationReason;
         Connection = synapseConnection;
         PacketSize = packetSize;
-        Details = details;
+        Log = logEntry;
         Action = initialAction;
     }
 }

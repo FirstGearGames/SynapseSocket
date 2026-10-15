@@ -7,6 +7,7 @@ using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using CodeBoost.Logging;
 using CodeBoost.Networking;
 using CodeBoost.Performance;
 using SynapseSocket.Connections;
@@ -576,7 +577,7 @@ internal sealed partial class IngressEngine
             catch (SocketException socketException) when (socketException.SocketErrorCode == SocketError.MessageSize)
             {
                 // Datagram larger than our buffer (should not happen with 64K, but be defensive).
-                ViolationOccurred?.Invoke(new(IPAddress.Any, 0), 0, ViolationReason.Oversized, 0, ViolationDatagramLargerThanBuffer, ViolationAction.KickAndBlacklist);
+                ViolationOccurred?.Invoke(new(IPAddress.Any, 0), 0, ViolationReason.Oversized, 0, LogEntry.Warning(ViolationDatagramLargerThanBuffer), ViolationAction.KickAndBlacklist);
                 continue;
             }
             catch (SocketException)
@@ -672,7 +673,7 @@ internal sealed partial class IngressEngine
             if (_packetTransform is not null && !TryTransformInbound(fromEndPoint, ref buffer, ref receivedLength))
             {
                 _telemetry.OnSecurityDroppedReceived();
-                ViolationOccurred?.Invoke(fromEndPoint, signature, ViolationReason.TransformRejected, receivedLength, null, ViolationAction.Drop);
+                ViolationOccurred?.Invoke(fromEndPoint, signature, ViolationReason.TransformRejected, receivedLength, default, ViolationAction.Drop);
 
                 return;
             }
@@ -705,7 +706,7 @@ internal sealed partial class IngressEngine
             ? ViolationAction.Drop
             : ViolationAction.KickAndBlacklist;
 
-        ViolationOccurred?.Invoke(fromEndPoint, signature, violationReason, receivedLength, ResolveFilterViolationDetails(filterResult), violationAction);
+        ViolationOccurred?.Invoke(fromEndPoint, signature, violationReason, receivedLength, violationAction is ViolationAction.Drop ? default : LogEntry.Warning(ResolveFilterViolationDetails(filterResult)), violationAction);
     }
 
     /// <summary>
@@ -812,7 +813,7 @@ internal sealed partial class IngressEngine
             {
                 _telemetry.OnSecurityDroppedReceived();
                 ulong unknownSignature = synapseConnection?.Signature ?? _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
-                ViolationOccurred?.Invoke(fromEndPoint, unknownSignature, ViolationReason.UnknownPacket, length, null, ViolationAction.KickAndBlacklist);
+                ViolationOccurred?.Invoke(fromEndPoint, unknownSignature, ViolationReason.UnknownPacket, length, default, ViolationAction.KickAndBlacklist);
                 return;
             }
 
@@ -822,7 +823,7 @@ internal sealed partial class IngressEngine
             {
                 _telemetry.OnSecurityDroppedReceived();
                 ulong unknownSignature = synapseConnection?.Signature ?? _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
-                ViolationOccurred?.Invoke(fromEndPoint, unknownSignature, ViolationReason.UnknownPacket, length, ResolveFilterViolationDetails(unknownFilterResult), ViolationAction.KickAndBlacklist);
+                ViolationOccurred?.Invoke(fromEndPoint, unknownSignature, ViolationReason.UnknownPacket, length, LogEntry.Warning(ResolveFilterViolationDetails(unknownFilterResult)), ViolationAction.KickAndBlacklist);
             }
 
             return;
@@ -839,7 +840,7 @@ internal sealed partial class IngressEngine
         {
             _telemetry.OnSecurityDroppedReceived();
             ulong signature = _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
-            ViolationOccurred?.Invoke(fromEndPoint, signature, ViolationReason.Malformed, length, ViolationHeaderParseFailure, ViolationAction.KickAndBlacklist);
+            ViolationOccurred?.Invoke(fromEndPoint, signature, ViolationReason.Malformed, length, LogEntry.Warning(ViolationHeaderParseFailure), ViolationAction.KickAndBlacklist);
             return;
         }
 
@@ -881,7 +882,7 @@ internal sealed partial class IngressEngine
                 /* Reported before the teardown, so the violation's observers still find the connection live, and torn down
                  * whatever action was settled. A kick has already torn it down, which the teardown checks for, and a handler
                  * that stopped the engine has released it, so nothing more is done then. */
-                ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.PeerDisconnect, packetSize: 0, details: null, ViolationAction.Ignore);
+                ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.PeerDisconnect, packetSize: 0, logEntry: default, ViolationAction.Ignore);
 
                 if (IsRunning)
                     TeardownRequested?.Invoke(synapseConnection);
@@ -944,7 +945,7 @@ internal sealed partial class IngressEngine
         if (payloadLength < 0)
         {
             _telemetry.OnSecurityDroppedReceived();
-            ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Malformed, length, ViolationNegativePayloadLength, ViolationAction.KickAndBlacklist);
+            ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Malformed, length, LogEntry.Warning(ViolationNegativePayloadLength), ViolationAction.KickAndBlacklist);
             return;
         }
 
@@ -956,7 +957,7 @@ internal sealed partial class IngressEngine
             if ((ulong)segmentCount * _effectiveMaximumTransmissionUnit > _effectiveMaximumReassembledPacketSize)
             {
                 _telemetry.OnSecurityDroppedReceived();
-                ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Oversized, length, ViolationSegmentAssemblyOversized, ViolationAction.KickAndBlacklist);
+                ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Oversized, length, LogEntry.Warning(ViolationSegmentAssemblyOversized), ViolationAction.KickAndBlacklist);
                 return;
             }
         }
@@ -1040,9 +1041,9 @@ internal sealed partial class IngressEngine
         _telemetry.OnSecurityDroppedReceived();
 
         if (payloadLength > _effectiveMaximumTransmissionUnit)
-            ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Oversized, length, ViolationSegmentLargerThanTransmissionUnit, ViolationAction.KickAndBlacklist);
+            ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Oversized, length, LogEntry.Warning(ViolationSegmentLargerThanTransmissionUnit), ViolationAction.KickAndBlacklist);
         else
-            ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Malformed, length, ViolationSegmentMismatch, ViolationAction.KickAndBlacklist);
+            ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Malformed, length, LogEntry.Warning(ViolationSegmentMismatch), ViolationAction.KickAndBlacklist);
     }
 
     /// <summary>
@@ -1105,7 +1106,7 @@ internal sealed partial class IngressEngine
                 if (payload.Array is not null)
                     TrackedArrayPool<byte>.Return(payload.Array);
 
-                ViolationOccurred?.Invoke(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.Oversized, 0, ViolationReorderBufferExceeded, ViolationAction.KickAndBlacklist);
+                ViolationOccurred?.Invoke(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.Oversized, 0, LogEntry.Warning(ViolationReorderBufferExceeded), ViolationAction.KickAndBlacklist);
                 return;
             }
 

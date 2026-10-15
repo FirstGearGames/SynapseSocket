@@ -1064,7 +1064,7 @@ public sealed class SweepFindingTests
             config.Security.ViolationsBeforeBlacklist = uint.MaxValue;
         }));
 
-        server.ViolationDetected += _ => ViolationAction.Ignore;
+        server.ViolationDetected += (ref ViolationEventArgs _) => ViolationAction.Ignore;
         server.Start();
 
         IPEndPoint target = new(IPAddress.Loopback, port);

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Net;
+using CodeBoost.Logging;
 using SynapseSocket.Connections;
 using SynapseSocket.Core.Configuration;
 using SynapseSocket.Core.Events;
@@ -174,7 +175,7 @@ public sealed partial class SynapseManager
             /* Reported before the teardown, so the violation's observers still find the connection live, and torn down whatever
              * action was settled, since a timed-out connection has nothing left to keep. The teardown goes by endpoint, so it does
              * nothing once the kick has run, or once a handler has stopped the engine and released everything. */
-            HandleViolation(timedOutEndPoint, timedOutSignature, ViolationReason.Timeout, 0, null, ViolationAction.Kick);
+            HandleViolation(timedOutEndPoint, timedOutSignature, ViolationReason.Timeout, 0, default, ViolationAction.Kick);
             DisconnectAndBlacklist(timedOutEndPoint, canBlacklist: false);
 
             return false;
@@ -295,7 +296,7 @@ public sealed partial class SynapseManager
                 if (synapseConnection.PendingReliableQueue.Remove(keyValuePair.Key, out SynapseConnection.PendingReliable? exhausted))
                     SynapseConnection.ReleasePendingReliable(exhausted);
                 Telemetry.OnLost();
-                HandleViolation(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.ReliableExhausted, 0, ViolationReliableExhausted, ViolationAction.Kick);
+                HandleViolation(synapseConnection.RemoteEndPoint, synapseConnection.Signature, ViolationReason.ReliableExhausted, 0, LogEntry.Information(ViolationReliableExhausted), ViolationAction.Kick);
 
                 return;
             }
