@@ -210,6 +210,50 @@ internal sealed partial class IngressEngine
     /// Violation detail reported when a peer holds more out-of-order reliable packets than the reorder buffer allows.
     /// </summary>
     private const string ViolationReorderBufferExceeded = "Reorder buffer capacity exceeded.";
+    /// <summary>
+    /// Violation detail reported when a datagram is larger than the receive buffer.
+    /// </summary>
+    private const string ViolationDatagramLargerThanBuffer = "Datagram larger than the receive buffer.";
+    /// <summary>
+    /// Violation detail reported when a packet header cannot be parsed.
+    /// </summary>
+    private const string ViolationHeaderParseFailure = "Header parse failure.";
+    /// <summary>
+    /// Violation detail reported when a packet declares a negative payload length.
+    /// </summary>
+    private const string ViolationNegativePayloadLength = "Negative payload length.";
+    /// <summary>
+    /// Violation detail reported when a filter refuses a packet as oversized.
+    /// </summary>
+    private const string ViolationFilterOversized = "Refused by the filter as oversized.";
+    /// <summary>
+    /// Violation detail reported when a filter refuses a packet from a blacklisted sender.
+    /// </summary>
+    private const string ViolationFilterBlacklisted = "Refused by the filter as blacklisted.";
+    /// <summary>
+    /// Violation detail reported when a filter refuses a packet for exceeding the rate limit.
+    /// </summary>
+    private const string ViolationFilterRateLimited = "Refused by the filter as rate limited.";
+    /// <summary>
+    /// Violation detail reported when a filter refuses a packet whose signature does not verify.
+    /// </summary>
+    private const string ViolationFilterSignatureFailure = "Refused by the filter for a signature failure.";
+    /// <summary>
+    /// Violation detail reported when a filter refuses a packet for a reason this engine does not name.
+    /// </summary>
+    private const string ViolationFilterRefused = "Refused by the filter.";
+    /// <summary>
+    /// Rejection detail reported when a handshake arrives while the server is at its connection limit.
+    /// </summary>
+    private const string RejectionConnectionLimitReached = "Connection limit reached.";
+    /// <summary>
+    /// Rejection detail reported when a handshake repeats one already seen.
+    /// </summary>
+    private const string RejectionHandshakeReplay = "Handshake replay detected.";
+    /// <summary>
+    /// Rejection detail reported when the configured handshake validator refuses a peer.
+    /// </summary>
+    private const string RejectionValidatorRefused = "Validator returned false.";
 
     /// <summary>
     /// Creates a new ingress engine bound to the provided socket.
@@ -532,7 +576,7 @@ internal sealed partial class IngressEngine
             catch (SocketException socketException) when (socketException.SocketErrorCode == SocketError.MessageSize)
             {
                 // Datagram larger than our buffer (should not happen with 64K, but be defensive).
-                ViolationOccurred?.Invoke(new(IPAddress.Any, 0), 0, ViolationReason.Oversized, 0, "MessageSize", ViolationAction.KickAndBlacklist);
+                ViolationOccurred?.Invoke(new(IPAddress.Any, 0), 0, ViolationReason.Oversized, 0, ViolationDatagramLargerThanBuffer, ViolationAction.KickAndBlacklist);
                 continue;
             }
             catch (SocketException)
@@ -643,7 +687,7 @@ internal sealed partial class IngressEngine
         if (filterResult is FilterResult.Blacklisted)
         {
             // Blacklisted = REJECTION, not a per-packet violation. The peer is already known-bad.
-            ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.Blacklisted, filterResult.ToString());
+            ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.Blacklisted, ResolveFilterViolationDetails(filterResult));
             return;
         }
 
@@ -661,7 +705,7 @@ internal sealed partial class IngressEngine
             ? ViolationAction.Drop
             : ViolationAction.KickAndBlacklist;
 
-        ViolationOccurred?.Invoke(fromEndPoint, signature, violationReason, receivedLength, filterResult.ToString(), violationAction);
+        ViolationOccurred?.Invoke(fromEndPoint, signature, violationReason, receivedLength, ResolveFilterViolationDetails(filterResult), violationAction);
     }
 
     /// <summary>
@@ -778,7 +822,7 @@ internal sealed partial class IngressEngine
             {
                 _telemetry.OnSecurityDroppedReceived();
                 ulong unknownSignature = synapseConnection?.Signature ?? _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
-                ViolationOccurred?.Invoke(fromEndPoint, unknownSignature, ViolationReason.UnknownPacket, length, unknownFilterResult.ToString(), ViolationAction.KickAndBlacklist);
+                ViolationOccurred?.Invoke(fromEndPoint, unknownSignature, ViolationReason.UnknownPacket, length, ResolveFilterViolationDetails(unknownFilterResult), ViolationAction.KickAndBlacklist);
             }
 
             return;
@@ -795,7 +839,7 @@ internal sealed partial class IngressEngine
         {
             _telemetry.OnSecurityDroppedReceived();
             ulong signature = _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
-            ViolationOccurred?.Invoke(fromEndPoint, signature, ViolationReason.Malformed, length, "Header parse failure", ViolationAction.KickAndBlacklist);
+            ViolationOccurred?.Invoke(fromEndPoint, signature, ViolationReason.Malformed, length, ViolationHeaderParseFailure, ViolationAction.KickAndBlacklist);
             return;
         }
 
@@ -900,7 +944,7 @@ internal sealed partial class IngressEngine
         if (payloadLength < 0)
         {
             _telemetry.OnSecurityDroppedReceived();
-            ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Malformed, length, "Negative payload length", ViolationAction.KickAndBlacklist);
+            ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.Malformed, length, ViolationNegativePayloadLength, ViolationAction.KickAndBlacklist);
             return;
         }
 
@@ -1165,7 +1209,7 @@ internal sealed partial class IngressEngine
         // Connection cap: reject new peers when the engine is full.
         if (!hasConnection && _connections.Count >= _effectiveMaximumConcurrentConnections)
         {
-            ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.ServerFull, "Connection limit reached");
+            ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.ServerFull, RejectionConnectionLimitReached);
             return;
         }
 
@@ -1191,13 +1235,13 @@ internal sealed partial class IngressEngine
         if (!_seenHandshakes.TryAdd(replayKey, nowTicks))
         {
             // Exact same bytes received again - replay.
-            ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.SignatureRejected, "Handshake replay detected");
+            ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.SignatureRejected, RejectionHandshakeReplay);
             return;
         }
 
         if (_config.Security.SignatureValidator is not null && !_config.Security.SignatureValidator.Validate(fromEndPoint, signature, handshakePayload))
         {
-            ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.SignatureRejected, "Validator returned false");
+            ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.SignatureRejected, RejectionValidatorRefused);
             return;
         }
 
@@ -1263,6 +1307,21 @@ internal sealed partial class IngressEngine
     /// <param name="nowTicks">Current timestamp in <see cref="System.DateTime.Ticks"/>.</param>
     /// <param name="staleTicks">Age in ticks beyond which a cached handshake signature is considered expired.</param>
     private void RemoveExpiredHandshakeEntries(long nowTicks, long staleTicks) => RemoveExpiredEntries(_seenHandshakes, nowTicks, staleTicks);
+
+    /// <summary>
+    /// Resolves the constant detail text for a packet a filter refused.
+    /// </summary>
+    /// <param name="filterResult">Why the filter refused the packet.</param>
+    /// <returns>A constant string, so reporting a refusal never allocates.</returns>
+    /// <remarks>A switch over constants rather than the enum's ToString, which builds a new string on every call; a refusal can repeat on every packet a hostile peer sends.</remarks>
+    private static string ResolveFilterViolationDetails(FilterResult filterResult) => filterResult switch
+    {
+        FilterResult.Oversized => ViolationFilterOversized,
+        FilterResult.Blacklisted => ViolationFilterBlacklisted,
+        FilterResult.RateLimited => ViolationFilterRateLimited,
+        FilterResult.SignatureFailure => ViolationFilterSignatureFailure,
+        _ => ViolationFilterRefused
+    };
 
     /// <summary>
     /// Mixes <paramref name="payload"/> into <paramref name="signature"/> using FNV-1a to produce a per-handshake replay cache key.
