@@ -105,10 +105,10 @@ public sealed class SecurityConfig
     public ISignatureValidator? SignatureValidator;
 
     /// <summary>
-    /// When false, all established-connection security enforcement is disabled: rate limiting,
-    /// oversized packet checks, reorder buffer overflow, and segment assembly size checks are
-    /// skipped. Pre-connection checks (blacklist, handshake replay, signature validation) remain
-    /// active regardless. Defaults to true.
+    /// When false, rate limiting and the oversized packet check on established connections are skipped.
+    /// The reorder buffer bound and the segment assembly size bound stay enforced, because they cap memory a
+    /// remote peer controls, and pre-connection checks (blacklist, handshake replay, signature validation)
+    /// remain active too. Defaults to true.
     /// </summary>
     public bool Enabled = true;
 

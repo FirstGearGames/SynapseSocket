@@ -67,7 +67,8 @@ public sealed partial class SynapseManager : IDisposable
     /// <summary>
     /// Raised when the engine detects a violation (oversized packet, rate limit breach, malformed data, or rejected signature).
     /// Handlers may override <see cref="ViolationEventArgs.Action"/> to customize how the engine responds.
-    /// When no handler is subscribed, the default action (<see cref="ViolationAction.KickAndBlacklist"/>) is applied.
+    /// When no handler is subscribed, the default action is applied: <see cref="ViolationAction.Drop"/> for a rate limit breach, which
+    /// sheds the excess and keeps the peer, and <see cref="ViolationAction.KickAndBlacklist"/> for everything else.
     /// <para>
     /// <b>Warning:</b> do not unconditionally downgrade <see cref="ViolationEventArgs.Action"/> inside a handler.
     /// Setting the action to <see cref="ViolationAction.Ignore"/> suppresses every protective measure the engine would otherwise take. See <see cref="ViolationEventArgs.Action"/> for details.
