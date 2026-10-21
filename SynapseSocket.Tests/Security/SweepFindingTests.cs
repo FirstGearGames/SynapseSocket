@@ -1243,6 +1243,48 @@ public sealed class SweepFindingTests
             $"replay cache holds {server.ReplayCacheCount} entries after {FloodCount} handshakes. It has no bound");
     }
 
+    /// <summary>
+    /// The once-a-second sweep must not enumerate a replay cache that holds only live handshakes: enumerating a
+    /// ConcurrentDictionary allocates its enumerator, and a connected peer's handshake stays cached for twice the
+    /// connection timeout, so the sweep allocated every second for that whole time. Once the entry has expired, the
+    /// sweep must still remove it.
+    /// </summary>
+    [Fact]
+    public void ReplayCache_SweepSkipsLiveHandshakesWithoutAllocating_AndStillEvictsThemOnceExpired()
+    {
+        int port = TestHarness.GetFreePort();
+        // A replay entry lives twice the connection timeout, 4 s here: long enough to span several sweeps while it is still live.
+        using SynapseManager server = new(TestHarness.ServerConfig(port, config => config.Connection.TimeoutMilliseconds = 2000));
+        using SynapseManager client = new(TestHarness.ClientConfig(config => config.Connection.TimeoutMilliseconds = 2000));
+
+        TestHarness.EventRecorder serverEvents = new();
+        serverEvents.Attach(server);
+
+        server.Start();
+        client.Start();
+        client.Connect(new IPEndPoint(IPAddress.Loopback, port));
+
+        Assert.True(TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 1, 3000, server, client), "handshake did not complete");
+        Assert.Equal(1, server.ReplayCacheCount);
+
+        // The sweep is driven directly at chosen times, so only it is measured; a pass also runs at most once a second, so each
+        // call is placed past that interval. Warmed first, so a first-call cost is not counted.
+        IngressEngine ingressEngine = server.IngressEngines[0];
+        long nowTicks = Clock.Ticks;
+        ingressEngine.RunMaintenance(nowTicks + 1 * TimeSpan.TicksPerSecond + 1);
+
+        long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        ingressEngine.RunMaintenance(nowTicks + 2 * TimeSpan.TicksPerSecond + 2);
+        long allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+
+        Assert.Equal(1, server.ReplayCacheCount);
+        Assert.Equal(0L, allocatedBytes);
+
+        // Past the entry's 4 s lifetime, the sweep still removes it.
+        ingressEngine.RunMaintenance(nowTicks + 5 * TimeSpan.TicksPerSecond);
+        Assert.Equal(0, server.ReplayCacheCount);
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // M16: ACK batching must actually coalesce
     // ─────────────────────────────────────────────────────────────────────────

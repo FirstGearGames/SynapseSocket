@@ -117,6 +117,15 @@ internal sealed partial class IngressEngine
     /// </summary>
     private long _lastHandshakeEvictionTicks;
     /// <summary>
+    /// The oldest first-seen <see cref="Clock.Ticks"/> still in <see cref="_seenHandshakes"/>, or <see cref="long.MaxValue"/> when it is empty.
+    /// </summary>
+    /// <remarks>
+    /// Lets a sweep skip the table until its oldest entry can have expired. Enumerating a ConcurrentDictionary allocates its
+    /// enumerator, and a connected peer's handshake stays in the table for twice the connection timeout, so without this the
+    /// once-a-second sweep allocated every second for that whole time while finding nothing to remove.
+    /// </remarks>
+    private long _oldestSeenHandshakeTicks = long.MaxValue;
+    /// <summary>
     /// Live entry count of the handshake replay cache. Diagnostic surface for verifying the cache stays bounded.
     /// </summary>
     internal int ReplayCacheCount => _seenHandshakes.Count;
@@ -1230,7 +1239,10 @@ internal sealed partial class IngressEngine
             RemoveExpiredHandshakeEntries(nowTicks, ReplayCacheEntryLifetimeTicks);
 
             if (_seenHandshakes.Count >= SynapseManager.MaximumReplayCacheEntries)
+            {
                 _seenHandshakes.Clear();
+                _oldestSeenHandshakeTicks = long.MaxValue;
+            }
         }
 
         if (!_seenHandshakes.TryAdd(replayKey, nowTicks))
@@ -1239,6 +1251,9 @@ internal sealed partial class IngressEngine
             ConnectionFailed?.Invoke(fromEndPoint, ConnectionRejectedReason.SignatureRejected, RejectionHandshakeReplay);
             return;
         }
+
+        if (nowTicks < _oldestSeenHandshakeTicks)
+            _oldestSeenHandshakeTicks = nowTicks;
 
         if (_config.Security.SignatureValidator is not null && !_config.Security.SignatureValidator.Validate(fromEndPoint, signature, handshakePayload))
         {
@@ -1307,7 +1322,14 @@ internal sealed partial class IngressEngine
     /// </summary>
     /// <param name="nowTicks">Current timestamp in <see cref="System.DateTime.Ticks"/>.</param>
     /// <param name="staleTicks">Age in ticks beyond which a cached handshake signature is considered expired.</param>
-    private void RemoveExpiredHandshakeEntries(long nowTicks, long staleTicks) => RemoveExpiredEntries(_seenHandshakes, nowTicks, staleTicks);
+    /// <remarks>Skipped until the oldest entry can have expired, so a table holding only live handshakes is never enumerated.</remarks>
+    private void RemoveExpiredHandshakeEntries(long nowTicks, long staleTicks)
+    {
+        if (nowTicks - _oldestSeenHandshakeTicks <= staleTicks)
+            return;
+
+        _oldestSeenHandshakeTicks = RemoveExpiredEntries(_seenHandshakes, nowTicks, staleTicks);
+    }
 
     /// <summary>
     /// Resolves the constant detail text for a packet a filter refused.
@@ -1367,17 +1389,24 @@ internal sealed partial class IngressEngine
     /// <param name="dictionary">The dictionary to prune.</param>
     /// <param name="nowTicks">Current timestamp in <see cref="DateTime.Ticks"/>.</param>
     /// <param name="staleTicks">Age threshold in ticks; entries older than this are removed.</param>
-    private static void RemoveExpiredEntries<TKey>(ConcurrentDictionary<TKey, long> dictionary, long nowTicks, long staleTicks) where TKey : notnull
+    /// <returns>The oldest tick stamp left in <paramref name="dictionary"/>, or <see cref="long.MaxValue"/> when none is left.</returns>
+    private static long RemoveExpiredEntries<TKey>(ConcurrentDictionary<TKey, long> dictionary, long nowTicks, long staleTicks) where TKey : notnull
     {
         // Enumerating a ConcurrentDictionary allocates its enumerator, and in steady state these caches are empty: nothing to expire, nothing to allocate.
         if (dictionary.IsEmpty)
-            return;
+            return long.MaxValue;
+
+        long oldestRemainingTicks = long.MaxValue;
 
         foreach (KeyValuePair<TKey, long> entry in dictionary)
         {
             if (nowTicks - entry.Value > staleTicks)
                 dictionary.TryRemove(entry.Key, out _);
+            else if (entry.Value < oldestRemainingTicks)
+                oldestRemainingTicks = entry.Value;
         }
+
+        return oldestRemainingTicks;
     }
 
     /// <summary>
