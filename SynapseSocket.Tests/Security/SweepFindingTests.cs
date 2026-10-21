@@ -1244,13 +1244,13 @@ public sealed class SweepFindingTests
     }
 
     /// <summary>
-    /// The once-a-second sweep must not enumerate a replay cache that holds only live handshakes: enumerating a
-    /// ConcurrentDictionary allocates its enumerator, and a connected peer's handshake stays cached for twice the
-    /// connection timeout, so the sweep allocated every second for that whole time. Once the entry has expired, the
-    /// sweep must still remove it.
+    /// The once-a-second sweep must never enumerate the replay cache: enumerating a ConcurrentDictionary allocates its
+    /// enumerator, and a connected peer's handshake stays cached for twice the connection timeout, so the sweep allocated
+    /// every second for that whole time and once more on removal. Once the entry has expired, the sweep must still remove
+    /// it, without allocating.
     /// </summary>
     [Fact]
-    public void ReplayCache_SweepSkipsLiveHandshakesWithoutAllocating_AndStillEvictsThemOnceExpired()
+    public void ReplayCache_SweepNeverAllocates_AndStillEvictsExpiredHandshakes()
     {
         int port = TestHarness.GetFreePort();
         // A replay entry lives twice the connection timeout, 4 s here: long enough to span several sweeps while it is still live.
@@ -1280,9 +1280,13 @@ public sealed class SweepFindingTests
         Assert.Equal(1, server.ReplayCacheCount);
         Assert.Equal(0L, allocatedBytes);
 
-        // Past the entry's 4 s lifetime, the sweep still removes it.
+        // Past the entry's 4 s lifetime, the sweep still removes it, and removing it allocates nothing either.
+        allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
         ingressEngine.RunMaintenance(nowTicks + 5 * TimeSpan.TicksPerSecond);
+        allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+
         Assert.Equal(0, server.ReplayCacheCount);
+        Assert.Equal(0L, allocatedBytes);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
