@@ -250,6 +250,23 @@ public sealed partial class SynapseManager : IDisposable
     }
 
     /// <summary>
+    /// Total entries in the replay caches' expiry queues across every ingress engine, which must always equal
+    /// <see cref="ReplayCacheCount"/>. Diagnostic surface.
+    /// </summary>
+    internal int ReplayCacheOrderCount
+    {
+        get
+        {
+            int total = 0;
+
+            for (int i = 0; i < _ingressEngines.Count; i++)
+                total += _ingressEngines[i].ReplayCacheOrderCount;
+
+            return total;
+        }
+    }
+
+    /// <summary>
     /// Creates a new SynapseSocket engine from the supplied configuration.
     /// Call <see cref="Start"/> to begin binding and receiving.
     /// </summary>

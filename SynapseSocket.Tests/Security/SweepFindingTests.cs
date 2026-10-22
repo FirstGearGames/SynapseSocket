@@ -1241,6 +1241,8 @@ public sealed class SweepFindingTests
         Assert.True(
             server.ReplayCacheCount <= SynapseManager.MaximumReplayCacheEntries,
             $"replay cache holds {server.ReplayCacheCount} entries after {FloodCount} handshakes. It has no bound");
+        // The flood overflows the cache and clears it; the expiry queue must be cleared and refilled with it, entry for entry.
+        Assert.Equal(server.ReplayCacheCount, server.ReplayCacheOrderCount);
     }
 
     /// <summary>
@@ -1266,6 +1268,7 @@ public sealed class SweepFindingTests
 
         Assert.True(TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 1, 3000, server, client), "handshake did not complete");
         Assert.Equal(1, server.ReplayCacheCount);
+        Assert.Equal(1, server.ReplayCacheOrderCount);
 
         // The sweep is driven directly at chosen times, so only it is measured; a pass also runs at most once a second, so each
         // call is placed past that interval. Warmed first, so a first-call cost is not counted.
@@ -1278,6 +1281,7 @@ public sealed class SweepFindingTests
         long allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
 
         Assert.Equal(1, server.ReplayCacheCount);
+        Assert.Equal(1, server.ReplayCacheOrderCount);
         Assert.Equal(0L, allocatedBytes);
 
         // Past the entry's 4 s lifetime, the sweep still removes it, and removing it allocates nothing either.
@@ -1286,6 +1290,7 @@ public sealed class SweepFindingTests
         allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
 
         Assert.Equal(0, server.ReplayCacheCount);
+        Assert.Equal(0, server.ReplayCacheOrderCount);
         Assert.Equal(0L, allocatedBytes);
     }
 

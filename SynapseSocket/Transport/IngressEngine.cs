@@ -131,6 +131,11 @@ internal sealed partial class IngressEngine
     /// </summary>
     internal int ReplayCacheCount => _seenHandshakes.Count;
     /// <summary>
+    /// Live entry count of the replay cache's expiry queue, which must always equal <see cref="ReplayCacheCount"/>. Diagnostic surface
+    /// for verifying the two are added to, expired and cleared together.
+    /// </summary>
+    internal int ReplayCacheOrderCount => _seenHandshakeOrder.Count;
+    /// <summary>
     /// How long a replay-cache entry stays meaningful. Sized off the connection timeout so a handshake cannot be
     /// replayed within any window where the original session could still be alive.
     /// </summary>
