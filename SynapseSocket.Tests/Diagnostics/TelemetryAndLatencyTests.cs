@@ -66,6 +66,39 @@ public class TelemetryAndLatencyTests
         Assert.Equal(0, eventRecorder.PacketsReceived);
     }
 
+    /// <summary>
+    /// Conditions changed while the engine runs take effect: a simulator turned on after start drops packets, and turned off again
+    /// lets them through.
+    /// </summary>
+    [Fact]
+    public void LatencySimulator_EnabledAndDisabledWhileRunning_TakesEffect()
+    {
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port));
+        using SynapseManager client = new(TestHarness.ClientConfig());
+
+        TestHarness.EventRecorder eventRecorder = new();
+        eventRecorder.Attach(server);
+
+        server.Start();
+        client.Start();
+
+        SynapseConnection synapseConnection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
+        Assert.True(TestHarness.PumpUntil(() => eventRecorder.ConnectionsEstablished >= 1, 2000, server, client));
+
+        client.Config.LatencySimulator.PacketLossChance = 1.0;
+        client.Config.LatencySimulator.Enabled = true;
+        client.Send(synapseConnection, new byte[] { 1 }, isReliable: false);
+        TestHarness.PumpFor(300, server, client);
+
+        Assert.Equal(0, eventRecorder.PacketsReceived);
+
+        client.Config.LatencySimulator.Enabled = false;
+        client.Send(synapseConnection, new byte[] { 2 }, isReliable: false);
+
+        Assert.True(TestHarness.PumpUntil(() => eventRecorder.PacketsReceived >= 1, 2000, server, client), "a packet sent after the simulator was turned off never arrived");
+    }
+
     [Fact]
     public void LatencySimulator_Adds_Measurable_Delay()
     {

@@ -41,10 +41,6 @@ public sealed partial class TransmissionEngine
     /// </summary>
     private readonly LatencySimulator _latencySimulator;
     /// <summary>
-    /// True if the LatencySimulator is enabled.
-    /// </summary>
-    private readonly bool _isLatencySimulatorEnabled;
-    /// <summary>
     /// Cached delegate for <see cref="SendDirect"/>, handed to the latency simulator to avoid a per-call allocation.
     /// </summary>
     private readonly Action<ArraySegment<byte>, IPEndPoint> _sendDirect;
@@ -118,7 +114,6 @@ public sealed partial class TransmissionEngine
         _telemetry = telemetry;
 
         _latencySimulator = latency;
-        _isLatencySimulatorEnabled = _latencySimulator.IsEnabled;
         _sendDirect = SendDirect;
         _packetTransform = config.PacketTransform;
 
@@ -149,9 +144,10 @@ public sealed partial class TransmissionEngine
     /// </summary>
     /// <param name="segment">The wire-ready bytes to send.</param>
     /// <param name="target">The remote endpoint to send to.</param>
+    /// <remarks>Whether the simulator is enabled is read on every send rather than once at construction, so conditions turned on or off while the engine runs take effect.</remarks>
     public void SendRaw(ArraySegment<byte> segment, IPEndPoint target)
     {
-        if (!_isLatencySimulatorEnabled)
+        if (!_latencySimulator.IsEnabled)
         {
             SendDirect(segment, target);
             return;
@@ -162,23 +158,15 @@ public sealed partial class TransmissionEngine
 
     /// <summary>
     /// Releases any latency-simulator-delayed packets whose due time has elapsed. Called once per engine poll.
-    /// No-op when the simulator is disabled.
+    /// Runs whether or not the simulator is enabled, so packets parked before it was turned off are still delivered.
     /// </summary>
     /// <param name="nowTicks">Current time in <see cref="DateTime.Ticks"/>.</param>
-    public void FlushDeferredSends(long nowTicks)
-    {
-        if (_isLatencySimulatorEnabled)
-            _latencySimulator.Flush(nowTicks, _sendDirect);
-    }
+    public void FlushDeferredSends(long nowTicks) => _latencySimulator.Flush(nowTicks, _sendDirect);
 
     /// <summary>
     /// Returns any still-parked latency-simulator buffers to the pool. Called on engine shutdown.
     /// </summary>
-    public void ClearDeferredSends()
-    {
-        if (_isLatencySimulatorEnabled)
-            _latencySimulator.Clear();
-    }
+    public void ClearDeferredSends() => _latencySimulator.Clear();
 
     /// <summary>
     /// Sends an unreliable, unsegmented payload to the connection's remote endpoint.
