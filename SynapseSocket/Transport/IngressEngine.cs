@@ -727,9 +727,9 @@ internal sealed partial class IngressEngine
     /// <summary>
     /// Reverses the payload of an arriving packet through <see cref="_packetTransform"/> and repoints
     /// <paramref name="buffer"/> and <paramref name="receivedLength"/> at the rebuilt packet, header first.
-    /// Datagrams whose leading byte is above <see cref="PacketType.NatChallenge"/> belong to an external protocol
-    /// piggybacking on the socket and pass through untouched, as do datagrams too short for the header they declare,
-    /// which <see cref="ProcessPacket"/> already reports as malformed.
+    /// Datagrams whose leading byte is above <see cref="PacketHeader.HighestPacketTypeByte"/> belong to an external
+    /// protocol piggybacking on the socket and pass through untouched, as do datagrams too short for the header they
+    /// declare, which <see cref="ProcessPacket"/> already reports as malformed.
     /// </summary>
     /// <param name="fromEndPoint">The source endpoint of the datagram.</param>
     /// <param name="buffer">The receive buffer, replaced by the transform buffer when a payload was reversed.</param>
@@ -742,7 +742,7 @@ internal sealed partial class IngressEngine
 
         byte typeByte = buffer[0];
 
-        if (typeByte > (byte)PacketType.NatChallenge)
+        if (typeByte > PacketHeader.HighestPacketTypeByte)
             return true;
 
         PacketType packetType = (PacketType)typeByte;
@@ -820,7 +820,7 @@ internal sealed partial class IngressEngine
         // External protocols (e.g. beacon/rendezvous clients) piggyback here intentionally.
         byte typeByte = buffer[0];
 
-        if (typeByte > (byte)PacketType.SegmentAck)
+        if (typeByte > PacketHeader.HighestPacketTypeByte)
         {
             /* AllowUnknownPackets value is not cached
              * because this condition is rare. */

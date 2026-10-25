@@ -695,9 +695,11 @@ public sealed partial class SynapseManager : IDisposable
     /// shares the same NAT mapping as Synapse's peer-to-peer traffic.
     /// <para>
     /// External protocols must use a leading byte strictly greater than
-    /// <see cref="SynapseSocket.Packets.PacketType.NatChallenge"/> so the ingress path can
+    /// <see cref="SynapseSocket.Packets.PacketHeader.HighestPacketTypeByte"/> so the ingress path can
     /// distinguish their packets from Synapse packets and route them through
-    /// <see cref="UnknownPacketReceived"/>.
+    /// <see cref="UnknownPacketReceived"/>. That boundary is the highest Synapse
+    /// <see cref="SynapseSocket.Packets.PacketType"/> and rises whenever a member is added, so an external protocol
+    /// should sit well clear of it rather than immediately above it.
     /// </para>
     /// </summary>
     /// <param name="target">The remote endpoint to send to.</param>

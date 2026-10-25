@@ -507,8 +507,8 @@ public sealed partial class TransmissionEngine
     /// Rewrites the payload of an outbound packet through <see cref="_packetTransform"/> and repoints
     /// <paramref name="segment"/> at the result. The header is copied through byte for byte, so the receiving side can
     /// still identify the packet before it reverses the transform.
-    /// Datagrams whose leading byte is above <see cref="PacketType.NatChallenge"/> belong to an external protocol
-    /// piggybacking on the socket via <see cref="SendRaw"/> and pass through untouched.
+    /// Datagrams whose leading byte is above <see cref="PacketHeader.HighestPacketTypeByte"/> belong to an external
+    /// protocol piggybacking on the socket via <see cref="SendRaw"/> and pass through untouched.
     /// </summary>
     /// <param name="segment">The wire-ready bytes to send, replaced by the transformed packet when one was produced.</param>
     /// <param name="target">The remote endpoint the packet is addressed to.</param>
@@ -517,7 +517,7 @@ public sealed partial class TransmissionEngine
     {
         byte typeByte = segment.Array![segment.Offset];
 
-        if (typeByte > (byte)PacketType.NatChallenge)
+        if (typeByte > PacketHeader.HighestPacketTypeByte)
             return true;
 
         PacketType packetType = (PacketType)typeByte;

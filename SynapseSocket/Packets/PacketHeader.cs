@@ -22,6 +22,15 @@ public static class PacketHeader
     public const int TypeSize = 1;
 
     /// <summary>
+    /// The highest leading byte that belongs to a Synapse packet. A leading byte strictly greater than this is an
+    /// external protocol piggybacking on the socket via <see cref="SynapseSocket.Core.SynapseManager.SendRaw"/>, which
+    /// the engine routes to <see cref="SynapseSocket.Core.SynapseManager.UnknownPacketReceived"/> and leaves out of the
+    /// packet transform. This is the single boundary every such check shares, so it moves with the enum rather than
+    /// being hard-coded against whichever member happened to be last when a check was written.
+    /// </summary>
+    public const byte HighestPacketTypeByte = (byte)PacketType.SegmentAck;
+
+    /// <summary>
     /// Size in bytes of the reliable sequence field when present.
     /// </summary>
     public const int SequenceSize = 2;

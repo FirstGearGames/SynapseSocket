@@ -218,13 +218,44 @@ public class PacketTransformTests
 
         ConnectPeers(server, client, port);
 
-        // A leading byte above PacketType.NatChallenge is the contract external protocols use, and it is what keeps
-        // this datagram out of the transform in both directions.
+        // A leading byte above PacketHeader.HighestPacketTypeByte is the contract external protocols use, and it is what
+        // keeps this datagram out of the transform in both directions.
         byte[] rawPacket = [200, 1, 2, 3, 4, 5, 6, 7];
         client.SendRaw(new(IPAddress.Loopback, port), rawPacket);
 
         Assert.True(TestHarness.PumpUntil(() => receivedRawPacket is not null, 5000, server, client), "server never received the piggybacked raw packet");
         Assert.Equal(rawPacket, receivedRawPacket);
+    }
+
+    /// <summary>
+    /// Proves a <see cref="PacketType.SegmentAck"/> is carried through the transform rather than slipping onto the wire
+    /// untouched. The server's inbound transform drops the first reliable segment, which makes the server answer with a
+    /// SegmentAck selective repair; the transform then has to be the one that produced that datagram's wire bytes.
+    /// </summary>
+    [Fact]
+    public void Segment_Ack_Is_Carried_Through_The_Transform()
+    {
+        int port = TestHarness.GetFreePort();
+
+        SegmentDroppingRecordingTransform serverTransform = new(dropFirstReliableSegment: true);
+        SegmentDroppingRecordingTransform clientTransform = new(dropFirstReliableSegment: false);
+
+        using SynapseManager server = new(TestHarness.ServerConfig(port, synapseConfig => synapseConfig.PacketTransform = serverTransform));
+        using SynapseManager client = new(TestHarness.ClientConfig(synapseConfig => synapseConfig.PacketTransform = clientTransform));
+
+        byte[]? receivedPayload = null;
+        server.PacketReceived += packetReceivedEventArgs => receivedPayload = packetReceivedEventArgs.Payload.ToArray();
+
+        SynapseConnection synapseConnection = ConnectPeers(server, client, port);
+
+        // Large enough to split into many reliable segments, so dropping one leaves the assembly incomplete and the
+        // server reports what it holds with a SegmentAck instead of resending the whole message.
+        byte[] payload = MakePayload(20_000, seed: 7);
+        client.Send(synapseConnection, payload, isReliable: true);
+
+        Assert.True(TestHarness.PumpUntil(() => receivedPayload is not null, 10_000, server, client), "server never reassembled the payload after the dropped segment was repaired");
+        Assert.Equal(payload, receivedPayload);
+        Assert.Contains(PacketType.SegmentAck, serverTransform.OutboundTypes);
     }
 
     /// <summary>
@@ -267,6 +298,85 @@ public class PacketTransformTests
         new Random(seed).NextBytes(payload);
 
         return payload;
+    }
+
+    /// <summary>
+    /// A marker-XOR transform that records every outbound packet type it is asked to rewrite and can drop the first
+    /// inbound reliable segment it sees, to force the peer into sending a SegmentAck selective repair. Proving the
+    /// transform recorded a <see cref="PacketType.SegmentAck"/> is proving the ack did not bypass the pipeline.
+    /// </summary>
+    private sealed class SegmentDroppingRecordingTransform : IPacketTransform
+    {
+        /// <summary>
+        /// The outbound packet types the transform was invoked for, in arrival order.
+        /// </summary>
+        public List<PacketType> OutboundTypes { get; } = [];
+        /// <inheritdoc/>
+        public uint ReservedBytes => MarkerSize;
+        /// <summary>
+        /// True when the transform should drop the first inbound reliable segment to simulate a lost segment.
+        /// </summary>
+        private readonly bool _dropFirstReliableSegment;
+        /// <summary>
+        /// Set once the first inbound reliable segment has been dropped, so later segments and retransmits flow.
+        /// </summary>
+        private bool _hasDroppedSegment;
+        /// <summary>
+        /// Size in bytes of the marker prepended to every transformed payload.
+        /// </summary>
+        private const int MarkerSize = 4;
+        /// <summary>
+        /// The marker value written ahead of each transformed payload and verified on the way back in.
+        /// </summary>
+        private const uint Marker = 0xC0FFEE02;
+        /// <summary>
+        /// The byte every payload byte is XORed against.
+        /// </summary>
+        private const byte Key = 0x5A;
+
+        /// <summary>
+        /// Creates the transform, optionally arming it to drop the first inbound reliable segment.
+        /// </summary>
+        /// <param name="dropFirstReliableSegment">True to drop the first inbound reliable segment once.</param>
+        public SegmentDroppingRecordingTransform(bool dropFirstReliableSegment) => _dropFirstReliableSegment = dropFirstReliableSegment;
+
+        /// <inheritdoc/>
+        public bool TryTransform(PacketTransformDirection packetTransformDirection, PacketType packetType, IPEndPoint endPoint, ReadOnlySpan<byte> source, Span<byte> destination, out int writtenLength)
+        {
+            if (packetTransformDirection == PacketTransformDirection.Outbound)
+            {
+                OutboundTypes.Add(packetType);
+                BinaryPrimitives.WriteUInt32LittleEndian(destination, Marker);
+
+                for (int i = 0; i < source.Length; i++)
+                    destination[MarkerSize + i] = (byte)(source[i] ^ Key);
+
+                writtenLength = MarkerSize + source.Length;
+
+                return true;
+            }
+
+            writtenLength = 0;
+
+            if (_dropFirstReliableSegment && !_hasDroppedSegment && packetType == PacketType.ReliableSegmented)
+            {
+                _hasDroppedSegment = true;
+
+                return false;
+            }
+
+            if (source.Length < MarkerSize || BinaryPrimitives.ReadUInt32LittleEndian(source) != Marker)
+                return false;
+
+            ReadOnlySpan<byte> body = source[MarkerSize..];
+
+            for (int i = 0; i < body.Length; i++)
+                destination[i] = (byte)(body[i] ^ Key);
+
+            writtenLength = body.Length;
+
+            return true;
+        }
     }
 
     /// <summary>
