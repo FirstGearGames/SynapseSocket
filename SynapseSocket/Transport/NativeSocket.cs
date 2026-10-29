@@ -31,6 +31,13 @@ namespace SynapseSocket.Transport;
 internal static unsafe class NativeSocket
 {
     /// <summary>
+    /// True where the kernel lays a <c>sockaddr</c> out the BSD way (macOS): a one-byte <c>sa_len</c> at offset 0 and a
+    /// one-byte family at offset 1, where Windows and Linux hold a two-byte little-endian family at offset 0. Reading
+    /// byte 0 as the family on macOS decodes every IPv4 sender as IPv6, and replies to it then fail with EINVAL.
+    /// </summary>
+    internal static readonly bool IsBsdLayout = RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
+
+    /// <summary>
     /// Size of a <c>sockaddr_in6</c>, the larger of the two address shapes handled here.
     /// </summary>
     internal const int SockAddrSize = 28;
@@ -51,7 +58,7 @@ internal static unsafe class NativeSocket
     private const int IPv6AddressOffset = 8;
 
     /// <summary>
-    /// <c>AF_INET</c> as it appears in the family field on Windows and Linux.
+    /// <c>AF_INET</c>, the same value on every platform.
     /// </summary>
     private const byte AddressFamilyInterNetwork = 2;
 
@@ -160,7 +167,17 @@ internal static unsafe class NativeSocket
     /// <param name="destination">Buffer of at least <see cref="SockAddrSize"/> bytes.</param>
     /// <param name="length">On success, bytes written.</param>
     /// <returns>True when the address was written.</returns>
-    internal static bool TryBuildSockAddr(IPEndPoint endPoint, byte[] destination, out int length)
+    internal static bool TryBuildSockAddr(IPEndPoint endPoint, byte[] destination, out int length) => TryBuildSockAddr(endPoint, destination, out length, IsBsdLayout);
+
+    /// <summary>
+    /// Writes <paramref name="endPoint"/> into <paramref name="destination"/> as a raw <c>sockaddr</c> in the given layout.
+    /// </summary>
+    /// <param name="endPoint">Target endpoint.</param>
+    /// <param name="destination">Buffer of at least <see cref="SockAddrSize"/> bytes.</param>
+    /// <param name="length">On success, bytes written.</param>
+    /// <param name="isBsdLayout">True to write the BSD layout, see <see cref="IsBsdLayout"/>.</param>
+    /// <returns>True when the address was written.</returns>
+    internal static bool TryBuildSockAddr(IPEndPoint endPoint, byte[] destination, out int length, bool isBsdLayout)
     {
         length = 0;
 
@@ -178,18 +195,23 @@ internal static unsafe class NativeSocket
         destination[PortOffset] = (byte)((endPoint.Port >> 8) & 0xFF);
         destination[PortOffset + 1] = (byte)(endPoint.Port & 0xFF);
 
+        int familyOffset = isBsdLayout ? 1 : 0;
+
         if (addressLength == 4)
         {
-            destination[0] = AddressFamilyInterNetwork;
+            destination[familyOffset] = AddressFamilyInterNetwork;
             addressBytes[..4].CopyTo(destination.AsSpan(IPv4AddressOffset, 4));
             length = SockAddrInSize;
-
-            return true;
+        }
+        else
+        {
+            destination[familyOffset] = AddressFamilyInterNetworkV6;
+            addressBytes[..16].CopyTo(destination.AsSpan(IPv6AddressOffset, 16));
+            length = SockAddrSize;
         }
 
-        destination[0] = AddressFamilyInterNetworkV6;
-        addressBytes[..16].CopyTo(destination.AsSpan(IPv6AddressOffset, 16));
-        length = SockAddrSize;
+        if (isBsdLayout)
+            destination[0] = (byte)length;
 
         return true;
     }
@@ -201,9 +223,18 @@ internal static unsafe class NativeSocket
     /// <param name="sockAddr">Raw address as filled by <see cref="ReceiveFrom"/>.</param>
     /// <param name="sockAddrLength">Valid bytes within <paramref name="sockAddr"/>.</param>
     /// <returns>A key stable for a given address and port.</returns>
-    internal static ulong ComputeAddressKey(byte[] sockAddr, int sockAddrLength)
+    internal static ulong ComputeAddressKey(byte[] sockAddr, int sockAddrLength) => ComputeAddressKey(sockAddr, sockAddrLength, IsBsdLayout);
+
+    /// <summary>
+    /// Produces the address key for a raw <c>sockaddr</c> in the given layout.
+    /// </summary>
+    /// <param name="sockAddr">Raw address as filled by <see cref="ReceiveFrom"/>.</param>
+    /// <param name="sockAddrLength">Valid bytes within <paramref name="sockAddr"/>.</param>
+    /// <param name="isBsdLayout">True to read the BSD layout, see <see cref="IsBsdLayout"/>.</param>
+    /// <returns>A key stable for a given address and port.</returns>
+    internal static ulong ComputeAddressKey(byte[] sockAddr, int sockAddrLength, bool isBsdLayout)
     {
-        bool isIPv4 = sockAddr[0] == AddressFamilyInterNetwork;
+        bool isIPv4 = sockAddr[isBsdLayout ? 1 : 0] == AddressFamilyInterNetwork;
         int addressOffset = isIPv4 ? IPv4AddressOffset : IPv6AddressOffset;
         int addressLength = isIPv4 ? 4 : 16;
 
@@ -268,11 +299,19 @@ internal static unsafe class NativeSocket
     /// </summary>
     /// <param name="sockAddr">Raw address as filled by <see cref="ReceiveFrom"/>.</param>
     /// <returns>The sender's endpoint, or null when the address shape is not recognised.</returns>
-    internal static IPEndPoint? ToEndPoint(byte[] sockAddr)
+    internal static IPEndPoint? ToEndPoint(byte[] sockAddr) => ToEndPoint(sockAddr, IsBsdLayout);
+
+    /// <summary>
+    /// Materialises a managed endpoint from a raw <c>sockaddr</c> in the given layout.
+    /// </summary>
+    /// <param name="sockAddr">Raw address as filled by <see cref="ReceiveFrom"/>.</param>
+    /// <param name="isBsdLayout">True to read the BSD layout, see <see cref="IsBsdLayout"/>.</param>
+    /// <returns>The sender's endpoint.</returns>
+    internal static IPEndPoint? ToEndPoint(byte[] sockAddr, bool isBsdLayout)
     {
         int port = (sockAddr[PortOffset] << 8) | sockAddr[PortOffset + 1];
 
-        if (sockAddr[0] == AddressFamilyInterNetwork)
+        if (sockAddr[isBsdLayout ? 1 : 0] == AddressFamilyInterNetwork)
         {
             Span<byte> ipv4 = stackalloc byte[4];
             sockAddr.AsSpan(IPv4AddressOffset, 4).CopyTo(ipv4);

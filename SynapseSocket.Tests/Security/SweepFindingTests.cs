@@ -2166,6 +2166,75 @@ public sealed class SweepFindingTests
     }
 
     /// <summary>
+    /// macOS lays a <c>sockaddr</c> out the BSD way, a one-byte length then a one-byte family, where Windows and Linux hold
+    /// the family in byte 0. Reading byte 0 as the family decoded every IPv4 sender as IPv6, so the server answered a
+    /// handshake by sending an IPv6 endpoint through its IPv4 socket and macOS rejected it with EINVAL (nucleus-issues #9).
+    /// The bytes here are what the macOS kernel writes, since the real failure cannot be produced on Windows.
+    /// </summary>
+    [Fact]
+    public void NativeSockAddr_DecodesTheBsdLayoutMacOSWrites()
+    {
+        // sockaddr_in: sin_len 16, sin_family AF_INET 2, port 7777 big-endian, 192.168.1.20, eight bytes of zero.
+        byte[] ipv4SockAddr = new byte[NativeSocket.SockAddrSize];
+        new byte[] { 16, 2, 0x1E, 0x61, 192, 168, 1, 20 }.CopyTo(ipv4SockAddr, 0);
+        IPEndPoint ipv4EndPoint = new(IPAddress.Parse("192.168.1.20"), 7777);
+
+        // sockaddr_in6: sin6_len 28, sin6_family AF_INET6 30, port 7777, flow info zero, 2001:db8::1, scope id zero.
+        byte[] ipv6SockAddr = new byte[NativeSocket.SockAddrSize];
+        new byte[] { 28, 30, 0x1E, 0x61, 0, 0, 0, 0 }.CopyTo(ipv6SockAddr, 0);
+        IPEndPoint ipv6EndPoint = new(IPAddress.Parse("2001:db8::1"), 7777);
+        ipv6EndPoint.Address.GetAddressBytes().CopyTo(ipv6SockAddr, 8);
+
+        foreach ((byte[] sockAddr, int sockAddrLength, IPEndPoint expected) in new[] { (ipv4SockAddr, 16, ipv4EndPoint), (ipv6SockAddr, 28, ipv6EndPoint) })
+        {
+            IPEndPoint? decoded = NativeSocket.ToEndPoint(sockAddr, isBsdLayout: true);
+
+            Assert.True(expected.Equals(decoded), $"a macOS sockaddr for {expected} decoded as {decoded}.");
+            Assert.True(NativeSocket.ComputeAddressKey(sockAddr, sockAddrLength, isBsdLayout: true) == NativeSocket.ComputeAddressKey(expected), $"a macOS sockaddr for {expected} keys differently from its managed endpoint, so the peer never resolves.");
+
+            byte[] built = new byte[NativeSocket.SockAddrSize];
+            Assert.True(NativeSocket.TryBuildSockAddr(expected, built, out int builtLength, isBsdLayout: true));
+            Assert.True(builtLength == sockAddrLength && built[0] == sockAddrLength, $"a sockaddr built for macOS for {expected} has sa_len {built[0]} and length {builtLength}, expected {sockAddrLength}.");
+            Assert.True(expected.Equals(NativeSocket.ToEndPoint(built, isBsdLayout: true)), $"a sockaddr built for macOS for {expected} does not decode back to it.");
+        }
+
+        Assert.Equal(16, ipv4SockAddr[0]);
+        Assert.Equal(2, ipv4SockAddr[1]);
+    }
+
+    /// <summary>
+    /// Whatever layout this platform's kernel uses, a datagram received through the native path must decode to the
+    /// socket that sent it, with the same family, and key the same as its managed endpoint. A server replies to the
+    /// decoded endpoint, so a wrong family there is a send the OS refuses.
+    /// </summary>
+    [Fact]
+    public void NativeReceive_DecodesTheSenderOnThisPlatform()
+    {
+        if (!NativeSocket.IsSupported)
+            return;
+
+        using Socket receiver = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        using Socket sender = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        receiver.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+        sender.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+
+        sender.SendTo([1, 2, 3], receiver.LocalEndPoint!);
+
+        Assert.True(receiver.Poll(5_000_000, SelectMode.SelectRead), "the datagram never arrived on loopback.");
+
+        byte[] buffer = new byte[16];
+        byte[] sockAddr = new byte[NativeSocket.SockAddrSize];
+        int received = NativeSocket.ReceiveFrom(receiver, buffer, buffer.Length, sockAddr, out int sockAddrLength);
+
+        IPEndPoint expected = (IPEndPoint)sender.LocalEndPoint!;
+        IPEndPoint? decoded = NativeSocket.ToEndPoint(sockAddr);
+
+        Assert.Equal(3, received);
+        Assert.True(expected.Equals(decoded), $"the native receive decoded the sender {expected} as {decoded}.");
+        Assert.Equal(NativeSocket.ComputeAddressKey(expected), NativeSocket.ComputeAddressKey(sockAddr, sockAddrLength));
+    }
+
+    /// <summary>
     /// Reference-equality membership check over the public connection list.
     /// </summary>
     private static bool Contains(IReadOnlyList<SynapseConnection> connections, SynapseConnection target)
