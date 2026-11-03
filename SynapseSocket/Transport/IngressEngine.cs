@@ -916,7 +916,8 @@ internal sealed partial class IngressEngine
                 {
                     int bitmapLength = length - headerSize;
 
-                    if (bitmapLength > 0 && partiallyAcked.ApplyAckedBitmap(buffer.AsSpan(headerSize, bitmapLength)))
+                    // A packet the send throttle still holds cannot all have arrived, so a report claiming it has is not released on.
+                    if (bitmapLength > 0 && partiallyAcked.ApplyAckedBitmap(buffer.AsSpan(headerSize, bitmapLength)) && !partiallyAcked.IsQueued)
                     {
                         // Every segment confirmed: the message is delivered, so drop it like a full ack would.
                         synapseConnection.PendingReliableQueue.Remove(sequence);
@@ -940,7 +941,14 @@ internal sealed partial class IngressEngine
                     ushort ackedSequence = (ushort)(buffer[offset] | (buffer[offset + 1] << 8));
 
                     if (synapseConnection.PendingReliableQueue.Remove(ackedSequence, out SynapseConnection.PendingReliable? acked))
-                        SynapseConnection.ReleasePendingReliable(acked);
+                    {
+                        /* A packet the send throttle still holds has not been sent, so an acknowledgement of it is not genuine. It goes
+                         * back rather than being released, which would free the bytes the queue is still waiting to send. */
+                        if (acked.IsQueued)
+                            synapseConnection.PendingReliableQueue[ackedSequence] = acked;
+                        else
+                            SynapseConnection.ReleasePendingReliable(acked);
+                    }
                 }
 
                 // The last acknowledgement a connection closing after delivery was waiting for is what lets it close.

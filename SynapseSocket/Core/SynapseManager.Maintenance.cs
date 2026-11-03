@@ -5,6 +5,7 @@ using CodeBoost.Logging;
 using SynapseSocket.Connections;
 using SynapseSocket.Core.Configuration;
 using SynapseSocket.Core.Events;
+using SynapseSocket.Transport;
 
 namespace SynapseSocket.Core;
 
@@ -112,6 +113,28 @@ public sealed partial class SynapseManager
                     TimeoutAssembledSegments(nowTicks, connection);
                     ResetInboundRateCounters(nowTicks, connection);
                 }
+            }
+            catch (Exception unexpectedException)
+            {
+                UnhandledException?.Invoke(unexpectedException);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Sends what each connection's send throttle now releases. Called once per <see cref="Poll"/> while the send throttle is enabled.
+    /// </summary>
+    /// <param name="nowTicks">The time this poll started at.</param>
+    private void ReleaseQueuedSends(long nowTicks)
+    {
+        TransmissionEngine transmissionEngine = _transmissionEngine!;
+        IReadOnlyList<SynapseConnection> connections = Connections.Connections;
+
+        for (int i = connections.Count - 1; i >= 0; i--)
+        {
+            try
+            {
+                transmissionEngine.ReleaseQueuedSends(connections[i], nowTicks);
             }
             catch (Exception unexpectedException)
             {

@@ -148,6 +148,12 @@ public sealed partial class SynapseConnection : IPoolResettable
     [PoolResettableMember]
     internal PacketReassembler? Reassembler;
     /// <summary>
+    /// This connection's send throttle, used only while <see cref="SynapseSocket.Core.Configuration.SendThrottleConfig.Enabled"/>.
+    /// It holds no memory until a send first has to wait.
+    /// </summary>
+    [PoolResettableMember]
+    internal readonly SendThrottle SendThrottle = new();
+    /// <summary>
     /// Reference to the shared transmission engine used to send ACKs during batch flush.
     /// Set on connection establishment and cleared on disconnect.
     /// </summary>
@@ -265,6 +271,8 @@ public sealed partial class SynapseConnection : IPoolResettable
     [PoolResettableMethod]
     internal void ReleasePooledResources()
     {
+        // Cleared before the pending reliables below, because a queued reliable datagram points into a pending reliable's buffer.
+        SendThrottle.Clear();
         PendingAcks.Clear();
 
         foreach (KeyValuePair<ushort, PendingReliable> entry in PendingReliableQueue)
@@ -346,10 +354,16 @@ public sealed partial class SynapseConnection : IPoolResettable
         [PoolResettableMember]
         public byte[]? BackingArray { get; private set; }
         /// <summary>
-        /// Monotonic ticks when this packet was last sent or retransmitted.
+        /// Monotonic ticks when this packet was last sent or retransmitted, or <see cref="UnsetSentTicks"/> while the send
+        /// throttle still holds it. The resend sweep never fires for an unset value.
         /// </summary>
         [PoolResettableMember]
         public long SentTicks;
+        /// <summary>
+        /// True while the send throttle still holds at least one datagram of this packet, so the peer cannot have received it all.
+        /// An acknowledgement of a packet in this state is not genuine, and releasing it would free bytes the queue still points at.
+        /// </summary>
+        public bool IsQueued => SentTicks == UnsetSentTicks;
         /// <summary>
         /// Number of retransmission attempts so far.
         /// </summary>
@@ -366,6 +380,11 @@ public sealed partial class SynapseConnection : IPoolResettable
         /// </summary>
         [PoolResettableMember]
         public int SegmentCount;
+        /// <summary>
+        /// The value of <see cref="SentTicks"/> while the send throttle still holds the packet. It is the largest tick value, so the
+        /// resend sweep's elapsed time is negative and never reaches the resend interval.
+        /// </summary>
+        public const long UnsetSentTicks = long.MaxValue;
 
         /// <summary>
         /// Initialises this instance for a reliable send.

@@ -133,6 +133,8 @@ Call it regularly, on the thread that calls `Send`: once per frame in a game loo
 
 A single unsegmented packet carries `MaximumPayloadSize` bytes, which is the MTU less 3 bytes of header: **1197 at the default 1200 MTU**. Larger payloads are split automatically and reassembled on arrival. Each segment carries the MTU less its header, 7 bytes for a reliable segment and 5 for an unreliable one, and a message may use at most 255 segments, or `Segment.MaximumSegments` when that is set. At the default MTU that caps a message at 304,215 bytes as reliable segments and 304,725 bytes as unreliable ones; a larger payload makes `Send` throw `InvalidOperationException`. **Check the size before sending rather than catching that exception.** A reliable send, or an unreliable one under `SegmentReliable`, has already used up a reliable sequence number when it throws, so it stalls the peer's reliable stream exactly as a lost message does.
 
+`Send` returns a `SendResult`. Without the send throttle it is always `Sent`. With `SendThrottle.Enabled`, each connection sends at most `SendThrottle.MaximumBytesPerRelease` in one release, and starts its next release no sooner than `SendThrottle.MinimumReleaseIntervalMilliseconds` later. A send the open release cannot cover waits in that connection's send queue and returns `Queued`, and `Poll` sends it once a release covers it, in order. This spreads a large burst out so it does not overflow the receiver's socket buffer, which a stock Linux peer caps at about 208 KiB. The queue holds at most `SendThrottle.MaximumQueuedBytes`. When a send would take it past that, `SendQueueFullAction.SendOldest` (the default) sends the oldest queued datagrams at once to make room, and `DropNewest` refuses the new payload and returns `Dropped`. A dropped reliable payload never takes a sequence number, so it does not stall the peer's reliable stream, and a segmented payload is dropped whole unless the queue has room for every segment. A queued reliable message's resend timer starts only when it actually leaves. The queue holds no memory until a send first has to wait, and gives it back when it drains. Handshakes, acknowledgements, keep-alives and disconnects are never throttled, and anything still queued when a connection closes is discarded.
+
 `Segment.UnreliableMode` decides what happens to an oversized *unreliable* payload: split it unreliably (the default), split it into reliable segments, or refuse it with an exception. Turning off `Segment.ReliableEnabled` does not, on its own, make an oversized reliable send throw; see the [Segment](#segment) table.
 
 On the receiving side, `PacketReceived` hands you the `Connection`, the `Payload` as an `ArraySegment<byte>`, and `IsReliable`. The payload is backed by a pooled buffer and is valid only for the duration of the handler.
@@ -199,6 +201,16 @@ Setting `CopyReceivedPayloads` to false removes the per-packet copy on the unrel
 | `ResendMilliseconds` | 250 | Retransmit interval |
 | `MaximumRetries` | 10 | Retransmits before the message is dropped and `ReliableExhausted` is raised |
 | `AckBatchingEnabled` | `true` | Coalesce acknowledgements and flush them once per `Poll` |
+
+### `SendThrottle`
+
+| Field | Default | Meaning |
+|---|---|---|
+| `Enabled` | `false` | Throttle sends per connection; see [Sending and receiving](#sending-and-receiving) |
+| `MaximumBytesPerRelease` | 200 KiB | Most bytes one connection sends in one release. The first datagram of a release always goes, so a smaller value still makes progress |
+| `MinimumReleaseIntervalMilliseconds` | 16 | Least time between one release starting and the next. The defaults cap a connection at about 12.5 MB a second |
+| `MaximumQueuedBytes` | 1 MiB | Most bytes one connection's send queue holds. Raised to `MaximumTransmissionUnit` if set below it |
+| `QueueFullAction` | `SendOldest` | `SendOldest` sends the oldest queued datagrams at once to make room; `DropNewest` refuses the new payload and `Send` returns `Dropped` |
 
 ### `Connection`
 
@@ -492,6 +504,7 @@ SynapseSocket/
 │   ├── IngressEngine.Nat.cs           NAT probe and challenge handling
 │   ├── TransmissionEngine.cs          send path, reliable queue, keep-alives, disconnects
 │   ├── TransmissionEngine.Nat.cs      NAT probe and challenge sends
+│   ├── SendThrottle.cs                per-connection send throttle: release window and send queue
 │   └── NativeSocket.cs                allocation-free recvfrom/sendto for netstandard2.1
 ├── Connections/                       ConnectionManager and per-peer SynapseConnection state
 ├── Packets/                           header, segmentation, reassembly, IPacketTransform
@@ -513,7 +526,7 @@ SynapseSocket.Tests/                   the test suite
 
 ## Tests
 
-132 xUnit tests in 19 suites. Almost all of them spin up real engines over loopback UDP sockets, with no mocking. Adversarial tests send hand-built datagrams from a plain `Socket`, the same thing a hostile peer on the network does.
+141 xUnit tests in 20 suites. Almost all of them spin up real engines over loopback UDP sockets, with no mocking. Adversarial tests send hand-built datagrams from a plain `Socket`, the same thing a hostile peer on the network does.
 
 | Suite | Tests | Coverage |
 |---|---|---|
@@ -525,6 +538,7 @@ SynapseSocket.Tests/                   the test suite
 | `ConnectionsListIntegrityTests` | 3 | Every connection's recorded list index matching its slot across removals |
 | `SegmentationTests` | 3 | A large unreliable payload split and reassembled, an oversized reliable send throwing when segmentation is disabled, a declared assembly size above `MaximumReassembledPacketSize` rejected |
 | `OutOfOrderTests` | 3 | Reordered segmented and unsegmented traffic arriving intact |
+| `SendThrottleTests` | 9 | The send throttle off by default, a burst spread over releases, both full-queue actions, queued reliable messages not resent early, a forged acknowledgement of a queued message ignored, segmented payloads queued intact or dropped whole, and a warm burst allocating nothing |
 | `PacketTransformTests` | 7 | `IPacketTransform` end to end through the public API |
 | `ExampleXorPacketTransformTests` | 5 | The XOR example, with the masking observed on the wire |
 | `NatTraversalTests` | 6 | Probe, challenge, echo and handshake; a forged token drawing an echo rather than a handshake; an already-echoed challenge never echoed again; probe rate limiting; a simultaneous punch |

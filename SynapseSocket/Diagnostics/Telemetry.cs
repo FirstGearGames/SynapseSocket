@@ -50,7 +50,7 @@ public sealed class Telemetry
     private long _packetsDroppedIn;
 
     /// <summary>
-    /// Total outgoing packets dropped (e.g., simulated loss).
+    /// Total outgoing packets dropped (e.g., simulated loss, or a full send-throttle queue).
     /// </summary>
     public long PacketsDroppedOut => Interlocked.Read(ref _packetsDroppedOut);
     private long _packetsDroppedOut;
@@ -114,6 +114,16 @@ public sealed class Telemetry
     {
         if (!IsEnabled) return;
         Interlocked.Increment(ref _packetsDroppedOut);
+    }
+
+    /// <summary>
+    /// Records outbound datagrams the send throttle dropped because the connection's send queue was full.
+    /// </summary>
+    /// <param name="datagramCount">The datagrams the dropped payload would have taken.</param>
+    internal void OnThrottleDroppedSent(int datagramCount)
+    {
+        if (!IsEnabled) return;
+        Interlocked.Add(ref _packetsDroppedOut, datagramCount);
     }
 
     /// <summary>

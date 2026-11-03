@@ -50,6 +50,27 @@ public sealed partial class TransmissionEngine
     /// </summary>
     private readonly IPacketTransform? _packetTransform;
     /// <summary>
+    /// True when sends to each connection go through its <see cref="SendThrottle"/>. Read once from <see cref="SendThrottleConfig.Enabled"/>.
+    /// </summary>
+    private readonly bool _isSendThrottleEnabled;
+    /// <summary>
+    /// The most bytes one connection sends in a single release, from <see cref="SendThrottleConfig.MaximumBytesPerRelease"/>.
+    /// </summary>
+    private readonly int _maximumBytesPerRelease;
+    /// <summary>
+    /// The least time between one release to a connection opening and the next, in ticks, from
+    /// <see cref="SendThrottleConfig.MinimumReleaseIntervalMilliseconds"/>.
+    /// </summary>
+    private readonly long _minimumReleaseIntervalTicks;
+    /// <summary>
+    /// The most bytes one connection's send queue may hold, from <see cref="SendThrottleConfig.MaximumQueuedBytes"/>.
+    /// </summary>
+    private readonly int _maximumQueuedBytes;
+    /// <summary>
+    /// What a send does when the queue is full, from <see cref="SendThrottleConfig.QueueFullAction"/>.
+    /// </summary>
+    private readonly SendQueueFullAction _sendQueueFullAction;
+    /// <summary>
     /// Scratch buffer the transformed packet is assembled into, allocated once and reused for every send.
     /// Null when no transform is configured, so an engine without one allocates nothing.
     /// </summary>
@@ -117,6 +138,14 @@ public sealed partial class TransmissionEngine
         _sendDirect = SendDirect;
         _packetTransform = config.PacketTransform;
 
+        SendThrottleConfig sendThrottleConfig = config.SendThrottle;
+        _isSendThrottleEnabled = sendThrottleConfig.Enabled;
+        _maximumBytesPerRelease = (int)Math.Min(sendThrottleConfig.MaximumBytesPerRelease, int.MaxValue);
+        _minimumReleaseIntervalTicks = sendThrottleConfig.MinimumReleaseIntervalMilliseconds * TimeSpan.TicksPerMillisecond;
+        // Never below one datagram, so a full queue can always make room for the next one by sending what it holds.
+        _maximumQueuedBytes = (int)Math.Min(Math.Max(sendThrottleConfig.MaximumQueuedBytes, config.MaximumTransmissionUnit), int.MaxValue);
+        _sendQueueFullAction = sendThrottleConfig.QueueFullAction;
+
         // Sized for the largest packet the engine can legally frame plus the headroom the transform reserved,
         // so a transformed packet never runs out of destination.
         if (_packetTransform is not null)
@@ -170,14 +199,35 @@ public sealed partial class TransmissionEngine
 
     /// <summary>
     /// Sends an unreliable, unsegmented payload to the connection's remote endpoint.
-    /// Builds a header-only packet, copies the payload after it, and sends immediately.
+    /// Builds a header-only packet, copies the payload after it, and sends immediately, or, when the send throttle holds it back,
+    /// builds it straight into the connection's send queue.
     /// </summary>
     /// <param name="synapseConnection">The target connection.</param>
     /// <param name="payload">The application payload to send.</param>
-    internal void SendUnreliableUnsegmented(SynapseConnection synapseConnection, ArraySegment<byte> payload)
+    /// <returns>Whether the packet was sent, queued, or dropped.</returns>
+    internal SendResult SendUnreliableUnsegmented(SynapseConnection synapseConnection, ArraySegment<byte> payload)
     {
         const PacketType Type = PacketType.None;
         int totalLength = PacketHeader.ComputeHeaderSize(Type) + payload.Count;
+
+        if (_isSendThrottleEnabled)
+        {
+            SendResult sendResult = AdmitToSendThrottle(synapseConnection, totalLength, Clock.Ticks);
+
+            if (sendResult is SendResult.Dropped)
+                return SendResult.Dropped;
+
+            if (sendResult is SendResult.Queued)
+            {
+                SendThrottle sendThrottle = synapseConnection.SendThrottle;
+                ArraySegment<byte> reservedSegment = sendThrottle.Reserve(totalLength);
+                int queuedLength = PacketHeader.BuildPacket(reservedSegment.AsSpan(), Type, 0, 0, 0, 0, payload.AsSpan());
+                sendThrottle.EnqueueReserved(queuedLength);
+
+                return SendResult.Queued;
+            }
+        }
+
         byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(totalLength);
         try
         {
@@ -188,24 +238,39 @@ public sealed partial class TransmissionEngine
         {
             TrackedArrayPool<byte>.Return(rentedBuffer, clearArray: false);
         }
+
+        return SendResult.Sent;
     }
 
     /// <summary>
     /// Sends a reliable, unsegmented payload to the connection's remote endpoint.
     /// Assigns a sequence number, stores a <see cref="SynapseConnection.PendingReliable"/>
-    /// entry for retransmission, and sends immediately.
+    /// entry for retransmission, and sends immediately, or, when the send throttle holds it back, queues it by reference to that
+    /// entry's buffer with the resend timer held until it leaves.
     /// </summary>
     /// <param name="synapseConnection">The target connection.</param>
     /// <param name="payload">The application payload to send reliably.</param>
-    internal void SendReliableUnsegmented(SynapseConnection synapseConnection, ArraySegment<byte> payload)
+    /// <returns>Whether the packet was sent, queued, or dropped. A dropped packet never took a sequence number.</returns>
+    internal SendResult SendReliableUnsegmented(SynapseConnection synapseConnection, ArraySegment<byte> payload)
     {
         if (synapseConnection.PendingReliableQueue.Count >= _config.Reliable.MaximumPending)
             throw new InvalidOperationException("Reliable backpressure limit reached.");
 
-        ushort sequence = synapseConnection.NextOutgoingSequence++;
-
         const PacketType Type = PacketType.Reliable;
         int totalLength = PacketHeader.ComputeHeaderSize(Type) + payload.Count;
+        long nowTicks = Clock.Ticks;
+        SendResult sendResult = SendResult.Sent;
+
+        if (_isSendThrottleEnabled)
+        {
+            sendResult = AdmitToSendThrottle(synapseConnection, totalLength, nowTicks);
+
+            // Refused before the sequence is taken, so the reliable channel is never left waiting for a packet that will not come.
+            if (sendResult is SendResult.Dropped)
+                return SendResult.Dropped;
+        }
+
+        ushort sequence = synapseConnection.NextOutgoingSequence++;
 
         byte[] packetBuffer = TrackedArrayPool<byte>.Rent(totalLength);
         int written = PacketHeader.BuildPacket(packetBuffer.AsSpan(), Type, sequence, 0, 0, 0, payload.AsSpan());
@@ -213,12 +278,22 @@ public sealed partial class TransmissionEngine
         List<ArraySegment<byte>> segments = ListPool<ArraySegment<byte>>.Rent();
         segments.Add(new(packetBuffer, 0, written));
 
+        bool isQueued = sendResult is SendResult.Queued;
         SynapseConnection.PendingReliable pendingReliable = ResettableObjectPool<SynapseConnection.PendingReliable>.Rent();
-        pendingReliable.Initialize(segments, packetBuffer, Clock.Ticks);
+        pendingReliable.Initialize(segments, packetBuffer, isQueued ? SynapseConnection.PendingReliable.UnsetSentTicks : nowTicks);
 
         ParkPendingReliable(synapseConnection, sequence, pendingReliable);
 
+        if (isQueued)
+        {
+            synapseConnection.SendThrottle.EnqueueReference(segments[0], arrayToReturn: null, pendingReliable);
+
+            return SendResult.Queued;
+        }
+
         SendToConnection(segments[0], synapseConnection);
+
+        return SendResult.Sent;
     }
 
     /// <summary>
@@ -226,15 +301,31 @@ public sealed partial class TransmissionEngine
     /// For reliable sends, the segment array is stored in <see cref="SynapseConnection.PendingReliable"/>
     /// and its lifetime is managed by the retransmission sweep and ACK handler.
     /// For unreliable sends, the backing buffer is returned to the pool after the last send.
+    /// Segments the send throttle holds back are queued by reference, in order, so the split is not copied again.
     /// </summary>
     /// <param name="synapseConnection">The target connection.</param>
     /// <param name="payload">The application payload to split and send.</param>
     /// <param name="isReliable">True to send segments reliably with retransmission; false for unreliable delivery.</param>
     /// <param name="splitter">The <see cref="PacketSplitter"/> instance used to produce the segment array.</param>
-    internal void SendSegmented(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable, PacketSplitter splitter)
+    /// <returns>Whether every segment was sent, at least one was queued, or the whole payload was dropped.</returns>
+    internal SendResult SendSegmented(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable, PacketSplitter splitter)
     {
         if (isReliable && synapseConnection.PendingReliableQueue.Count >= _config.Reliable.MaximumPending)
             throw new InvalidOperationException("Reliable backpressure limit reached.");
+
+        // One last-sent stamp covers the whole burst rather than routing each segment through SendToConnection.
+        // The segments leave back to back, so a per-segment clock read would buy nothing on a send of up to 255 of them.
+        long nowTicks = Clock.Ticks;
+
+        /* Refused whole, before it takes a sequence number or is split, unless the queue has room for every segment. Checking the
+         * whole payload against the room left is what lets the loops below queue each segment without ever being refused partway,
+         * which would leave a reliable message waiting forever or an unreliable one that can never assemble. */
+        if (_isSendThrottleEnabled && _sendQueueFullAction is SendQueueFullAction.DropNewest && !HasQueueRoomForSplit(synapseConnection, splitter, payload.Count, isReliable, out int droppedSegmentCount))
+        {
+            _telemetry.OnThrottleDroppedSent(droppedSegmentCount);
+
+            return SendResult.Dropped;
+        }
 
         ushort sequence = 0;
 
@@ -243,10 +334,11 @@ public sealed partial class TransmissionEngine
 
         List<ArraySegment<byte>> segments = splitter.Split(payload.AsSpan(), isReliable, out int segmentCount, sequence, out byte[] backingBuffer);
 
-        // One last-sent stamp covers the whole burst rather than routing each segment through SendToConnection.
-        // The segments leave back to back, so a per-segment clock read would buy nothing on a send of up to 255 of them.
-        long nowTicks = Clock.Ticks;
         synapseConnection.LastSentTicks = nowTicks;
+
+        SendResult sendResult = SendResult.Sent;
+        SendThrottle sendThrottle = synapseConnection.SendThrottle;
+        int lastSegmentIndex = segmentCount - 1;
 
         if (isReliable)
         {
@@ -258,27 +350,80 @@ public sealed partial class TransmissionEngine
             // Segments are now owned by PendingReliable; do NOT return them here.
             // When the latency simulator is enabled it copies each segment, so an independent random
             // delay per segment produces genuine out-of-order arrival at the receiver.
-            for (int i = 0; i < segments.Count; i++)
+            for (int i = 0; i < segmentCount; i++)
+            {
+                if (_isSendThrottleEnabled && AdmitToSendThrottle(synapseConnection, segments[i].Count, nowTicks) is SendResult.Queued)
+                {
+                    /* Once one segment waits, every later one waits behind it, so the last segment is always queued and it is the one
+                     * that starts the resend timer, held until then because the message has not all left. */
+                    pendingReliable.SentTicks = SynapseConnection.PendingReliable.UnsetSentTicks;
+                    sendThrottle.EnqueueReference(segments[i], arrayToReturn: null, i == lastSegmentIndex ? pendingReliable : null);
+                    sendResult = SendResult.Queued;
+
+                    continue;
+                }
+
                 SendRaw(segments[i], synapseConnection.RemoteEndPoint);
+            }
         }
         // Unreliable does not need to retain buffers.
         else
         {
+            // Returned once the loop ends, unless the last segment waits in the queue, which then returns it after sending it.
+            byte[]? backingBufferToReturn = backingBuffer;
+
             try
             {
                 for (int i = 0; i < segmentCount; i++)
+                {
+                    if (_isSendThrottleEnabled && AdmitToSendThrottle(synapseConnection, segments[i].Count, nowTicks) is SendResult.Queued)
+                    {
+                        bool isLastSegment = i == lastSegmentIndex;
+                        sendThrottle.EnqueueReference(segments[i], isLastSegment ? backingBuffer : null, pendingReliableToStart: null);
+                        sendResult = SendResult.Queued;
+
+                        if (isLastSegment)
+                            backingBufferToReturn = null;
+
+                        continue;
+                    }
+
                     SendRaw(segments[i], synapseConnection.RemoteEndPoint);
+                }
             }
             finally
             {
-                TrackedArrayPool<byte>.Return(backingBuffer);
+                if (backingBufferToReturn is not null)
+                    TrackedArrayPool<byte>.Return(backingBufferToReturn);
 
                 /* The reliable branch hands the list to PendingReliable, which returns it on ack or eviction.
                  * Nothing owns it here, so it has to go back explicitly, otherwise ListPool is permanently
-                 * empty and every large unreliable send allocates a fresh list. */
+                 * empty and every large unreliable send allocates a fresh list. The queue keeps its own copy of
+                 * each segment's bounds, so it never reads the list. */
                 ListPool<ArraySegment<byte>>.Return(segments);
             }
         }
+
+        return sendResult;
+    }
+
+    /// <summary>
+    /// Sends what the open release to a connection can cover from the front of its send queue, opening a new release first when
+    /// the interval since the last one has passed. Called for every connection on each <see cref="Core.SynapseManager.Poll"/>.
+    /// </summary>
+    /// <param name="synapseConnection">The connection whose queue to release.</param>
+    /// <param name="nowTicks">The time this poll started at.</param>
+    internal void ReleaseQueuedSends(SynapseConnection synapseConnection, long nowTicks)
+    {
+        SendThrottle sendThrottle = synapseConnection.SendThrottle;
+
+        if (sendThrottle.IsEmpty)
+            return;
+
+        sendThrottle.OpenReleaseIfDue(nowTicks, _minimumReleaseIntervalTicks);
+
+        while (sendThrottle.TryPeekLength(out int length) && sendThrottle.TryCountRelease(length, _maximumBytesPerRelease))
+            SendOldestQueued(synapseConnection, sendThrottle, nowTicks);
     }
 
     /// <summary>
@@ -408,6 +553,98 @@ public sealed partial class TransmissionEngine
         byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(headerSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
         SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), synapseConnection);
+    }
+
+    /// <summary>
+    /// Decides whether a datagram for a connection leaves now, waits in the connection's send queue, or is dropped. Under
+    /// <see cref="SendQueueFullAction.SendOldest"/> a full queue first sends its oldest datagrams immediately until this one fits.
+    /// </summary>
+    /// <param name="synapseConnection">The connection the datagram is for.</param>
+    /// <param name="length">The datagram's length.</param>
+    /// <param name="nowTicks">The current time in <see cref="DateTime.Ticks"/> units.</param>
+    /// <returns><see cref="SendResult.Sent"/> when the caller is to send it now, <see cref="SendResult.Queued"/> when the caller is to queue it, or <see cref="SendResult.Dropped"/> when the caller is to discard it.</returns>
+    private SendResult AdmitToSendThrottle(SynapseConnection synapseConnection, int length, long nowTicks)
+    {
+        SendThrottle sendThrottle = synapseConnection.SendThrottle;
+
+        // Anything already waiting leaves first, so a datagram only goes now when nothing is queued ahead of it.
+        if (sendThrottle.IsEmpty)
+        {
+            sendThrottle.OpenReleaseIfDue(nowTicks, _minimumReleaseIntervalTicks);
+
+            if (sendThrottle.TryCountRelease(length, _maximumBytesPerRelease))
+                return SendResult.Sent;
+        }
+
+        if (sendThrottle.QueuedBytes + length <= _maximumQueuedBytes)
+            return SendResult.Queued;
+
+        if (_sendQueueFullAction is SendQueueFullAction.DropNewest)
+        {
+            _telemetry.OnThrottleDroppedSent(datagramCount: 1);
+
+            return SendResult.Dropped;
+        }
+
+        /* Room is made by sending the oldest now, outside the release's limit but counted against it, so the releases after still
+         * wait their turn. The queue's limit is never below one datagram, so this ends before the queue empties. */
+        while (sendThrottle.QueuedBytes + length > _maximumQueuedBytes)
+            sendThrottle.CountForcedRelease(SendOldestQueued(synapseConnection, sendThrottle, nowTicks));
+
+        return SendResult.Queued;
+    }
+
+    /// <summary>
+    /// Takes the oldest datagram off a connection's send queue and sends it.
+    /// </summary>
+    /// <param name="synapseConnection">The connection the datagram is for.</param>
+    /// <param name="sendThrottle">The connection's send throttle.</param>
+    /// <param name="nowTicks">The current time in <see cref="DateTime.Ticks"/> units.</param>
+    /// <returns>The length of the datagram sent.</returns>
+    private int SendOldestQueued(SynapseConnection synapseConnection, SendThrottle sendThrottle, long nowTicks)
+    {
+        SendThrottle.QueuedDatagram queuedDatagram = sendThrottle.Dequeue();
+        synapseConnection.LastSentTicks = nowTicks;
+
+        try
+        {
+            SendRaw(queuedDatagram.Segment, synapseConnection.RemoteEndPoint);
+        }
+        finally
+        {
+            // Finished even when the send throws, so its array still goes back and a reliable packet's resend timer still starts, which retries it.
+            sendThrottle.Complete(in queuedDatagram, nowTicks);
+        }
+
+        return queuedDatagram.Segment.Count;
+    }
+
+    /// <summary>
+    /// Reports whether a connection's send queue has room for every segment a payload splits into, counting none of them as
+    /// leaving now. A split admitted on this answer is never refused partway.
+    /// </summary>
+    /// <param name="synapseConnection">The connection the payload is for.</param>
+    /// <param name="splitter">The connection's splitter, whose transmission unit sizes the segments.</param>
+    /// <param name="payloadLength">The payload's length.</param>
+    /// <param name="isReliable">True when the payload is split into reliable segments.</param>
+    /// <param name="segmentCount">The segments the payload splits into, or zero when the transmission unit cannot hold a segment header.</param>
+    /// <returns>True when the queue can take every segment.</returns>
+    private bool HasQueueRoomForSplit(SynapseConnection synapseConnection, PacketSplitter splitter, int payloadLength, bool isReliable, out int segmentCount)
+    {
+        int headerSize = PacketHeader.ComputeHeaderSize(isReliable ? PacketType.ReliableSegmented : PacketType.Segmented);
+        int segmentPayloadSize = (int)splitter.MaximumTransmissionUnit - headerSize;
+
+        // A transmission unit too small for a segment header is left for the split to report clearly.
+        if (segmentPayloadSize <= 0)
+        {
+            segmentCount = 0;
+
+            return true;
+        }
+
+        segmentCount = (payloadLength + segmentPayloadSize - 1) / segmentPayloadSize;
+
+        return synapseConnection.SendThrottle.QueuedBytes + payloadLength + segmentCount * headerSize <= _maximumQueuedBytes;
     }
 
     /// <summary>

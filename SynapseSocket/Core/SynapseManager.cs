@@ -29,7 +29,8 @@ public sealed partial class SynapseManager : IDisposable
     /// </summary>
     public event PacketReceivedHandler? PacketReceived;
     /// <summary>
-    /// Raised after a packet has been transmitted on the wire.
+    /// Raised after a payload has been transmitted on the wire, or, while <see cref="SendThrottleConfig.Enabled"/>, once the
+    /// send throttle has accepted it into the send queue. Not raised for a payload the throttle dropped.
     /// </summary>
     public event PacketSentHandler? PacketSent;
     /// <summary>
@@ -171,6 +172,11 @@ public sealed partial class SynapseManager : IDisposable
     /// True when reliable or unreliable segmentation is enabled; controls the segmented send path.
     /// </summary>
     private readonly bool _isSegmentingEnabled;
+    /// <summary>
+    /// True when sends are throttled per connection, read once from <see cref="SendThrottleConfig.Enabled"/>. Each poll then releases
+    /// what every connection's send queue may send.
+    /// </summary>
+    private readonly bool _isSendThrottleEnabled;
     /// <summary>
     /// Bound UDP sockets, one per configured endpoint. Shared with the ingress engines.
     /// </summary>
@@ -323,6 +329,7 @@ public sealed partial class SynapseManager : IDisposable
         _reliableResendTicks = TimeSpan.FromMilliseconds(Config.Reliable.ResendMilliseconds).Ticks;
         _maximumReliableRetries = Config.Reliable.MaximumRetries;
         _isAckBatchingEnabled = Config.Reliable.AckBatchingEnabled;
+        _isSendThrottleEnabled = Config.SendThrottle.Enabled;
         /* Value is unset if segmenting is not enabled or if
          * a timeout is unset. */
         uint segmentAssemblyTimeoutMilliseconds = config.Segment.AssemblyTimeoutMilliseconds;
@@ -477,6 +484,10 @@ public sealed partial class SynapseManager : IDisposable
 
             // 3. Maintenance: keep-alive, timeout, reliable retransmit, segment-assembly timeout, rate-counter reset.
             RunMaintenance(nowTicks);
+
+            // 3b. Send what each connection's send throttle now releases.
+            if (_isSendThrottleEnabled)
+                ReleaseQueuedSends(nowTicks);
 
             // 4. Flush batched outbound ACKs.
             if (_isAckBatchingEnabled)
@@ -643,8 +654,17 @@ public sealed partial class SynapseManager : IDisposable
     /// <item><see cref="UnreliableSegmentMode.SegmentReliable"/>: splits into reliable segments.</item>
     /// </list>
     /// Throws <see cref="InvalidOperationException"/> for a connection that has been closed.
+    /// <para>
+    /// While <see cref="SendThrottleConfig.Enabled"/>, a payload the connection's open release cannot cover waits in its send queue
+    /// for a later <see cref="Poll"/>, and a payload the full queue refuses is not sent at all. The payload is copied either way, so
+    /// its buffer may be reused as soon as this returns.
+    /// </para>
     /// </summary>
-    public void Send(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable)
+    /// <param name="synapseConnection">The connection to send on.</param>
+    /// <param name="payload">The application payload.</param>
+    /// <param name="isReliable">True to send on the reliable channel.</param>
+    /// <returns><see cref="SendResult.Sent"/> when every datagram is on the wire, <see cref="SendResult.Queued"/> when at least one waits in the send queue, or <see cref="SendResult.Dropped"/> when the full queue refused the payload. Always <see cref="SendResult.Sent"/> while the throttle is disabled.</returns>
+    public SendResult Send(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable)
     {
         EnsureRunning();
 
@@ -656,14 +676,12 @@ public sealed partial class SynapseManager : IDisposable
 
         if (payload.Count <= MaximumPayloadSize)
         {
-            if (isReliable)
-                _transmissionEngine!.SendReliableUnsegmented(synapseConnection, payload);
-            else
-                _transmissionEngine!.SendUnreliableUnsegmented(synapseConnection, payload);
+            SendResult sendResult = isReliable ? _transmissionEngine!.SendReliableUnsegmented(synapseConnection, payload) : _transmissionEngine!.SendUnreliableUnsegmented(synapseConnection, payload);
 
-            RaisePacketSent(synapseConnection.RemoteEndPoint, payload, isReliable);
+            if (sendResult is not SendResult.Dropped)
+                RaisePacketSent(synapseConnection.RemoteEndPoint, payload, isReliable);
 
-            return;
+            return sendResult;
         }
 
         /* If here, the packet must be segmented. */
@@ -684,8 +702,12 @@ public sealed partial class SynapseManager : IDisposable
             isReliable = unreliableSegmentMode is UnreliableSegmentMode.SegmentReliable;
         }
 
-        _transmissionEngine!.SendSegmented(synapseConnection, payload, isReliable, GetOrRentSplitter(synapseConnection));
-        RaisePacketSent(synapseConnection.RemoteEndPoint, payload, isReliable);
+        SendResult segmentedSendResult = _transmissionEngine!.SendSegmented(synapseConnection, payload, isReliable, GetOrRentSplitter(synapseConnection));
+
+        if (segmentedSendResult is not SendResult.Dropped)
+            RaisePacketSent(synapseConnection.RemoteEndPoint, payload, isReliable);
+
+        return segmentedSendResult;
     }
 
     /// <summary>

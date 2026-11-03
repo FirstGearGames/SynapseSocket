@@ -174,6 +174,12 @@ public sealed class SynapseConfig
     public ReliableConfig Reliable = new();
 
     /// <summary>
+    /// Per-connection send throttle settings: the most sent in one release, the least time between releases, and the send queue's
+    /// limit and full action. Disabled by default.
+    /// </summary>
+    public SendThrottleConfig SendThrottle = new();
+
+    /// <summary>
     /// Latency simulation settings.
     /// Disabled by default.
     /// </summary>
