@@ -4,7 +4,7 @@
 
 SynapseSocket carries two delivery channels over a single UDP socket, splits and reassembles payloads larger than the MTU, runs every inbound datagram through a security pipeline before its payload is touched, and can hole-punch through full-cone and address-restricted NAT. The companion **SynapseBeacon** project is a small rendezvous server that introduces peers to each other so they can punch.
 
-The engine starts no background threads. `Connect`, `Send` and `Disconnect` put their datagrams on the wire immediately, on the calling thread. Everything else, meaning receiving, acknowledging, retransmitting, keep-alives, timeouts and NAT punching, happens inside `Poll()` on whichever thread calls it. If nothing calls `Poll()`, nothing arrives and nothing times out. SynapseBeacon is the exception to "no threads": a host session heartbeats from the thread pool, handing each heartbeat to the engine through the thread-safe `EnqueueRaw` so it still goes out on the next `Poll()`, and `BeaconServer` runs its own async receive loop.
+The engine starts no background threads. `Connect`, `Send` and `Disconnect` put their datagrams on the wire immediately, on the calling thread, unless the optional send throttle holds a `Send` back for a later `Poll()`. Everything else, meaning receiving, acknowledging, retransmitting, keep-alives, timeouts and NAT punching, happens inside `Poll()` on whichever thread calls it. If nothing calls `Poll()`, nothing arrives and nothing times out. SynapseBeacon is the exception to "no threads": a host session heartbeats from the thread pool, handing each heartbeat to the engine through the thread-safe `EnqueueRaw` so it still goes out on the next `Poll()`, and `BeaconServer` runs its own async receive loop.
 
 ---
 
@@ -95,10 +95,11 @@ One call to `Poll()` does this, in order:
 2. Sweeps the handshake replay cache and the NAT probe table.
 3. Advances pending NAT hole punches.
 4. Runs maintenance on every connection: keep-alives, idle and handshake timeouts, handshake retries, reliable retransmission, segment-assembly timeouts.
-5. Flushes batched acknowledgements.
-6. Sends anything queued with `EnqueueRaw` from other threads.
-7. Releases packets the latency simulator was holding back.
-8. Releases the pooled buffers held by connections closed since the previous poll, including any closed by `Disconnect` or `Connect` between polls, raises `ConnectionReleased` for each, and then returns each connection object to the pool.
+5. Sends what each connection's send throttle now releases, when `SendThrottle.Enabled` is set.
+6. Flushes batched acknowledgements.
+7. Sends anything queued with `EnqueueRaw` from other threads.
+8. Releases packets the latency simulator was holding back.
+9. Releases the pooled buffers held by connections closed since the previous poll, including any closed by `Disconnect` or `Connect` between polls, raises `ConnectionReleased` for each, and then returns each connection object to the pool.
 
 Call it regularly, on the thread that calls `Send`: once per frame in a game loop, or in a loop on one dedicated thread. Do not drive it from a thread-pool timer such as `System.Threading.Timer` or `System.Timers.Timer`, whose callbacks move between threads and can overlap; the engine has no lock or thread check that would catch it. Intervals are measured on a monotonic clock, so a system clock change cannot time peers out, but a stalled `Poll` stalls retransmission and keep-alives along with everything else.
 
@@ -526,27 +527,29 @@ SynapseSocket.Tests/                   the test suite
 
 ## Tests
 
-141 xUnit tests in 20 suites. Almost all of them spin up real engines over loopback UDP sockets, with no mocking. Adversarial tests send hand-built datagrams from a plain `Socket`, the same thing a hostile peer on the network does.
+188 xUnit tests in 22 suites. Almost all of them spin up real engines over loopback UDP sockets, with no mocking. Adversarial tests send hand-built datagrams from a plain `Socket`, the same thing a hostile peer on the network does.
 
 | Suite | Tests | Coverage |
 |---|---|---|
-| `HandshakeAndChannelTests` | 6 | Handshake on both sides, unreliable and reliable delivery, in-order delivery, echo from a callback, graceful disconnect |
+| `HandshakeAndChannelTests` | 22 | Handshake on both sides, unreliable and reliable delivery, in-order delivery, echo from a callback, graceful disconnect |
 | `EngineLifecycleTests` | 8 | Start and bind, double start, a config with no bind endpoints or a null config, received payloads copied by default, dispose, send before start, bind failure |
 | `KeepAliveAndTimeoutTests` | 3 | Idle timeout, keep-alive preventing it, a receive-only peer surviving |
 | `HandshakeTimeoutTests` | 5 | A pending handshake timed out from when it began, the unset fallback, the full-cone schedule check |
 | `ConnectedSocketTests` | 2 | OS-connected sockets in both directions, and the full-cone combination throwing |
 | `ConnectionsListIntegrityTests` | 3 | Every connection's recorded list index matching its slot across removals |
+| `ConnectionReleasedTests` | 16 | `ConnectionReleased` raised once per connection after `ConnectionClosed`, or alone on `Stop` and `Dispose`; reconnects, and stop, dispose, disconnect or connect called from inside handlers, each releasing and returning a connection exactly once
+| `DisconnectAfterDeliveryTests` | 2 | A lost reliable payload resent before a closing connection closes, and a closing connection delivering nothing more to the application
 | `SegmentationTests` | 3 | A large unreliable payload split and reassembled, an oversized reliable send throwing when segmentation is disabled, a declared assembly size above `MaximumReassembledPacketSize` rejected |
 | `OutOfOrderTests` | 3 | Reordered segmented and unsegmented traffic arriving intact |
 | `SendThrottleTests` | 9 | The send throttle off by default, a burst spread over releases, both full-queue actions, queued reliable messages not resent early, a forged acknowledgement of a queued message ignored, segmented payloads queued intact or dropped whole, and a warm burst allocating nothing |
-| `PacketTransformTests` | 7 | `IPacketTransform` end to end through the public API |
+| `PacketTransformTests` | 8 | `IPacketTransform` end to end through the public API |
 | `ExampleXorPacketTransformTests` | 5 | The XOR example, with the masking observed on the wire |
 | `NatTraversalTests` | 6 | Probe, challenge, echo and handshake; a forged token drawing an echo rather than a handshake; an already-echoed challenge never echoed again; probe rate limiting; a simultaneous punch |
-| `ExploitDefenseTests` | 10 | Oversized and garbage packets, rate floods, blacklisting, malformed headers, handler overrides |
+| `ExploitDefenseTests` | 11 | Oversized and garbage packets, rate floods, blacklisting, malformed headers, handler overrides |
 | `SignatureValidatorTests` | 3 | Custom validators and signature providers |
 | `BeaconSecurityTests` | 5 | The beacon's join challenge, forged cookies, host-only heartbeat acknowledgement, per-address rate limiting |
-| `SweepFindingTests` | 42 | The robustness-sweep findings, each asserting the corrected behaviour; see `docs/ROBUSTNESS_SWEEP.md` |
-| `TelemetryAndLatencyTests` | 11 | Telemetry counts, and the latency simulator's delay, jitter, loss and reordering |
+| `SweepFindingTests` | 49 | The robustness-sweep findings, each asserting the corrected behaviour; see `docs/ROBUSTNESS_SWEEP.md` |
+| `TelemetryAndLatencyTests` | 15 | Telemetry counts, and the latency simulator's delay, jitter, loss and reordering |
 | `ConnectionStressTests` | 4 | Many clients sending rapidly, and repeated connect, send and disconnect cycles |
 | `PayloadIntegrityStressTests` | 5 | Received payloads never sharing a buffer with an unrelated rental |
 | `GarbageCollectionTests` | 1 | Steady-state sending not triggering a collection |
