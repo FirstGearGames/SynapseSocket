@@ -36,10 +36,6 @@ public sealed class SecuritySweepTests
     /// </summary>
     private const string HeldForSessionAuthentication = "Held for Ben: SYNCONN-1/2 need per-session authentication, which adds wire bytes.";
     /// <summary>
-    /// Skip reason for the finding whose fix challenges handshakes below the connection cap, an extra round trip at connect.
-    /// </summary>
-    private const string HeldForHandshakeChallenge = "Held for Ben: SYNCONN-3 needs the handshake challenge below the cap, an extra round trip at connect.";
-    /// <summary>
     /// Skip reason for the findings whose fix is a new per-connection byte budget.
     /// </summary>
     private const string HeldForReorderBudget = "Held for Ben: SYNREL-1/2 need a new per-connection byte budget.";
@@ -166,16 +162,23 @@ public sealed class SecuritySweepTests
     }
 
     /// <summary>
-    /// SYNCONN-3: sources that never answer a handshake reply must not fill a server whose connection cap is below
+    /// SYNCONN-3: sources that never answer a handshake reply must not fill a server whose connection cap is at or below
     /// <see cref="SecurityConfig.HandshakeChallengeThreshold"/>, which is every capped game server at the default 1024.
     /// </summary>
-    [Fact(Skip = HeldForHandshakeChallenge)]
-    public void SYNCONN3_SpoofedHandshakes_DoNotLockARealClientOutOfACappedServer()
+    /// <param name="handshakeChallengeThreshold">The server's threshold: the default, or the cap itself, where the gate engages only once the server is full.</param>
+    [Theory]
+    [InlineData(1024u)]
+    [InlineData(8u)]
+    public void SYNCONN3_SpoofedHandshakes_DoNotLockARealClientOutOfACappedServer(uint handshakeChallengeThreshold)
     {
         const uint ConnectionCap = 8;
 
         int port = TestHarness.GetFreePort();
-        using SynapseManager server = new(TestHarness.ServerConfig(port, config => config.MaximumConcurrentConnections = ConnectionCap));
+        using SynapseManager server = new(TestHarness.ServerConfig(port, config =>
+        {
+            config.MaximumConcurrentConnections = ConnectionCap;
+            config.Security.HandshakeChallengeThreshold = handshakeChallengeThreshold;
+        }));
         server.Start();
 
         IPEndPoint target = new(IPAddress.Loopback, port);

@@ -156,7 +156,9 @@ internal sealed partial class IngressEngine
     private readonly System.Security.Cryptography.HMACSHA256 _handshakeChallengeHmac;
     /// <summary>
     /// Live connection count at or above which unknown endpoints must prove return-routability before any state is
-    /// allocated for them, or <see cref="SynapseConfig.EffectiveUnlimitedValueUInt32"/> when the gate is disabled.
+    /// allocated for them, or <see cref="SynapseConfig.EffectiveUnlimitedValueUInt32"/> when the gate is disabled, or 0 when
+    /// <see cref="SynapseConfig.MaximumConcurrentConnections"/> is set at or below <see cref="SecurityConfig.HandshakeChallengeThreshold"/>,
+    /// so that every unknown endpoint is challenged.
     /// </summary>
     private readonly uint _handshakeChallengeThreshold;
     /// <summary>
@@ -300,6 +302,12 @@ internal sealed partial class IngressEngine
         _effectiveMaximumConcurrentConnections = SynapseConfig.ToEffectiveLimit(config.MaximumConcurrentConnections);
         _effectiveMaximumReceivesPerPoll = SynapseConfig.ToEffectiveLimit(config.MaximumReceivesPerPoll);
         _handshakeChallengeThreshold = SynapseConfig.ToEffectiveLimit(config.Security.HandshakeChallengeThreshold);
+
+        /* A connection cap at or below the threshold fills before the gate engages, so every slot would go to whoever sends a
+         * handshake, from any source address, spoofed or not. Under such a cap every handshake from an unknown endpoint is
+         * challenged instead, which costs a joining peer one round trip. A threshold of 0 still means never challenge. */
+        if (config.MaximumConcurrentConnections is not SynapseConfig.DisabledMaximumConcurrentConnections && config.MaximumConcurrentConnections <= config.Security.HandshakeChallengeThreshold)
+            _handshakeChallengeThreshold = 0;
 
         Span<byte> secret = stackalloc byte[32];
 

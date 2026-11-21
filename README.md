@@ -158,7 +158,7 @@ Setting `CopyReceivedPayloads` to false removes the per-packet copy on the unrel
 
 **`ConnectionFailed`** reports rejected connection attempts, with one of these reasons: `BindFailed`, `SignatureRejected`, `Blacklisted`, `NatTraversalFailed` and `ServerFull`. (`ConnectionRejectedReason.Timeout` exists in the enum but is not raised.) It fires once per rejected datagram, not once per connection, so a refused peer's handshake retries raise it again each time, and a blacklisted endpoint raises `Blacklisted` for every datagram it sends. `BindFailed` names a local bind endpoint, not a peer. Two things about it are easy to get wrong:
 
-- **A refusal is reported only on the side that refuses.** `ServerFull`, `SignatureRejected` and a blacklisted inbound handshake are raised by the engine that rejects the handshake, and the rejected peer is never told. It may get a reply first: at or above `HandshakeChallengeThreshold` (1024, below the default cap of 4096, so always the case when the engine is full) a new peer's handshake is answered with a challenge, and `ServerFull` or `SignatureRejected` is raised only when the peer's automatic echo arrives. A blacklisted peer is never challenged: `Blacklisted` is raised as soon as its datagrams arrive, at any occupancy. On the rejected peer's side the connection stays `Pending`, keeps retrying, and ends as a handshake timeout. `Connect` to an endpoint *this* side has blacklisted is different: it raises `ConnectionFailed(Blacklisted)` and then throws `InvalidOperationException`.
+- **A refusal is reported only on the side that refuses.** `ServerFull`, `SignatureRejected` and a blacklisted inbound handshake are raised by the engine that rejects the handshake, and the rejected peer is never told. It may get a reply first: at or above `HandshakeChallengeThreshold` (1024, below the default cap of 4096, so always the case when the engine is full), and at any occupancy when `MaximumConcurrentConnections` is set at or below the threshold, a new peer's handshake is answered with a challenge, and `ServerFull` or `SignatureRejected` is raised only when the peer's automatic echo arrives. A blacklisted peer is never challenged: `Blacklisted` is raised as soon as its datagrams arrive, at any occupancy. On the rejected peer's side the connection stays `Pending`, keeps retrying, and ends as a handshake timeout. `Connect` to an endpoint *this* side has blacklisted is different: it raises `ConnectionFailed(Blacklisted)` and then throws `InvalidOperationException`.
 - **`NatTraversalFailed` does not close the connection.** It only stops the probing. The connection stays `Pending`, still establishes if the peer's handshake gets through, and is otherwise closed by the handshake timeout like any other.
 
 ---
@@ -175,7 +175,7 @@ Setting `CopyReceivedPayloads` to false removes the per-packet copy on the unrel
 | `MaximumPacketSize` | 1400 | Largest inbound datagram accepted; anything larger is an `Oversized` violation |
 | `MaximumTransmissionUnit` | 1200 | Size outbound packets are packed to, less a `PacketTransform`'s `ReservedBytes` (batched acknowledgements excepted; see [Packet transform](#packet-transform)). It also bounds what this side accepts: a received segment larger than this side's MTU is a `Malformed` violation, so give peers the same value |
 | `PacketTransform` | `null` | Optional `IPacketTransform` rewriting Synapse packet payloads in both directions. Segment acknowledgements and raw external-protocol datagrams bypass it |
-| `MaximumConcurrentConnections` | 4096 | Cap on connections admitted by inbound handshake. It counts every connection, pending and outbound ones included, but `Connect` itself is never refused, so outbound connections can take the count past it. A new peer's handshake beyond it is dropped and raises `ConnectionFailed(ServerFull)` on this engine; the joining peer is never told and times out. 0 disables |
+| `MaximumConcurrentConnections` | 4096 | Cap on connections admitted by inbound handshake. It counts every connection, pending and outbound ones included, but `Connect` itself is never refused, so outbound connections can take the count past it. A new peer's handshake beyond it is dropped and raises `ConnectionFailed(ServerFull)` on this engine; the joining peer is never told and times out. Set at or below `Security.HandshakeChallengeThreshold`, every new peer must answer a challenge before it takes a slot, so spoofed handshakes cannot fill it; that costs a joining peer one round trip and 34 bytes. 0 disables |
 | `MaximumReceivesPerPoll` | 4096 | Datagrams drained from each socket per `Poll` before it moves on, so a flood cannot hold the loop. 0 disables |
 | `NativeReceiveEnabled` | `true` | Uses direct `recvfrom`/`sendto` bindings on netstandard2.1, where the managed API allocates per datagram. No effect on net8.0, which already allocates nothing |
 | `SocketReceiveBufferBytes` | 1 MiB | OS receive buffer for each socket |
@@ -232,7 +232,7 @@ Setting `CopyReceivedPayloads` to false removes the per-packet copy on the unrel
 | `MaximumBytesPerSecond` | 2 MiB | Per-peer byte rate, over the same window. 0 disables |
 | `MaximumOutOfOrderReliablePackets` | 64 | Reliable messages a peer may have buffered ahead of a gap; one more is an `Oversized` violation. 0 disables |
 | `MaximumReassembledPacketSize` | 0 | Cap on a segmented message's declared segment count × effective MTU; going over is an `Oversized` violation. It is not the message's length: each segment also carries a header, so size it from segments × MTU rather than from your largest message. 0 disables |
-| `HandshakeChallengeThreshold` | 1024 | Live connections at or above which an unknown endpoint must return a stateless token before any state is allocated for it. 0 never challenges |
+| `HandshakeChallengeThreshold` | 1024 | Live connections at or above which an unknown endpoint must return a stateless token before any state is allocated for it. A `MaximumConcurrentConnections` at or below it challenges every unknown endpoint. 0 never challenges |
 | `ViolationsBeforeBlacklist` | 5 | `KickAndBlacklist` violations inside the window that earn a ban |
 | `ViolationWindowMilliseconds` | 10000 | The window violations are counted over. It opens at the first violation and does not slide |
 | `BlacklistDurationMilliseconds` | 300000 | How long a ban lasts. 0 makes bans permanent |
@@ -278,7 +278,7 @@ Every inbound datagram is filtered before its payload is copied.
 | Unrecognised type byte from a connected peer | `UnknownPacket` violation. With `AllowUnknownPackets`, it goes to `UnknownPacketReceived` instead, and a return value other than `FilterResult.Allowed` still raises `UnknownPacket` |
 | Header from a connected peer does not parse | `Malformed` violation |
 | Handshake from a blacklisted signature | `ConnectionFailed(Blacklisted)` |
-| Handshake from an unknown endpoint at or above `HandshakeChallengeThreshold` | Answered with a stateless token; no state is allocated until it comes back |
+| Handshake from an unknown endpoint at or above `HandshakeChallengeThreshold`, or at any occupancy when `MaximumConcurrentConnections` is at or below it | Answered with a stateless token; no state is allocated until it comes back |
 | Handshake beyond `MaximumConcurrentConnections` | `ConnectionFailed(ServerFull)` |
 | Replayed handshake | `ConnectionFailed(SignatureRejected)` |
 | Validator returns false | `ConnectionFailed(SignatureRejected)` |
@@ -527,7 +527,7 @@ SynapseSocket.Tests/                   the test suite
 
 ## Tests
 
-200 xUnit tests in 23 suites. Almost all of them spin up real engines over loopback UDP sockets, with no mocking. Adversarial tests send hand-built datagrams from a plain `Socket`, the same thing a hostile peer on the network does.
+201 xUnit tests in 23 suites. Almost all of them spin up real engines over loopback UDP sockets, with no mocking. Adversarial tests send hand-built datagrams from a plain `Socket`, the same thing a hostile peer on the network does.
 
 | Suite | Tests | Coverage |
 |---|---|---|
@@ -549,7 +549,7 @@ SynapseSocket.Tests/                   the test suite
 | `SignatureValidatorTests` | 3 | Custom validators and signature providers |
 | `BeaconSecurityTests` | 5 | The beacon's join challenge, forged cookies, host-only heartbeat acknowledgement, per-address rate limiting |
 | `SweepFindingTests` | 49 | The robustness-sweep findings, each asserting the corrected behaviour; see `docs/ROBUSTNESS_SWEEP.md` |
-| `SecuritySweepTests` | 12 | The 2026-11 security sweep findings: a datagram refused from a sender with no connection, outright or by an `UnknownPacketReceived` handler, dropped and counted without a violation; a forged run against a connected peer earning it one strike rather than a ban; a reliable send past `Reliable.MaximumPending` returning `Dropped` without throwing or allocating; and eight reproductions skipped while their fixes are held for a design decision: forged datagrams ending or banning a connected peer, a forged acknowledgement losing a reliable message, unanswered handshakes filling a capped server, a peer pinning memory behind a reliable gap, and duplicate segments each drawing a segment acknowledgement |
+| `SecuritySweepTests` | 13 | The 2026-11 security sweep findings: a datagram refused from a sender with no connection, outright or by an `UnknownPacketReceived` handler, dropped and counted without a violation; a forged run against a connected peer earning it one strike rather than a ban; a server capped at or below `HandshakeChallengeThreshold` challenging every handshake, so unanswered handshakes cannot fill it; a reliable send past `Reliable.MaximumPending` returning `Dropped` without throwing or allocating; and seven reproductions skipped while their fixes are held for a design decision: forged datagrams ending or banning a connected peer, a forged acknowledgement losing a reliable message, a peer pinning memory behind a reliable gap, and duplicate segments each drawing a segment acknowledgement |
 | `TelemetryAndLatencyTests` | 15 | Telemetry counts, and the latency simulator's delay, jitter, loss and reordering |
 | `ConnectionStressTests` | 4 | Many clients sending rapidly, and repeated connect, send and disconnect cycles |
 | `PayloadIntegrityStressTests` | 5 | Received payloads never sharing a buffer with an unrelated rental |
