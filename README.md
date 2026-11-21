@@ -129,7 +129,7 @@ Call it regularly, on the thread that calls `Send`: once per frame in a game loo
 
 `Send(connection, payload, isReliable)` picks the channel per call, and one connection carries both:
 
-- **Reliable:** acknowledged, retransmitted every `Reliable.ResendMilliseconds` (250 ms) up to `Reliable.MaximumRetries` (10) times, delivered in order. Exhausting the retries drops the message and raises a `ReliableExhausted` violation whose default action, `Kick`, closes the connection locally without sending a disconnect packet. The message is gone whatever the handler returns. If the peer never received it, keeping the peer with `Ignore` or `Drop` stalls its reliable stream: the peer holds every later reliable message undelivered while it waits for the lost one, and once more than `Security.MaximumOutOfOrderReliablePackets` (64) are waiting it raises an `Oversized` violation and drops the connection.
+- **Reliable:** acknowledged, retransmitted every `Reliable.ResendMilliseconds` (250 ms) up to `Reliable.MaximumRetries` (10) times, delivered in order. Exhausting the retries drops the message and raises a `ReliableExhausted` violation whose default action, `Kick`, closes the connection locally without sending a disconnect packet. The message is gone whatever the handler returns. If the peer never received it, keeping the peer with `Ignore` or `Drop` stalls its reliable stream: the peer holds every later reliable message undelivered while it waits for the lost one, and once more than `Security.MaximumOutOfOrderReliablePackets` (64) are waiting it raises an `Oversized` violation and drops the connection. Messages that would take it past its held-byte budget are dropped unacknowledged before that, so the sender resends them until its retries run out.
 - **Unreliable:** sent once, with no acknowledgement and no ordering.
 
 A single unsegmented packet carries `MaximumPayloadSize` bytes, which is the MTU less 3 bytes of header: **1197 at the default 1200 MTU**. Larger payloads are split automatically and reassembled on arrival. Each segment carries the MTU less its header, 7 bytes for a reliable segment and 5 for an unreliable one, and a message may use at most 255 segments, or `Segment.MaximumSegments` when that is set. At the default MTU that caps a message at 304,215 bytes as reliable segments and 304,725 bytes as unreliable ones; a larger payload makes `Send` throw `InvalidOperationException`. **Check the size before sending rather than catching that exception.** A reliable send, or an unreliable one under `SegmentReliable`, has already used up a reliable sequence number when it throws, so it stalls the peer's reliable stream exactly as a lost message does.
@@ -173,7 +173,7 @@ Setting `CopyReceivedPayloads` to false removes the per-packet copy on the unrel
 |---|---|---|
 | `BindEndPoints` | *(required)* | Local endpoints to bind. At most one per address family, so one IPv4 plus one IPv6 for dual-stack; two of the same family throw at `Start`. An endpoint that fails to bind raises `ConnectionFailed(BindFailed)` from inside `Start`, which throws only when *no* endpoint binds, so subscribe first and check `BoundEndPoints` afterwards |
 | `MaximumPacketSize` | 1400 | Largest inbound datagram accepted; anything larger is an `Oversized` violation |
-| `MaximumTransmissionUnit` | 1200 | Size outbound packets are packed to, less a `PacketTransform`'s `ReservedBytes` (batched acknowledgements excepted; see [Packet transform](#packet-transform)). It also bounds what this side accepts: a received segment larger than this side's MTU is a `Malformed` violation, so give peers the same value |
+| `MaximumTransmissionUnit` | 1200 | Size outbound packets are packed to, less a `PacketTransform`'s `ReservedBytes` (batched acknowledgements excepted; see [Packet transform](#packet-transform)). It also bounds what this side accepts: a received segment larger than this side's MTU is an `Oversized` violation, so give peers the same value |
 | `PacketTransform` | `null` | Optional `IPacketTransform` rewriting Synapse packet payloads in both directions. Segment acknowledgements and raw external-protocol datagrams bypass it |
 | `MaximumConcurrentConnections` | 4096 | Cap on connections admitted by inbound handshake. It counts every connection, pending and outbound ones included, but `Connect` itself is never refused, so outbound connections can take the count past it. A new peer's handshake beyond it is dropped and raises `ConnectionFailed(ServerFull)` on this engine; the joining peer is never told and times out. 0 disables |
 | `MaximumReceivesPerPoll` | 4096 | Datagrams drained from each socket per `Poll` before it moves on, so a flood cannot hold the loop. 0 disables |
@@ -191,7 +191,7 @@ Setting `CopyReceivedPayloads` to false removes the per-packet copy on the unrel
 | `ReliableEnabled` | `true` | Split oversized reliable payloads, and accept reliable segments. When false, this side drops reliable segments unacknowledged, so a sender ends in `ReliableExhausted`; an oversized reliable send throws only if `UnreliableMode` is also `Disabled`, and otherwise still goes out as reliable segments |
 | `UnreliableMode` | `SegmentUnreliable` | Oversized unreliable payloads: `SegmentUnreliable`, `SegmentReliable`, or `Disabled` (the send throws). `Disabled` also makes this side silently drop unreliable segments it receives, with no violation or event, so a peer on `SegmentUnreliable` never gets its oversized unreliable messages through |
 | `MaximumSegments` | 0 | Most segments one message may use, in both directions: a send that needs more throws, and a received message declaring more is dropped. 0 means the protocol maximum of 255 |
-| `MaximumConcurrentAssembliesPerConnection` | 16 | Incomplete messages a peer may have in flight; one more is a `Malformed` violation. 0 disables |
+| `MaximumConcurrentAssembliesPerConnection` | 16 | Incomplete messages a peer may have in flight. A segment that would open one more evicts the oldest incomplete unreliable message, or is dropped without a violation when every open one is reliable. 0 disables |
 | `AssemblyTimeoutMilliseconds` | 5000 | Incomplete messages older than this, counted from their first segment, are discarded. 0 disables; above 300000 the constructor throws |
 
 ### `Reliable`
@@ -227,9 +227,9 @@ Setting `CopyReceivedPayloads` to false removes the per-packet copy on the unrel
 
 | Field | Default | Meaning |
 |---|---|---|
-| `Enabled` | `true` | When false, per-connection rate and size enforcement is skipped. Pre-connection checks, the reorder cap and the assembly caps still apply |
+| `Enabled` | `true` | When false, per-connection rate and size enforcement is skipped, and with it the held-byte budget. Pre-connection checks, the reorder cap and the assembly caps still apply |
 | `MaximumPacketsPerSecond` | 2000 | Per-peer packet rate, counted over a fixed one-second window. 0 disables |
-| `MaximumBytesPerSecond` | 2 MiB | Per-peer byte rate, over the same window. 0 disables |
+| `MaximumBytesPerSecond` | 2 MiB | Per-peer byte rate, over the same window. It also sizes the held-byte budget: what a peer may have held waiting for a reliable gap; see [Security model](#security-model). 0 disables both |
 | `MaximumOutOfOrderReliablePackets` | 64 | Reliable messages a peer may have buffered ahead of a gap; one more is an `Oversized` violation. 0 disables |
 | `MaximumReassembledPacketSize` | 0 | Cap on a segmented message's declared segment count × effective MTU; going over is an `Oversized` violation. It is not the message's length: each segment also carries a header, so size it from segments × MTU rather than from your largest message. 0 disables |
 | `HandshakeChallengeThreshold` | 1024 | Live connections at or above which an unknown endpoint must return a stateless token before any state is allocated for it. 0 never challenges |
@@ -283,8 +283,12 @@ Every inbound datagram is filtered before its payload is copied.
 | Replayed handshake | `ConnectionFailed(SignatureRejected)` |
 | Validator returns false | `ConnectionFailed(SignatureRejected)` |
 | Reorder buffer over its cap, or a declared segment count × MTU over `MaximumReassembledPacketSize` | `Oversized` violation |
-| Too many messages in reassembly at once, segment headers that contradict each other, or a segment larger than this side's MTU | `Malformed` violation. On the reliable channel, a segment carrying the last index of its message, including any single-segment message, is dropped without one |
+| Segment headers that contradict each other, or a segment larger than this side's MTU | `Malformed` or `Oversized` violation. On the reliable channel, a segment carrying the last index of its message, including any single-segment message, is dropped without one |
+| A segment that would open more messages in reassembly than `MaximumConcurrentAssembliesPerConnection` | The oldest incomplete unreliable message is evicted for it, or, when every open one is reliable, the segment is dropped without a violation and the sender resends it |
+| An out-of-order reliable message, or a reliable segment, that would take what a peer has held waiting for a gap past its byte allowance | Dropped unacknowledged and reported as the per-second limits report a drop: `RateLimitExceeded`, default `Drop`, counted in `Telemetry.PacketsDroppedIn`; see the held-byte budget below |
 | Packet transform rejects the payload | `TransformRejected` violation |
+
+**The held-byte budget.** While a reliable gap stays open, this side holds data for the peer: out-of-order reliable messages waiting in the reorder buffer, and reliable messages still being reassembled. Their payload bytes together are held to the peer's byte allowance, `MaximumBytesPerSecond`, so a peer that never sends the message a gap waits on pins no more than one second of its traffic. Whatever would go past it is dropped before it is acknowledged, so an honest sender resends it once the gap drains, and each drop is reported as `RateLimitExceeded` with `Drop`, exactly as the per-second limits report one, so it never kicks or bans. The segments of the message the gap waits on may go one message past the budget, so a full budget never keeps out the message that drains it. This side counts at most 16 reliable messages in reassembly at once; with `Segment.MaximumConcurrentAssembliesPerConnection` above 16 or at 0, a segment that would open one more is dropped as past the budget. The budget applies wherever the byte allowance does: it is off with `Enabled` false, with `MaximumBytesPerSecond` at 0, and on a connection marked `IsRateLimitExempt`, so a client that turns its limits off against its server holds whatever a gap in a large reliable snapshot needs. It counts payload bytes; the pooled buffers holding them can be up to twice that. Unreliable messages in reassembly are not counted: they are bounded by `MaximumConcurrentAssembliesPerConnection`, evicted for room and expired instead.
 
 ### Violations and bans
 
@@ -463,7 +467,7 @@ The latency simulator delays, drops and reorders **this engine's outbound** pack
 - **A timeout never shows up in `ConnectionFailed`.** Both idle and handshake timeouts arrive as `ConnectionClosed` plus a `Timeout` violation, even for a connection that was never established.
 - **A refused peer is never told.** When this side rejects a handshake as `ServerFull`, `SignatureRejected` or `Blacklisted`, `ConnectionFailed` fires here and nothing is sent back to say so. At or above `HandshakeChallengeThreshold` the other side may first get a challenge and answer it, but its handshake is still never accepted, so it eventually times out.
 - **`NatTraversalFailed` leaves the connection pending.** It stops the probing; the handshake timeout closes the connection later.
-- **Peers with different MTUs can kick each other.** A received segment larger than this side's MTU is `Malformed`, and a datagram larger than `MaximumPacketSize` (1400) is `Oversized`. Give every peer the same MTU, at or below every peer's `MaximumPacketSize`.
+- **Peers with different MTUs can kick each other.** A received segment larger than this side's MTU is `Oversized`, and a datagram larger than `MaximumPacketSize` (1400) is `Oversized`. Give every peer the same MTU, at or below every peer's `MaximumPacketSize`.
 
 ---
 
@@ -527,7 +531,7 @@ SynapseSocket.Tests/                   the test suite
 
 ## Tests
 
-200 xUnit tests in 23 suites. Almost all of them spin up real engines over loopback UDP sockets, with no mocking. Adversarial tests send hand-built datagrams from a plain `Socket`, the same thing a hostile peer on the network does.
+209 xUnit tests in 23 suites. Almost all of them spin up real engines over loopback UDP sockets, with no mocking. Adversarial tests send hand-built datagrams from a plain `Socket`, the same thing a hostile peer on the network does.
 
 | Suite | Tests | Coverage |
 |---|---|---|
@@ -549,7 +553,7 @@ SynapseSocket.Tests/                   the test suite
 | `SignatureValidatorTests` | 3 | Custom validators and signature providers |
 | `BeaconSecurityTests` | 5 | The beacon's join challenge, forged cookies, host-only heartbeat acknowledgement, per-address rate limiting |
 | `SweepFindingTests` | 49 | The robustness-sweep findings, each asserting the corrected behaviour; see `docs/ROBUSTNESS_SWEEP.md` |
-| `SecuritySweepTests` | 12 | The 2026-11 security sweep findings: a datagram refused from a sender with no connection, outright or by an `UnknownPacketReceived` handler, dropped and counted without a violation; a forged run against a connected peer earning it one strike rather than a ban; a reliable send past `Reliable.MaximumPending` returning `Dropped` without throwing or allocating; and eight reproductions skipped while their fixes are held for a design decision: forged datagrams ending or banning a connected peer, a forged acknowledgement losing a reliable message, unanswered handshakes filling a capped server, a peer pinning memory behind a reliable gap, and duplicate segments each drawing a segment acknowledgement |
+| `SecuritySweepTests` | 21 | The 2026-11 security sweep findings: a datagram refused from a sender with no connection, outright or by an `UnknownPacketReceived` handler, dropped and counted without a violation; a forged run against a connected peer earning it one strike rather than a ban; a reliable send past `Reliable.MaximumPending` returning `Dropped` without throwing or allocating; the held-byte budget holding a peer that never fills a reliable gap to its byte allowance, dropping what goes past it unacknowledged and reported as rate limited, giving an abandoned message's bytes back when its assembly expires, never holding a message it cannot count, and letting an honest sender deliver everything in order once the gap fills, with the budget off wherever the limits are; and seven reproductions skipped while their fixes are held for a design decision: forged datagrams ending or banning a connected peer, a forged acknowledgement losing a reliable message, unanswered handshakes filling a capped server, and duplicate segments each drawing a segment acknowledgement |
 | `TelemetryAndLatencyTests` | 15 | Telemetry counts, and the latency simulator's delay, jitter, loss and reordering |
 | `ConnectionStressTests` | 4 | Many clients sending rapidly, and repeated connect, send and disconnect cycles |
 | `PayloadIntegrityStressTests` | 5 | Received payloads never sharing a buffer with an unrelated rental |

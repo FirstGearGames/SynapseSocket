@@ -40,10 +40,6 @@ public sealed class SecuritySweepTests
     /// </summary>
     private const string HeldForHandshakeChallenge = "Held for Ben: SYNCONN-3 needs the handshake challenge below the cap, an extra round trip at connect.";
     /// <summary>
-    /// Skip reason for the findings whose fix is a new per-connection byte budget.
-    /// </summary>
-    private const string HeldForReorderBudget = "Held for Ben: SYNREL-1/2 need a new per-connection byte budget.";
-    /// <summary>
     /// Skip reason for the finding whose fix needs per-assembly state in CodeBoost's PacketReassembler.
     /// </summary>
     private const string HeldForSegmentAckPacing = "Held for Ben: SYNREL-3 needs per-assembly state in CodeBoost's PacketReassembler.";
@@ -283,14 +279,14 @@ public sealed class SecuritySweepTests
     }
 
     /// <summary>
-    /// SYNREL-1 and SYNREL-2: a peer that never sends the reliable message a gap waits on must not pin more memory than one second of
-    /// its byte allowance, across the reorder buffer and the reliable assemblies it holds open.
+    /// SYNREL-1 and SYNREL-2: a peer that never sends the reliable message a gap waits on must not hold more than one second of its
+    /// byte allowance in payload bytes, across the reorder buffer and the assemblies it holds open.
     /// </summary>
     /// <remarks>
     /// Sent at the default rate limits, paced under them, so the run takes about fifteen seconds. Each message declares the 255 segments
     /// the protocol allows, which nothing bounds while <see cref="SecurityConfig.MaximumReassembledPacketSize"/> is at its default of 0.
     /// </remarks>
-    [Fact(Skip = HeldForReorderBudget)]
+    [Fact]
     public void SYNREL1_PeerThatNeverFillsAGap_PinsNoMoreThanItsByteAllowance()
     {
         const byte SegmentCount = 255;
@@ -308,9 +304,8 @@ public sealed class SecuritySweepTests
         Assert.True(TestHarness.PumpUntil(() => server.Connections.Count == 1, 2000, server), "the attacker never connected");
 
         SynapseConnection attackerConnection = server.Connections.Connections[0];
-        int headerSize = PacketHeader.ComputeHeaderSize(PacketType.ReliableSegmented);
-        int segmentPayloadLength = (int)server.MaximumTransmissionUnit - headerSize;
-        PacedSender pacedSender = new(attacker, target, server, headerSize + segmentPayloadLength);
+        int segmentPayloadLength = (int)server.MaximumTransmissionUnit - PacketHeader.ComputeHeaderSize(PacketType.ReliableSegmented);
+        PacedSender pacedSender = new(attacker, target, server);
 
         // Sequences 1 to 64, never 0: each completes, is acknowledged, and waits in the reorder buffer for a gap that never fills.
         for (ushort sequence = 1; sequence <= OutOfOrderMessageCount; sequence++)
@@ -323,27 +318,410 @@ public sealed class SecuritySweepTests
         TestHarness.PumpFor(200, server);
 
         long reorderBytes = 0;
+        long reorderArrayBytes = 0;
 
         foreach (ArraySegment<byte> reorderedPayload in attackerConnection.ReorderBuffer.Values)
-            reorderBytes += reorderedPayload.Array!.Length;
-
-        long assemblyBytes = 0;
-        byte[] receivedBitmap = new byte[PacketHeader.SegmentAckBitmapSize];
-
-        for (ushort sequence = OutOfOrderMessageCount + 1; sequence <= OutOfOrderMessageCount + OpenAssemblyCount; sequence++)
         {
-            if (attackerConnection.Reassembler is null || !attackerConnection.Reassembler.TryWriteReceivedBitmap(sequence, new(receivedBitmap), out _))
-                continue;
-
-            foreach (byte bitmapByte in receivedBitmap)
-                assemblyBytes += BitOperations.PopCount(bitmapByte) * (long)segmentPayloadLength;
+            reorderBytes += reorderedPayload.Count;
+            reorderArrayBytes += reorderedPayload.Array!.Length;
         }
 
+        // Any message sent may hold an assembly open, including one the budget stopped partway through.
+        long assemblyBytes = MeasureAssemblyBytes(attackerConnection, lastSegmentId: OutOfOrderMessageCount + OpenAssemblyCount, segmentPayloadLength);
         long byteAllowance = server.Config.Security.MaximumBytesPerSecond;
 
         Assert.True(
             reorderBytes + assemblyBytes <= byteAllowance,
-            $"a peer that never sent sequence 0 pinned [{reorderBytes}] bytes of pooled arrays in [{attackerConnection.ReorderBuffer.Count}] reorder entries and [{assemblyBytes}] payload bytes in open reliable assemblies, against a byte allowance of [{byteAllowance}] a second");
+            $"a peer that never sent sequence 0 held [{reorderBytes}] payload bytes ([{reorderArrayBytes}] in pooled arrays) in [{attackerConnection.ReorderBuffer.Count}] reorder entries and [{assemblyBytes}] payload bytes in open assemblies, against a byte allowance of [{byteAllowance}] a second");
+    }
+
+    /// <summary>
+    /// SYNREL-1: an out-of-order reliable packet that would take a peer past its byte allowance is dropped without an acknowledgement and
+    /// reported as the per-second rate limit reports one, while a resend of a packet already delivered or already held is still
+    /// acknowledged.
+    /// </summary>
+    [Fact]
+    public void SYNREL1_OutOfOrderPacketPastTheBudget_IsDroppedUnacknowledged()
+    {
+        const int ByteAllowance = 16 * 1024;
+        const int PayloadLength = 1000;
+        // 15 packets of 1003 bytes stay under the allowance in one rate window.
+        const int DatagramsPerWindow = 15;
+        // 16 packets of 1000 bytes fit the allowance: sequences 2 to 17, behind the never-sent 1.
+        const ushort LastHeldSequence = 1 + ByteAllowance / PayloadLength;
+        const ushort LastSentSequence = LastHeldSequence + 3;
+        // The three sent past the budget, and the last of them again.
+        const int DroppedPacketCount = 4;
+
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port, config => config.Security.MaximumBytesPerSecond = ByteAllowance));
+        List<ViolationEventArgs> violations = RecordViolations(server);
+        server.Start();
+
+        IPEndPoint target = new(IPAddress.Loopback, port);
+        using Socket attacker = TestHarness.CreateRawSocket();
+        byte[] receiveBuffer = new byte[2048];
+
+        attacker.SendTo(BuildHandshake(), target);
+        Assert.True(TestHarness.PumpUntil(() => server.Connections.Count == 1, 2000, server), "the attacker never connected");
+
+        SynapseConnection attackerConnection = server.Connections.Connections[0];
+        PacedSender pacedSender = new(attacker, target, server, DatagramsPerWindow);
+
+        // Sequence 0 is delivered and 1 is never sent, so everything from 2 waits behind it. The run spans two rate windows, since one
+        // window carries no more than the allowance the budget is sized from.
+        pacedSender.Send(PacketType.Reliable, sequence: 0, segmentId: 0, segmentIndex: 0, segmentCount: 0, PayloadLength);
+
+        for (ushort sequence = 2; sequence <= LastSentSequence; sequence++)
+            pacedSender.Send(PacketType.Reliable, sequence, segmentId: 0, segmentIndex: 0, segmentCount: 0, PayloadLength);
+
+        TestHarness.PumpFor(100, server);
+        HashSet<ushort> ackedSequences = ReceiveAckedSequences(attacker, receiveBuffer);
+
+        // The sender missed these acknowledgements: 0 is delivered, LastHeldSequence is held, and the last one was dropped.
+        pacedSender.Send(PacketType.Reliable, sequence: 0, segmentId: 0, segmentIndex: 0, segmentCount: 0, PayloadLength);
+        pacedSender.Send(PacketType.Reliable, LastHeldSequence, segmentId: 0, segmentIndex: 0, segmentCount: 0, PayloadLength);
+        pacedSender.Send(PacketType.Reliable, LastSentSequence, segmentId: 0, segmentIndex: 0, segmentCount: 0, PayloadLength);
+
+        TestHarness.PumpFor(100, server);
+        HashSet<ushort> resentAckedSequences = ReceiveAckedSequences(attacker, receiveBuffer);
+
+        long heldBytes = 0;
+
+        foreach (ArraySegment<byte> reorderedPayload in attackerConnection.ReorderBuffer.Values)
+            heldBytes += reorderedPayload.Count;
+
+        for (ushort sequence = 2; sequence <= LastSentSequence; sequence++)
+        {
+            bool isWithinBudget = sequence <= LastHeldSequence;
+            Assert.True(ackedSequences.Contains(sequence) == isWithinBudget, $"sequence [{sequence}] was acknowledged [{ackedSequences.Contains(sequence)}] where the budget holds up to [{LastHeldSequence}]");
+        }
+
+        Assert.True(resentAckedSequences.Contains(0) && resentAckedSequences.Contains(LastHeldSequence), $"a resend of a delivered or held packet went unacknowledged: [{string.Join(", ", resentAckedSequences)}]");
+        Assert.DoesNotContain(LastSentSequence, resentAckedSequences);
+        Assert.True(heldBytes <= ByteAllowance, $"[{heldBytes}] payload bytes held against an allowance of [{ByteAllowance}]");
+        Assert.True(server.Connections.Count == 1, "the budget dropped the peer");
+        AssertReportedAsRateLimited(violations, DroppedPacketCount);
+    }
+
+    /// <summary>
+    /// SYNREL-2: the bytes of a reliable message that never completes count toward the allowance for as long as its assembly is held, and
+    /// are given back when the assembly expires.
+    /// </summary>
+    [Fact]
+    public void SYNREL2_AbandonedMessage_HoldsTheBudgetUntilItsAssemblyExpires()
+    {
+        const int ByteAllowance = 16 * 1024;
+        // 13 datagrams of up to 1200 bytes stay under the allowance in one rate window.
+        const int DatagramsPerWindow = 13;
+        const uint AssemblyTimeoutMilliseconds = 2000;
+        const byte SegmentCount = 14;
+        const int HeldSegmentCount = 12;
+
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port, config =>
+        {
+            config.Security.MaximumBytesPerSecond = ByteAllowance;
+            config.Segment.AssemblyTimeoutMilliseconds = AssemblyTimeoutMilliseconds;
+        }));
+        server.Start();
+
+        IPEndPoint target = new(IPAddress.Loopback, port);
+        using Socket attacker = TestHarness.CreateRawSocket();
+        byte[] receiveBuffer = new byte[2048];
+
+        attacker.SendTo(BuildHandshake(), target);
+        Assert.True(TestHarness.PumpUntil(() => server.Connections.Count == 1, 2000, server), "the attacker never connected");
+
+        SynapseConnection attackerConnection = server.Connections.Connections[0];
+        int segmentPayloadLength = (int)server.MaximumTransmissionUnit - PacketHeader.ComputeHeaderSize(PacketType.ReliableSegmented);
+        PacedSender pacedSender = new(attacker, target, server, DatagramsPerWindow);
+
+        // Sequence 0 is never sent and 1 never completes: twelve of its fourteen segments hold 14,316 bytes.
+        for (byte segmentIndex = 0; segmentIndex < HeldSegmentCount; segmentIndex++)
+            pacedSender.Send(PacketType.ReliableSegmented, sequence: 1, segmentId: 1, segmentIndex, SegmentCount, segmentPayloadLength);
+
+        // One full unsegmented packet still fits beside it, and a second does not.
+        pacedSender.StartNextWindow();
+        pacedSender.Send(PacketType.Reliable, sequence: 2, segmentId: 0, segmentIndex: 0, segmentCount: 0, server.MaximumPayloadSize);
+        pacedSender.Send(PacketType.Reliable, sequence: 3, segmentId: 0, segmentIndex: 0, segmentCount: 0, server.MaximumPayloadSize);
+
+        TestHarness.PumpFor(100, server);
+        HashSet<ushort> ackedSequences = ReceiveAckedSequences(attacker, receiveBuffer);
+
+        Assert.True(
+            TestHarness.PumpUntil(() => attackerConnection.Reassembler is { HasAssemblies: false }, (int)AssemblyTimeoutMilliseconds + 1000, server),
+            "the abandoned message was never discarded");
+
+        pacedSender.Send(PacketType.Reliable, sequence: 3, segmentId: 0, segmentIndex: 0, segmentCount: 0, server.MaximumPayloadSize);
+
+        TestHarness.PumpFor(100, server);
+        HashSet<ushort> resentAckedSequences = ReceiveAckedSequences(attacker, receiveBuffer);
+
+        Assert.True(ackedSequences.Contains(2) && !ackedSequences.Contains(3), $"with the abandoned message held, [{string.Join(", ", ackedSequences)}] were acknowledged where only 2 fits the budget");
+        Assert.True(resentAckedSequences.Contains(3), "the abandoned message's bytes were still counted after its assembly expired");
+    }
+
+    /// <summary>
+    /// SYNREL-2: a reliable message the split-message table has no room to count is refused as past the budget only where the reassembler
+    /// would hold it, because the concurrent-assembly cap is disabled. At the default cap the reassembler refuses it itself, without a
+    /// violation, as it always has.
+    /// </summary>
+    /// <param name="maximumConcurrentAssemblies">The receiver's cap on messages in reassembly.</param>
+    [Theory]
+    [InlineData(SegmentConfig.DisabledMaximumConcurrentAssembliesPerConnection)]
+    [InlineData(16u)]
+    public void SYNREL2_MessageTheTableCannotCount_IsNeverHeldUncounted(uint maximumConcurrentAssemblies)
+    {
+        const byte SegmentCount = 2;
+        const ushort MessageCount = SynapseConnection.SplitMessageTableLength + 1;
+        const int PayloadLength = 10;
+
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port, config => config.Segment.MaximumConcurrentAssembliesPerConnection = maximumConcurrentAssemblies));
+        List<ViolationEventArgs> violations = RecordViolations(server);
+        server.Start();
+
+        IPEndPoint target = new(IPAddress.Loopback, port);
+        using Socket attacker = TestHarness.CreateRawSocket();
+
+        attacker.SendTo(BuildHandshake(), target);
+        Assert.True(TestHarness.PumpUntil(() => server.Connections.Count == 1, 2000, server), "the attacker never connected");
+
+        SynapseConnection attackerConnection = server.Connections.Connections[0];
+        PacedSender pacedSender = new(attacker, target, server);
+
+        // One more incomplete message than the table holds, each behind the never-sent sequence 0.
+        for (ushort sequence = 1; sequence <= MessageCount; sequence++)
+            pacedSender.Send(PacketType.ReliableSegmented, sequence, segmentId: sequence, segmentIndex: 0, SegmentCount, PayloadLength);
+
+        TestHarness.PumpFor(100, server);
+
+        Assert.Equal(SynapseConnection.SplitMessageTableLength * (long)PayloadLength, MeasureAssemblyBytes(attackerConnection, lastSegmentId: MessageCount, PayloadLength));
+        AssertReportedAsRateLimited(violations, maximumConcurrentAssemblies == SegmentConfig.DisabledMaximumConcurrentAssembliesPerConnection ? 1 : 0);
+    }
+
+    /// <summary>
+    /// SYNREL-2: the segments of the message a gap waits on may go one message past the allowance, so a full budget never keeps out the
+    /// message that drains it, and that headroom is all a peer gets: assemblies opened on the awaited sequence hold no more than the
+    /// allowance and one message.
+    /// </summary>
+    [Fact]
+    public void SYNREL2_AssembliesOnTheAwaitedSequence_HoldNoMoreThanTheBudgetAndOneMessage()
+    {
+        const byte SegmentCount = 255;
+        const int SentSegmentCount = 250;
+        const ushort AssemblyCount = 12;
+
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port));
+        server.Start();
+
+        IPEndPoint target = new(IPAddress.Loopback, port);
+        using Socket attacker = TestHarness.CreateRawSocket();
+
+        attacker.SendTo(BuildHandshake(), target);
+        Assert.True(TestHarness.PumpUntil(() => server.Connections.Count == 1, 2000, server), "the attacker never connected");
+
+        SynapseConnection attackerConnection = server.Connections.Connections[0];
+        int segmentPayloadLength = (int)server.MaximumTransmissionUnit - PacketHeader.ComputeHeaderSize(PacketType.ReliableSegmented);
+        PacedSender pacedSender = new(attacker, target, server);
+
+        // Every assembly names sequence 0, the one the receiver waits on, under a segment id of its own.
+        for (ushort segmentId = 1; segmentId <= AssemblyCount; segmentId++)
+        {
+            for (int segmentIndex = 0; segmentIndex < SentSegmentCount; segmentIndex++)
+                pacedSender.Send(PacketType.ReliableSegmented, sequence: 0, segmentId, (byte)segmentIndex, SegmentCount, segmentPayloadLength);
+        }
+
+        TestHarness.PumpFor(200, server);
+
+        long assemblyBytes = MeasureAssemblyBytes(attackerConnection, lastSegmentId: AssemblyCount, segmentPayloadLength);
+        long heldByteCeiling = server.Config.Security.MaximumBytesPerSecond + (long)SegmentCount * server.MaximumTransmissionUnit;
+
+        Assert.True(assemblyBytes <= heldByteCeiling, $"[{assemblyBytes}] payload bytes held in assemblies on the awaited sequence against the allowance and one message, [{heldByteCeiling}]");
+    }
+
+    /// <summary>
+    /// SYNREL-1: an honest sender whose messages queue past a lost one beyond the receiver's byte allowance still delivers every message,
+    /// in order, once the lost one arrives. What does not fit is dropped unacknowledged, and the sender's resends bring it back after the
+    /// gap drains, which gives the whole budget back for the next gap.
+    /// </summary>
+    /// <remarks>
+    /// The lost message is segmented and stays lost until the backlog has filled the budget, so it can only complete through the headroom
+    /// its segments get past the budget. Each burst ends with an unsegmented message, and the second one lands past the budget: had it
+    /// been acknowledged, the sender would have released it and it would never arrive. The sender is allowed more resends than the default
+    /// because the test holds the gap open, on purpose, for longer than the default resends last.
+    /// </remarks>
+    [Fact]
+    public void SYNREL1_HonestSenderPastTheBudget_DeliversEveryMessageInOrderOnceTheGapFills()
+    {
+        const int ByteAllowance = 128 * 1024;
+        const int SegmentsPerMessage = 20;
+        const int UnsegmentedMessageLength = 1000;
+        const int MessagesPerBurst = 5;
+        const int BurstCount = 2;
+        const int SecondGapMessageCount = 3;
+
+        GapTransform gapTransform = new();
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port, config => config.Security.MaximumBytesPerSecond = ByteAllowance));
+        using SynapseManager client = new(TestHarness.ClientConfig(config =>
+        {
+            config.PacketTransform = gapTransform;
+            config.Reliable.MaximumRetries = 40;
+        }));
+
+        TestHarness.EventRecorder serverEvents = new();
+        serverEvents.Attach(server);
+        List<ViolationEventArgs> violations = RecordViolations(server);
+        List<byte[]> deliveredPayloads = [];
+        server.PacketReceived += packetReceivedEventArgs => deliveredPayloads.Add(packetReceivedEventArgs.Payload.ToArray());
+
+        server.Start();
+        client.Start();
+
+        SynapseConnection clientConnection = client.Connect(new(IPAddress.Loopback, port));
+        Assert.True(TestHarness.PumpUntil(() => clientConnection.State is ConnectionState.Connected && server.Connections.Count == 1, 3000, server, client), "the sender never connected");
+
+        int segmentedMessageLength = SegmentsPerMessage * ((int)client.MaximumTransmissionUnit - PacketHeader.ComputeHeaderSize(PacketType.ReliableSegmented));
+        List<byte[]> sentMessages = [BuildFilledMessage(GapTransform.GapMessageFill, segmentedMessageLength)];
+
+        gapTransform.IsDroppingGapMessage = true;
+        client.Send(clientConnection, sentMessages[0], isReliable: true);
+
+        // One burst per rate window, each under the allowance, so nothing is rate limited and every drop is the budget's.
+        for (int burst = 0; burst < BurstCount; burst++)
+        {
+            for (int burstIndex = 0; burstIndex < MessagesPerBurst; burstIndex++)
+            {
+                byte[] message = BuildFilledMessage((byte)sentMessages.Count, burstIndex == MessagesPerBurst - 1 ? UnsegmentedMessageLength : segmentedMessageLength);
+                sentMessages.Add(message);
+                client.Send(clientConnection, message, isReliable: true);
+            }
+
+            TestHarness.PumpFor(1100, server, client);
+        }
+
+        long droppedPastBudget = server.Telemetry.PacketsDroppedIn;
+        gapTransform.IsDroppingGapMessage = false;
+
+        Assert.True(
+            TestHarness.PumpUntil(() => deliveredPayloads.Count == sentMessages.Count, 10_000, server, client),
+            $"[{deliveredPayloads.Count}] of [{sentMessages.Count}] messages arrived once the gap filled, after [{droppedPastBudget}] datagrams were dropped past the budget");
+
+        Assert.True(droppedPastBudget > 0, "the backlog never went past the budget, so the test proved nothing");
+        Assert.Equal(0, serverEvents.ConnectionsClosed);
+        AssertReportedAsRateLimited(violations, (int)server.Telemetry.PacketsDroppedIn);
+
+        // The drained gap gives its bytes back: in a fresh rate window, a second gap holds a backlog under the budget without dropping any.
+        TestHarness.PumpFor(1100, server, client);
+
+        SynapseConnection serverConnection = server.Connections.Connections[0];
+        long droppedBeforeSecondGap = server.Telemetry.PacketsDroppedIn;
+        sentMessages.Add(BuildFilledMessage(GapTransform.GapMessageFill, segmentedMessageLength));
+
+        gapTransform.IsDroppingGapMessage = true;
+        client.Send(clientConnection, sentMessages[^1], isReliable: true);
+
+        for (int i = 0; i < SecondGapMessageCount; i++)
+        {
+            sentMessages.Add(BuildFilledMessage((byte)sentMessages.Count, segmentedMessageLength));
+            client.Send(clientConnection, sentMessages[^1], isReliable: true);
+        }
+
+        Assert.True(
+            TestHarness.PumpUntil(() => serverConnection.ReorderBuffer.Count == SecondGapMessageCount, 2000, server, client),
+            $"[{serverConnection.ReorderBuffer.Count}] of [{SecondGapMessageCount}] messages under the budget were held behind a second gap, with [{server.Telemetry.PacketsDroppedIn - droppedBeforeSecondGap}] dropped");
+
+        gapTransform.IsDroppingGapMessage = false;
+
+        Assert.True(TestHarness.PumpUntil(() => deliveredPayloads.Count == sentMessages.Count, 5000, server, client), $"[{deliveredPayloads.Count}] of [{sentMessages.Count}] messages arrived once the second gap filled");
+        Assert.Equal(droppedBeforeSecondGap, server.Telemetry.PacketsDroppedIn);
+
+        for (int i = 0; i < sentMessages.Count; i++)
+            Assert.True(sentMessages[i].AsSpan().SequenceEqual(deliveredPayloads[i]), $"message [{i}] arrived out of order or altered");
+    }
+
+    /// <summary>
+    /// The budget is off wherever the per-connection limits it is sized from are off, so a receiver that applies no byte allowance, has
+    /// security disabled, or exempts the connection from its rate limits holds a backlog past a lost message well beyond the default
+    /// allowance, and delivers all of it once the gap fills.
+    /// </summary>
+    /// <param name="receiverLimits">How the receiver's limits are turned off.</param>
+    [Theory]
+    [InlineData(ReceiverLimits.RateLimitsDisabled)]
+    [InlineData(ReceiverLimits.SecurityDisabled)]
+    [InlineData(ReceiverLimits.ConnectionExempt)]
+    public void SYNREL1_ReceiverWithItsLimitsOff_HoldsABacklogPastTheDefaultBudget(ReceiverLimits receiverLimits)
+    {
+        const byte SegmentCount = 255;
+        const int BacklogMessageCount = 9;
+        const int UnsegmentedMessageLength = 1000;
+
+        GapTransform gapTransform = new();
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port, config =>
+        {
+            if (receiverLimits is ReceiverLimits.RateLimitsDisabled)
+            {
+                config.Security.MaximumPacketsPerSecond = SecurityConfig.DisabledMaximumPacketsPerSecond;
+                config.Security.MaximumBytesPerSecond = SecurityConfig.DisabledMaximumBytesPerSecond;
+            }
+            else if (receiverLimits is ReceiverLimits.SecurityDisabled)
+            {
+                config.Security.Enabled = false;
+            }
+        }));
+        using SynapseManager client = new(TestHarness.ClientConfig(config =>
+        {
+            config.PacketTransform = gapTransform;
+            config.Reliable.MaximumRetries = 40;
+        }));
+
+        if (receiverLimits is ReceiverLimits.ConnectionExempt)
+            server.ConnectionEstablished += connectionEventArgs => connectionEventArgs.Connection.IsRateLimitExempt = true;
+
+        List<byte[]> deliveredPayloads = [];
+        server.PacketReceived += packetReceivedEventArgs => deliveredPayloads.Add(packetReceivedEventArgs.Payload.ToArray());
+
+        server.Start();
+        client.Start();
+
+        SynapseConnection clientConnection = client.Connect(new(IPAddress.Loopback, port));
+        Assert.True(TestHarness.PumpUntil(() => clientConnection.State is ConnectionState.Connected && server.Connections.Count == 1, 3000, server, client), "the sender never connected");
+
+        SynapseConnection serverConnection = server.Connections.Connections[0];
+        int messageLength = SegmentCount * ((int)client.MaximumTransmissionUnit - PacketHeader.ComputeHeaderSize(PacketType.ReliableSegmented));
+        List<byte[]> sentMessages = [BuildFilledMessage(GapTransform.GapMessageFill, messageLength)];
+
+        gapTransform.IsDroppingGapMessage = true;
+        client.Send(clientConnection, sentMessages[0], isReliable: true);
+
+        // Segmented messages past the default allowance, then one unsegmented, since each takes its own check.
+        for (int i = 1; i <= BacklogMessageCount; i++)
+        {
+            sentMessages.Add(BuildFilledMessage((byte)i, i < BacklogMessageCount ? messageLength : UnsegmentedMessageLength));
+            client.Send(clientConnection, sentMessages[i], isReliable: true);
+            TestHarness.PumpFor(30, server, client);
+        }
+
+        Assert.True(TestHarness.PumpUntil(() => serverConnection.ReorderBuffer.Count == BacklogMessageCount, 5000, server, client), $"[{serverConnection.ReorderBuffer.Count}] of [{BacklogMessageCount}] messages were held behind the gap");
+
+        long heldBytes = 0;
+
+        foreach (ArraySegment<byte> reorderedPayload in serverConnection.ReorderBuffer.Values)
+            heldBytes += reorderedPayload.Count;
+
+        long defaultByteAllowance = new SecurityConfig().MaximumBytesPerSecond;
+        long droppedPastBudget = server.Telemetry.PacketsDroppedIn;
+        gapTransform.IsDroppingGapMessage = false;
+
+        Assert.True(TestHarness.PumpUntil(() => deliveredPayloads.Count == sentMessages.Count, 10_000, server, client), $"[{deliveredPayloads.Count}] of [{sentMessages.Count}] messages arrived once the gap filled");
+        Assert.True(heldBytes > defaultByteAllowance && droppedPastBudget == 0, $"[{heldBytes}] payload bytes held and [{droppedPastBudget}] datagrams dropped, where the default allowance is [{defaultByteAllowance}]");
+
+        for (int i = 0; i < sentMessages.Count; i++)
+            Assert.True(sentMessages[i].AsSpan().SequenceEqual(deliveredPayloads[i]), $"message [{i}] arrived out of order or altered");
     }
 
     /// <summary>
@@ -527,6 +905,121 @@ public sealed class SecuritySweepTests
     }
 
     /// <summary>
+    /// Reads every datagram queued on <paramref name="socket"/> and collects the sequences its acknowledgements name.
+    /// </summary>
+    /// <param name="socket">The socket the acknowledgements arrive on.</param>
+    /// <param name="buffer">Scratch buffer the datagrams are read into.</param>
+    /// <returns>The acknowledged sequences.</returns>
+    private static HashSet<ushort> ReceiveAckedSequences(Socket socket, byte[] buffer)
+    {
+        HashSet<ushort> ackedSequences = [];
+
+        while (TryReceive(socket, buffer, out int receivedLength))
+        {
+            if (receivedLength == 0 || buffer[0] != (byte)PacketType.Ack)
+                continue;
+
+            for (int offset = PacketHeader.TypeSize; offset + PacketHeader.SequenceSize <= receivedLength; offset += PacketHeader.SequenceSize)
+                ackedSequences.Add((ushort)(buffer[offset] | (buffer[offset + 1] << 8)));
+        }
+
+        return ackedSequences;
+    }
+
+    /// <summary>
+    /// Counts the payload bytes <paramref name="synapseConnection"/>'s assemblies hold under segment ids 1 to
+    /// <paramref name="lastSegmentId"/>, from the segments each reports holding.
+    /// </summary>
+    /// <param name="synapseConnection">The connection whose assemblies are measured.</param>
+    /// <param name="lastSegmentId">The last segment id measured.</param>
+    /// <param name="segmentPayloadLength">The payload every held segment carries.</param>
+    /// <returns>The payload bytes held.</returns>
+    private static long MeasureAssemblyBytes(SynapseConnection synapseConnection, ushort lastSegmentId, int segmentPayloadLength)
+    {
+        long assemblyBytes = 0;
+        byte[] receivedBitmap = new byte[PacketHeader.SegmentAckBitmapSize];
+
+        for (ushort segmentId = 1; segmentId <= lastSegmentId; segmentId++)
+        {
+            if (synapseConnection.Reassembler is null || !synapseConnection.Reassembler.TryWriteReceivedBitmap(segmentId, new(receivedBitmap), out _))
+                continue;
+
+            foreach (byte bitmapByte in receivedBitmap)
+                assemblyBytes += BitOperations.PopCount(bitmapByte) * (long)segmentPayloadLength;
+        }
+
+        return assemblyBytes;
+    }
+
+    /// <summary>
+    /// Records every violation <paramref name="synapseManager"/> raises, leaving each one's action as the engine settled it.
+    /// </summary>
+    /// <param name="synapseManager">The engine whose violations are recorded.</param>
+    /// <returns>The violations, in the order they were raised.</returns>
+    private static List<ViolationEventArgs> RecordViolations(SynapseManager synapseManager)
+    {
+        List<ViolationEventArgs> violations = [];
+
+        synapseManager.ViolationDetected += (ref ViolationEventArgs violationEventArgs) =>
+        {
+            violations.Add(violationEventArgs);
+
+            return violationEventArgs.Action;
+        };
+
+        return violations;
+    }
+
+    /// <summary>
+    /// Asserts <paramref name="violations"/> holds exactly <paramref name="expectedCount"/> reports, each a drop past the held-byte budget
+    /// reported as the per-second rate limit reports one: <see cref="ViolationReason.RateLimitExceeded"/>, settled as
+    /// <see cref="ViolationAction.Drop"/>, with no log entry.
+    /// </summary>
+    /// <param name="violations">The violations raised.</param>
+    /// <param name="expectedCount">How many datagrams were dropped past the budget.</param>
+    private static void AssertReportedAsRateLimited(List<ViolationEventArgs> violations, int expectedCount)
+    {
+        Assert.True(violations.Count == expectedCount, $"[{violations.Count}] violations [{string.Join(", ", violations.Select(violationEventArgs => violationEventArgs.Reason))}] where [{expectedCount}] datagrams were dropped past the budget");
+
+        foreach (ViolationEventArgs violationEventArgs in violations)
+            Assert.True(violationEventArgs is { Reason: ViolationReason.RateLimitExceeded, Action: ViolationAction.Drop, Log.IsSet: false }, $"a drop past the budget was reported as [{violationEventArgs.Reason}] settled as [{violationEventArgs.Action}]");
+    }
+
+    /// <summary>
+    /// Builds a message of <paramref name="length"/> bytes, every one of them <paramref name="fill"/>, so it is told apart from any
+    /// other message on arrival.
+    /// </summary>
+    /// <param name="fill">The byte the message is filled with.</param>
+    /// <param name="length">The message's length.</param>
+    /// <returns>The message.</returns>
+    private static byte[] BuildFilledMessage(byte fill, int length)
+    {
+        byte[] message = new byte[length];
+        Array.Fill(message, fill);
+
+        return message;
+    }
+
+    /// <summary>
+    /// How a receiver's per-connection limits are turned off.
+    /// </summary>
+    public enum ReceiverLimits : byte
+    {
+        /// <summary>
+        /// The packet and byte rate limits are set to 0, as a client sets them against its server.
+        /// </summary>
+        RateLimitsDisabled,
+        /// <summary>
+        /// Security is disabled, which skips every per-connection limit.
+        /// </summary>
+        SecurityDisabled,
+        /// <summary>
+        /// The connection is marked exempt from the rate limits.
+        /// </summary>
+        ConnectionExempt
+    }
+
+    /// <summary>
     /// A server and a real client connected over loopback, the client being the victim whose address is forged.
     /// </summary>
     private sealed class ConnectedPair : IDisposable
@@ -607,13 +1100,13 @@ public sealed class SecuritySweepTests
     }
 
     /// <summary>
-    /// Sends hand-built reliable segments from a raw socket, paced under the server's default per-connection rate limits so that none is
-    /// shed, and polls the server as it goes so its socket buffer never overflows.
+    /// Sends hand-built datagrams from a raw socket, paced under the server's per-connection rate limits so that none is shed, and polls
+    /// the server as it goes so its socket buffer never overflows.
     /// </summary>
     private sealed class PacedSender
     {
         /// <summary>
-        /// The socket the segments leave from.
+        /// The socket the datagrams leave from.
         /// </summary>
         private readonly Socket _socket;
         /// <summary>
@@ -625,9 +1118,13 @@ public sealed class SecuritySweepTests
         /// </summary>
         private readonly SynapseManager _server;
         /// <summary>
-        /// One full-size segment datagram, rewritten for each send.
+        /// One datagram of up to the server's transmission unit, rewritten for each send.
         /// </summary>
         private readonly byte[] _datagram;
+        /// <summary>
+        /// Datagrams sent per window, kept under the server's packet and byte allowance a second.
+        /// </summary>
+        private readonly int _datagramsPerWindow;
         /// <summary>
         /// Datagrams sent in the current window.
         /// </summary>
@@ -637,9 +1134,10 @@ public sealed class SecuritySweepTests
         /// </summary>
         private long _windowStartMilliseconds = Environment.TickCount64;
         /// <summary>
-        /// Datagrams sent per window: 1.8 MB of full-size segments, under both the 2000 packet and the 2 MiB byte allowance a second.
+        /// Datagrams sent per window at the default limits: 1.8 MB of full-size segments, under both the 2000 packet and the 2 MiB byte
+        /// allowance a second.
         /// </summary>
-        private const int DatagramsPerWindow = 1500;
+        public const int DefaultDatagramsPerWindow = 1500;
         /// <summary>
         /// How long a window lasts. The server's rate window is a second measured between its own polls, so a window any shorter can
         /// leave one of the server's holding the tail of one burst and the head of the next.
@@ -647,53 +1145,105 @@ public sealed class SecuritySweepTests
         private const long WindowMilliseconds = 1100;
 
         /// <summary>
-        /// Creates a sender of full-size segments.
+        /// Creates a sender of datagrams up to the server's transmission unit.
         /// </summary>
-        /// <param name="socket">The socket the segments leave from.</param>
+        /// <param name="socket">The socket the datagrams leave from.</param>
         /// <param name="target">The server's address.</param>
         /// <param name="server">The server, polled between bursts.</param>
-        /// <param name="datagramLength">The length of one full-size segment datagram.</param>
-        public PacedSender(Socket socket, IPEndPoint target, SynapseManager server, int datagramLength)
+        /// <param name="datagramsPerWindow">How many datagrams to send per window, kept under the server's allowance a second.</param>
+        public PacedSender(Socket socket, IPEndPoint target, SynapseManager server, int datagramsPerWindow = DefaultDatagramsPerWindow)
         {
             _socket = socket;
             _target = target;
             _server = server;
-            _datagram = new byte[datagramLength];
+            _datagram = new byte[server.MaximumTransmissionUnit];
+            _datagramsPerWindow = datagramsPerWindow;
         }
 
         /// <summary>
-        /// Sends the first <paramref name="sentSegmentCount"/> segments of a reliable message declaring <paramref name="segmentCount"/>,
-        /// using the sequence as its segment id.
+        /// Sends the first <paramref name="sentSegmentCount"/> full-size segments of a reliable message declaring
+        /// <paramref name="segmentCount"/>, using the sequence as its segment id.
         /// </summary>
         /// <param name="sequence">The message's reliable sequence and segment id.</param>
         /// <param name="segmentCount">The segments the message declares.</param>
         /// <param name="sentSegmentCount">How many of them to send, from index 0.</param>
         public void SendMessage(ushort sequence, byte segmentCount, int sentSegmentCount)
         {
+            int segmentPayloadLength = _datagram.Length - PacketHeader.ComputeHeaderSize(PacketType.ReliableSegmented);
+
             for (int segmentIndex = 0; segmentIndex < sentSegmentCount; segmentIndex++)
-            {
-                if (_windowDatagramCount >= DatagramsPerWindow)
-                {
-                    // Wait out the rest of the window, polling so nothing waits in the socket buffer.
-                    while (Environment.TickCount64 - _windowStartMilliseconds < WindowMilliseconds)
-                    {
-                        _server.Poll();
-                        Thread.Sleep(1);
-                    }
-
-                    _windowStartMilliseconds = Environment.TickCount64;
-                    _windowDatagramCount = 0;
-                }
-
-                PacketHeader.Write(_datagram, PacketType.ReliableSegmented, sequence, segmentId: sequence, (byte)segmentIndex, segmentCount);
-                _socket.SendTo(_datagram, _target);
-                _windowDatagramCount++;
-
-                if (_windowDatagramCount % 64 == 0)
-                    _server.Poll();
-            }
+                Send(PacketType.ReliableSegmented, sequence, segmentId: sequence, (byte)segmentIndex, segmentCount, segmentPayloadLength);
 
             _server.Poll();
+        }
+
+        /// <summary>
+        /// Sends one datagram of <paramref name="packetType"/> carrying <paramref name="payloadLength"/> zero bytes, opening the next window
+        /// first when the current one is full.
+        /// </summary>
+        /// <param name="packetType">The datagram's packet type.</param>
+        /// <param name="sequence">The reliable sequence, written when the type carries one.</param>
+        /// <param name="segmentId">The segment id, written when the type carries one.</param>
+        /// <param name="segmentIndex">The segment index, written when the type carries one.</param>
+        /// <param name="segmentCount">The segment count, written when the type carries one.</param>
+        /// <param name="payloadLength">The bytes after the header.</param>
+        public void Send(PacketType packetType, ushort sequence, ushort segmentId, byte segmentIndex, byte segmentCount, int payloadLength)
+        {
+            if (_windowDatagramCount >= _datagramsPerWindow)
+                StartNextWindow();
+
+            int headerSize = PacketHeader.Write(_datagram, packetType, sequence, segmentId, segmentIndex, segmentCount);
+            _socket.SendTo(_datagram, 0, headerSize + payloadLength, SocketFlags.None, _target);
+            _windowDatagramCount++;
+
+            if (_windowDatagramCount % 64 == 0)
+                _server.Poll();
+        }
+
+        /// <summary>
+        /// Waits out the rest of the current window, polling so nothing waits in the socket buffer, and opens the next.
+        /// </summary>
+        public void StartNextWindow()
+        {
+            while (Environment.TickCount64 - _windowStartMilliseconds < WindowMilliseconds)
+            {
+                _server.Poll();
+                Thread.Sleep(1);
+            }
+
+            _windowStartMilliseconds = Environment.TickCount64;
+            _windowDatagramCount = 0;
+        }
+    }
+
+    /// <summary>
+    /// A pass-through transform for a sender that loses every reliable segment of the gap message while armed, standing in for a message
+    /// lost on the network for as long as a test needs the backlog behind it to build.
+    /// </summary>
+    private sealed class GapTransform : IPacketTransform
+    {
+        /// <summary>
+        /// True while the gap message's segments are lost.
+        /// </summary>
+        public bool IsDroppingGapMessage;
+        /// <inheritdoc/>
+        public uint ReservedBytes => 0;
+        /// <summary>
+        /// The byte the gap message is filled with, which no other message in these tests carries.
+        /// </summary>
+        public const byte GapMessageFill = 0xEE;
+
+        /// <inheritdoc/>
+        public bool TryTransform(PacketTransformDirection packetTransformDirection, PacketType packetType, IPEndPoint endPoint, ReadOnlySpan<byte> source, Span<byte> destination, out int writtenLength)
+        {
+            writtenLength = source.Length;
+
+            if (IsDroppingGapMessage && packetTransformDirection == PacketTransformDirection.Outbound && packetType == PacketType.ReliableSegmented && source.Length > 0 && source[0] == GapMessageFill)
+                return false;
+
+            source.CopyTo(destination);
+
+            return true;
         }
     }
 }

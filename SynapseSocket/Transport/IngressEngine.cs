@@ -202,12 +202,57 @@ internal sealed partial class IngressEngine
     /// 0 (disabled) to <see cref="SynapseConfig.EffectiveUnlimitedValueUInt32"/>.
     /// </summary>
     private readonly uint _effectiveMaximumReceivesPerPoll;
+    /// <summary>
+    /// The most segments a received message may declare: <see cref="SegmentConfig.MaximumSegments"/>, or
+    /// <see cref="PacketReassembler.MaximumSegmentCount"/> while that is <see cref="SegmentConfig.DisabledMaximumSegments"/>.
+    /// </summary>
+    private readonly uint _effectiveMaximumSegments;
+    /// <summary>
+    /// The most payload bytes one connection may hold waiting for a reliable gap, across its reorder buffer and its incomplete reliable
+    /// messages: <see cref="SecurityConfig.MaximumBytesPerSecond"/>, or <see cref="UnlimitedHeldByteBudget"/> where that allowance is not
+    /// enforced, because it is 0 or <see cref="SecurityConfig.Enabled"/> is false.
+    /// </summary>
+    /// <remarks>
+    /// An out-of-order reliable packet or a reliable segment that would take a connection past it is dropped unacknowledged, and reported
+    /// as the per-second rate limit reports a drop, so an honest sender resends it once the gap has drained. A connection marked
+    /// <see cref="SynapseConnection.IsRateLimitExempt"/> skips the budget as it skips the rate limits.
+    /// </remarks>
+    private readonly ulong _heldByteBudget;
+    /// <summary>
+    /// <see cref="_heldByteBudget"/> raised by the most one assembly can hold, applied to the segments of the reliable message a gap
+    /// waits on, or <see cref="UnlimitedHeldByteBudget"/> where the budget is not applied.
+    /// </summary>
+    /// <remarks>
+    /// Without the headroom, later messages filling the budget would refuse the segments of the one message that drains it, and the gap
+    /// would never fill.
+    /// </remarks>
+    private readonly ulong _gapHeldByteBudget;
+    /// <summary>
+    /// The most reliable messages <see cref="SynapseConnection.SplitMessages"/> counts for one connection: the concurrent-assembly cap,
+    /// at which the reassembler itself refuses one more, or the table's length where the cap is larger or disabled.
+    /// </summary>
+    private readonly int _splitMessageLimit;
+    /// <summary>
+    /// True where the budget applies and the reassembler can hold more messages than <see cref="_splitMessageLimit"/>, so a segment opening
+    /// one the table has no room to count is dropped as past the budget rather than held uncounted.
+    /// </summary>
+    private readonly bool _uncountedSplitMessageRefusalEnabled;
 
     /// <summary>
     /// Window within which an inbound handshake is read as the peer's answer to one we just sent, rather than as a
     /// fresh request that would reset the session. Must comfortably exceed a real round trip.
     /// </summary>
     private const long HandshakeAnswerWindowTicks = TimeSpan.TicksPerSecond;
+    /// <summary>
+    /// Half the 16-bit reliable sequence space. A sequence this far or further past the next expected one is behind it: a resend of a
+    /// packet already delivered.
+    /// </summary>
+    private const ushort SequenceHalfSpace = 32768;
+    /// <summary>
+    /// The value of <see cref="_heldByteBudget"/> and <see cref="_gapHeldByteBudget"/> where the budget is not applied, which no
+    /// connection can reach, so the check stays one comparison.
+    /// </summary>
+    private const ulong UnlimitedHeldByteBudget = ulong.MaxValue;
 
     /// <summary>
     /// Violation detail reported when a peer declares a reassembled size above the configured ceiling.
@@ -300,6 +345,24 @@ internal sealed partial class IngressEngine
         _effectiveMaximumConcurrentConnections = SynapseConfig.ToEffectiveLimit(config.MaximumConcurrentConnections);
         _effectiveMaximumReceivesPerPoll = SynapseConfig.ToEffectiveLimit(config.MaximumReceivesPerPoll);
         _handshakeChallengeThreshold = SynapseConfig.ToEffectiveLimit(config.Security.HandshakeChallengeThreshold);
+        _effectiveMaximumSegments = config.Segment.MaximumSegments == SegmentConfig.DisabledMaximumSegments ? PacketReassembler.MaximumSegmentCount : config.Segment.MaximumSegments;
+
+        uint effectiveMaximumConcurrentAssemblies = SynapseConfig.ToEffectiveLimit(config.Segment.MaximumConcurrentAssembliesPerConnection);
+        _splitMessageLimit = (int)Math.Min(effectiveMaximumConcurrentAssemblies, SynapseConnection.SplitMessageTableLength);
+
+        /* The budget applies exactly where the byte allowance does. A client that sets no limits on its server therefore holds whatever a
+         * gap in a large reliable snapshot needs, as it always has. */
+        if (_isSecurityEnabled && config.Security.MaximumBytesPerSecond != SecurityConfig.DisabledMaximumBytesPerSecond)
+        {
+            _heldByteBudget = config.Security.MaximumBytesPerSecond;
+            _gapHeldByteBudget = _heldByteBudget + (ulong)_effectiveMaximumSegments * _effectiveMaximumTransmissionUnit;
+            _uncountedSplitMessageRefusalEnabled = effectiveMaximumConcurrentAssemblies > SynapseConnection.SplitMessageTableLength;
+        }
+        else
+        {
+            _heldByteBudget = UnlimitedHeldByteBudget;
+            _gapHeldByteBudget = UnlimitedHeldByteBudget;
+        }
 
         Span<byte> secret = stackalloc byte[32];
 
@@ -1002,6 +1065,14 @@ internal sealed partial class IngressEngine
         {
             case PacketType.Reliable:
             {
+                /* An out-of-order packet is held until its gap fills, so it has to fit the budget before it is acknowledged. One that
+                 * does not is dropped unacknowledged, and the sender resends it once the gap has drained. */
+                if (sequence != synapseConnection.NextExpectedSequence && IsOutOfOrderPacketPastBudget(synapseConnection, sequence, payloadLength))
+                {
+                    ReportHeldByteBudgetExceeded(fromEndPoint, synapseConnection, length);
+                    return;
+                }
+
                 byte[] payloadBuffer = TrackedArrayPool<byte>.Rent(payloadLength);
                 Buffer.BlockCopy(buffer, headerSize, payloadBuffer, 0, payloadLength);
 
@@ -1017,17 +1088,40 @@ internal sealed partial class IngressEngine
             {
                 if (_config.Segment.ReliableEnabled)
                 {
+                    PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
+                    int splitMessageIndex = synapseConnection.FindSplitMessage(segmentId);
+                    bool hasSplitMessageRoom = splitMessageIndex != SynapseConnection.UnsetSplitMessageIndex || synapseConnection.SplitMessageCount < _splitMessageLimit;
+
+                    // Held until its message completes, so a segment past the budget is dropped before it is stored; the sender resends it.
+                    if (IsReliableSegmentPastBudget(synapseConnection, payloadLength, isNextExpectedSequence: sequence == synapseConnection.NextExpectedSequence, hasSplitMessageRoom))
+                    {
+                        ReportHeldByteBudgetExceeded(fromEndPoint, synapseConnection, length);
+                        return;
+                    }
+
                     /* Read straight out of the receive buffer. TryReassemble copies each segment into the
                      * assembly's own storage anyway, so renting an intermediate buffer just to copy into it and
                      * immediately return it was a second copy and a pool round-trip per segment. */
-                    PacketReassembler reassembler = GetOrRentReassembler(synapseConnection);
+                    bool isAssembled = reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, new(buffer, headerSize, payloadLength), isReliable: true, nowTicks, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation, out bool isDuplicateSegment);
 
-                    if (reassembler.TryReassemble(segmentId, segmentIndex, segmentCount, new(buffer, headerSize, payloadLength), isReliable: true, nowTicks, out ArraySegment<byte> assembledPayload, out bool isProtocolViolation, out bool isDuplicateSegment))
+                    if (isAssembled)
                     {
+                        if (splitMessageIndex != SynapseConnection.UnsetSplitMessageIndex)
+                            synapseConnection.RemoveSplitMessage(splitMessageIndex);
+
                         EnqueueOrSendAck(synapseConnection, sequence);
                         DeliverOrdered(synapseConnection, sequence, assembledPayload, isReliable: true);
+
+                        return;
                     }
-                    else if (isDuplicateSegment || segmentIndex == segmentCount - 1)
+
+                    /* The reassembler stored a new segment of a well-formed message it had room for, so it is counted. A message it discards
+                     * for a contradicting segment keeps its entry until the entry expires: only a peer breaking the protocol sends one, and
+                     * the bytes still counted come out of that peer's own allowance. */
+                    if (!isDuplicateSegment && !isProtocolViolation && hasSplitMessageRoom && segmentIndex < segmentCount && segmentCount <= _effectiveMaximumSegments)
+                        synapseConnection.AddSplitMessageBytes(splitMessageIndex, segmentId, payloadLength, nowTicks);
+
+                    if (isDuplicateSegment || segmentIndex == segmentCount - 1)
                     {
                         /* Report what we hold, so the sender repairs the gap instead of resending the message.
                          *
@@ -1094,8 +1188,7 @@ internal sealed partial class IngressEngine
             return synapseConnection.Reassembler;
 
         PacketReassembler rented = ResettableObjectPool<PacketReassembler>.Rent();
-        uint effectiveMax = _config.Segment.MaximumSegments == 0 ? 255u : _config.Segment.MaximumSegments;
-        rented.Initialize(_effectiveMaximumTransmissionUnit, effectiveMax, _config.Segment.MaximumConcurrentAssembliesPerConnection);
+        rented.Initialize(_effectiveMaximumTransmissionUnit, _effectiveMaximumSegments, _config.Segment.MaximumConcurrentAssembliesPerConnection);
 
         PacketReassembler? existing = Interlocked.CompareExchange(ref synapseConnection.Reassembler, rented, null);
 
@@ -1106,6 +1199,58 @@ internal sealed partial class IngressEngine
         }
 
         return rented;
+    }
+
+    /// <summary>
+    /// True when an out-of-order reliable packet would be held past <see cref="_heldByteBudget"/>: it is ahead of the gap rather than a
+    /// resend of a packet already delivered, it is not held already, and its bytes would take the connection past the budget.
+    /// </summary>
+    /// <param name="synapseConnection">The connection the packet arrived on.</param>
+    /// <param name="sequence">The packet's sequence, which is not the next expected one.</param>
+    /// <param name="payloadLength">The packet's payload length.</param>
+    /// <returns>True when the packet must be dropped without being acknowledged.</returns>
+    private bool IsOutOfOrderPacketPastBudget(SynapseConnection synapseConnection, ushort sequence, int payloadLength)
+    {
+        // Behind the gap, it is a resend of a delivered packet, which is acknowledged again and never held.
+        if (unchecked((ushort)(sequence - synapseConnection.NextExpectedSequence)) >= SequenceHalfSpace)
+            return false;
+
+        // The exemption is read only past the budget. A packet already held lost its acknowledgement, which is sent again, and adds nothing.
+        return synapseConnection.HeldByteCount + (uint)payloadLength > _heldByteBudget
+            && !synapseConnection.IsRateLimitExempt
+            && !synapseConnection.ReorderBuffer.ContainsKey(sequence);
+    }
+
+    /// <summary>
+    /// True when a reliable segment would be held past the budget: its bytes would take what the connection holds waiting for a gap past
+    /// it, or it would open a message the reassembler can hold but <see cref="SynapseConnection.SplitMessages"/> has no room to count.
+    /// </summary>
+    /// <param name="synapseConnection">The connection the segment arrived on.</param>
+    /// <param name="payloadLength">The segment's payload length.</param>
+    /// <param name="isNextExpectedSequence">True for a segment of the message the gap waits on, held to <see cref="_gapHeldByteBudget"/>.</param>
+    /// <param name="hasSplitMessageRoom">True when the segment's message has an entry or there is room to open one.</param>
+    /// <returns>True when the segment must be dropped.</returns>
+    /// <remarks>Within the budget this costs one addition and one comparison; the exemption is read only past it.</remarks>
+    private bool IsReliableSegmentPastBudget(SynapseConnection synapseConnection, int payloadLength, bool isNextExpectedSequence, bool hasSplitMessageRoom)
+    {
+        ulong heldByteLimit = isNextExpectedSequence ? _gapHeldByteBudget : _heldByteBudget;
+        bool isPastBudget = synapseConnection.HeldByteCount + (uint)payloadLength > heldByteLimit || (!hasSplitMessageRoom && _uncountedSplitMessageRefusalEnabled);
+
+        return isPastBudget && !synapseConnection.IsRateLimitExempt;
+    }
+
+    /// <summary>
+    /// Reports a datagram dropped because it would take what its connection holds waiting for a gap past the budget, exactly as the
+    /// per-second rate limit reports one: counted in <see cref="Telemetry.PacketsDroppedIn"/> and raised as
+    /// <see cref="ViolationReason.RateLimitExceeded"/> with <see cref="ViolationAction.Drop"/> and no log entry, so it never kicks or bans.
+    /// </summary>
+    /// <param name="fromEndPoint">The sender.</param>
+    /// <param name="synapseConnection">The sender's connection.</param>
+    /// <param name="length">The whole datagram's length.</param>
+    private void ReportHeldByteBudgetExceeded(IPEndPoint fromEndPoint, SynapseConnection synapseConnection, int length)
+    {
+        _telemetry.OnSecurityDroppedReceived();
+        ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.RateLimitExceeded, length, logEntry: default, ViolationAction.Drop);
     }
 
     /// <summary>
@@ -1126,7 +1271,7 @@ internal sealed partial class IngressEngine
         {
             // Half-space comparison: if (sequence - NextExpectedSequence) wraps past the midpoint,
             // the sequence is "behind", a retransmit of an already-delivered packet. Discard it.
-            if (unchecked((ushort)(sequence - synapseConnection.NextExpectedSequence)) >= 32768)
+            if (unchecked((ushort)(sequence - synapseConnection.NextExpectedSequence)) >= SequenceHalfSpace)
             {
                 if (payload.Array is not null)
                     TrackedArrayPool<byte>.Return(payload.Array);
@@ -1146,7 +1291,9 @@ internal sealed partial class IngressEngine
                 return;
             }
 
-            if (!synapseConnection.ReorderBuffer.TryAdd(sequence, payload) && payload.Array is not null)
+            if (synapseConnection.ReorderBuffer.TryAdd(sequence, payload))
+                synapseConnection.ReorderBufferByteCount += (uint)payload.Count;
+            else if (payload.Array is not null)
                 TrackedArrayPool<byte>.Return(payload.Array);
 
             return;
@@ -1172,6 +1319,7 @@ internal sealed partial class IngressEngine
         do
         {
             synapseConnection.ReorderBuffer.Remove(synapseConnection.NextExpectedSequence);
+            synapseConnection.ReorderBufferByteCount -= (uint)nextPayload.Count;
             synapseConnection.NextExpectedSequence++;
             toDeliver.Add(nextPayload);
         }
