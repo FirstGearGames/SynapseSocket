@@ -14,6 +14,30 @@ public sealed partial class SynapseConnection
     /// the connection returns to its pool.
     /// </remarks>
     public bool IsRateLimitExempt { get; set; }
+    /// <summary>
+    /// The session token this side expects at the end of every disconnect, keep-alive, acknowledgement and segment acknowledgement from
+    /// the peer, unless <see cref="SessionTokenState"/> is <see cref="Connections.SessionTokenState.Unsupported"/>. It is random, chosen
+    /// when the connection is initialised, and opens the nonce of every handshake this side sends on the connection, so the peer learns
+    /// it whichever of those handshakes it answers.
+    /// </summary>
+    /// <remarks>
+    /// A reconnect that resets the session keeps it, because a handshake this side sent for the old session can still be in flight,
+    /// and a peer that accepts that one instead of the new one must still present a token this side accepts.
+    /// </remarks>
+    [PoolResettableMember]
+    internal uint LocalSessionToken;
+    /// <summary>
+    /// The session token this side ends its own control packets with while <see cref="SessionTokenState"/> is
+    /// <see cref="Connections.SessionTokenState.Supported"/>: the first bytes of the nonce in the peer's handshake that established the
+    /// session, which is the peer's <see cref="LocalSessionToken"/>.
+    /// </summary>
+    [PoolResettableMember]
+    internal uint RemoteSessionToken;
+    /// <summary>
+    /// Whether the peer takes part in session tokens, read from the handshake that established the session.
+    /// </summary>
+    [PoolResettableMember]
+    internal SessionTokenState SessionTokenState;
 
     /// <summary>
     /// Number of packets received by this connection since <see cref="_inboundRateCountersResetTick"/> was last set.

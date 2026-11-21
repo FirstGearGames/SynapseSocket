@@ -1,7 +1,9 @@
 using System;
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Net;
+using System.Security.Cryptography;
 using System.Threading;
 using CodeBoost.CodeAnalysis;
 using CodeBoost.Extensions;
@@ -207,6 +209,10 @@ public sealed partial class SynapseConnection : IPoolResettable
         ConnectionsIndex = connectionsIndex;
         State = ConnectionState.Pending;
 
+        Span<byte> sessionTokenBytes = stackalloc byte[PacketHeader.SessionTokenSize];
+        RandomNumberGenerator.Fill(sessionTokenBytes);
+        LocalSessionToken = BinaryPrimitives.ReadUInt32LittleEndian(sessionTokenBytes);
+
         long nowTicks = Clock.Ticks;
 
         HandshakeStartedTicks = nowTicks;
@@ -323,6 +329,9 @@ public sealed partial class SynapseConnection : IPoolResettable
 
         /* Security. */
         IsRateLimitExempt = false;
+        LocalSessionToken = 0;
+        RemoteSessionToken = 0;
+        SessionTokenState = SessionTokenState.Unknown;
         _inboundRateCountersResetTick = 0;
         _receivedByPacketCount = 0;
         _receivedByBytesCount = 0;

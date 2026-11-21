@@ -32,14 +32,6 @@ namespace SynapseSocket.Tests.Security;
 public sealed class SecuritySweepTests
 {
     /// <summary>
-    /// Skip reason for the findings whose fix is per-session authentication, which adds wire bytes.
-    /// </summary>
-    private const string HeldForSessionAuthentication = "Held for Ben: SYNCONN-1/2 need per-session authentication, which adds wire bytes.";
-    /// <summary>
-    /// Skip reason for the finding whose fix challenges handshakes below the connection cap, an extra round trip at connect.
-    /// </summary>
-    private const string HeldForHandshakeChallenge = "Held for Ben: SYNCONN-3 needs the handshake challenge below the cap, an extra round trip at connect.";
-    /// <summary>
     /// Skip reason for the findings whose fix is a new per-connection byte budget.
     /// </summary>
     private const string HeldForReorderBudget = "Held for Ben: SYNREL-1/2 need a new per-connection byte budget.";
@@ -51,13 +43,23 @@ public sealed class SecuritySweepTests
     /// The type byte of a datagram no Synapse packet uses.
     /// </summary>
     private const byte UnknownTypeByte = 0xFF;
+    /// <summary>
+    /// The bytes of session token a disconnect, keep-alive, acknowledgement or segment acknowledgement ends with between two peers that
+    /// both advertise session tokens: the first bytes of the handshake nonce the receiver sent. Pinned here rather than read from the
+    /// engine, so these tests describe the wire format independently of it.
+    /// </summary>
+    private const int SessionTokenSize = 4;
+    /// <summary>
+    /// The protocol version byte a handshake, a challenge or a proof ends with to advertise session tokens.
+    /// </summary>
+    private const byte SessionTokenVersion = 1;
 
     /// <summary>
     /// SYNCONN-1: a malformed or oversized datagram forged from a connected peer's address must not end that peer's session.
     /// </summary>
     /// <param name="typeByte">The forged datagram's leading byte.</param>
     /// <param name="length">The forged datagram's length.</param>
-    [Theory(Skip = HeldForSessionAuthentication)]
+    [Theory]
     [InlineData((int)UnknownTypeByte, 1)]
     [InlineData((int)PacketType.Reliable, 1)]
     [InlineData((int)PacketType.None, 1401)]
@@ -79,24 +81,31 @@ public sealed class SecuritySweepTests
     /// <summary>
     /// SYNCONN-1: a bare disconnect forged from a connected peer's address must not end that peer's session.
     /// </summary>
-    [Fact(Skip = HeldForSessionAuthentication)]
+    [Fact]
     public void SYNCONN1_ForgedDisconnect_DoesNotEndTheVictimsSession()
     {
         using ConnectedPair pair = new();
         SynapseConnection serverConnection = pair.ServerConnection;
+        long droppedBefore = pair.Server.Telemetry.PacketsDroppedIn;
 
         pair.Forge([(byte)PacketType.Disconnect]);
         TestHarness.PumpFor(300, pair.Server, pair.Client);
 
         AssertSessionIntact(pair, serverConnection, "one forged 1-byte disconnect");
+        Assert.True(pair.Server.Telemetry.PacketsDroppedIn == droppedBefore + 1, "the forged disconnect was not counted as a dropped datagram");
     }
 
     /// <summary>
     /// SYNCONN-1: a handshake forged from a connected peer's address, once the one second in which it would read as the peer's answer has
-    /// passed, must not reset that peer's session.
+    /// passed, must not reset that peer's session, whether it is shaped as a handshake or as a proof answering a challenge.
     /// </summary>
-    [Fact(Skip = HeldForSessionAuthentication)]
-    public void SYNCONN1_ForgedHandshake_DoesNotResetTheVictimsSession()
+    /// <param name="payloadLength">The forged handshake's payload length: a nonce or a challenge, with or without the version byte.</param>
+    [Theory]
+    [InlineData(PacketHeader.HandshakeNonceSize)]
+    [InlineData(PacketHeader.HandshakeNonceSize + 1)]
+    [InlineData(PacketHeader.HandshakeChallengeSize)]
+    [InlineData(PacketHeader.HandshakeChallengeSize + 1)]
+    public void SYNCONN1_ForgedHandshake_DoesNotResetTheVictimsSession(int payloadLength)
     {
         using ConnectedPair pair = new();
         SynapseConnection serverConnection = pair.ServerConnection;
@@ -104,10 +113,221 @@ public sealed class SecuritySweepTests
         // Past IngressEngine.HandshakeAnswerWindowTicks, the only guard on a reconnect.
         TestHarness.PumpFor(1200, pair.Server, pair.Client);
 
-        pair.Forge(BuildHandshake());
+        pair.Forge(BuildHandshake(payloadLength));
         TestHarness.PumpFor(300, pair.Server, pair.Client);
 
-        AssertSessionIntact(pair, serverConnection, "one forged 9-byte handshake with a random nonce");
+        AssertSessionIntact(pair, serverConnection, $"one forged handshake with a random [{payloadLength}]-byte payload");
+    }
+
+    /// <summary>
+    /// SYNCONN-1: keep-alives forged from the address of a peer that has gone silent must not hold its session open past the timeout.
+    /// </summary>
+    [Fact]
+    public void SYNCONN1_ForgedKeepAlives_DoNotHoldASilentPeersSessionOpen()
+    {
+        const uint TimeoutMilliseconds = 500;
+
+        using ConnectedPair pair = new(config => config.Connection.TimeoutMilliseconds = TimeoutMilliseconds);
+
+        // The victim is never polled again, so it sends nothing, while a keep-alive forged from its address arrives every 50 ms.
+        long deadlineMilliseconds = Environment.TickCount64 + TimeoutMilliseconds * 3;
+
+        while (pair.ServerEvents.ConnectionsClosed == 0 && Environment.TickCount64 < deadlineMilliseconds)
+        {
+            pair.Forge([(byte)PacketType.KeepAlive]);
+            TestHarness.PumpFor(50, pair.Server);
+        }
+
+        Assert.True(
+            pair.ServerEvents.ConnectionsClosed == 1,
+            $"keep-alives forged from a silent peer's address held its session open for [{TimeoutMilliseconds * 3}] ms against a [{TimeoutMilliseconds}] ms timeout");
+    }
+
+    /// <summary>
+    /// SYNCONN-1: a disconnect forged from the address an outbound connection is still waiting to hear from must not end the attempt.
+    /// </summary>
+    [Fact]
+    public void SYNCONN1_ForgedDisconnect_DoesNotEndAPendingConnection()
+    {
+        using Socket peer = TestHarness.CreateRawSocket();
+        using SynapseManager client = new(TestHarness.ClientConfig());
+
+        TestHarness.EventRecorder clientEvents = new();
+        clientEvents.Attach(client);
+        client.Start();
+
+        SynapseConnection pendingConnection = client.Connect((IPEndPoint)peer.LocalEndPoint!);
+
+        // The peer never answers the handshake, and a disconnect from its address arrives before any answer.
+        peer.SendTo([(byte)PacketType.Disconnect], client.BoundEndPoints[0]);
+        TestHarness.PumpFor(300, client);
+
+        Assert.True(
+            clientEvents.ConnectionsClosed == 0 && pendingConnection.State is ConnectionState.Pending,
+            $"one 1-byte disconnect ended a connection still waiting on its handshake: [{clientEvents.ConnectionsClosed}] closed, state [{pendingConnection.State}]");
+    }
+
+    /// <summary>
+    /// SYNCONN-1: every handshake an outbound connection sends opens with the same session token, so whichever one the peer answers, a
+    /// control packet the peer sends back carrying that token is accepted, and one carrying any other token is not.
+    /// </summary>
+    [Fact]
+    public void SYNCONN1_EveryHandshakeRetry_OpensWithTheSameSessionToken()
+    {
+        using Socket peer = TestHarness.CreateRawSocket();
+        using SynapseManager client = new(TestHarness.ClientConfig());
+
+        TestHarness.EventRecorder clientEvents = new();
+        clientEvents.Attach(client);
+        client.Start();
+
+        IPEndPoint clientEndPoint = client.BoundEndPoints[0];
+        SynapseConnection connection = client.Connect((IPEndPoint)peer.LocalEndPoint!);
+        byte[] receiveBuffer = new byte[64];
+
+        // The handshake Connect sends, and the retry the peer's silence draws 300 ms later.
+        Assert.True(TryReceiveWhilePumping(peer, receiveBuffer, client, PacketType.Handshake, out int firstLength), "the client sent no handshake");
+        byte[] firstHandshake = receiveBuffer.AsSpan(0, firstLength).ToArray();
+        Assert.True(TryReceiveWhilePumping(peer, receiveBuffer, client, PacketType.Handshake, out int retryLength), "the client never retried its handshake");
+        byte[] retryHandshake = receiveBuffer.AsSpan(0, retryLength).ToArray();
+
+        int versionedLength = PacketHeader.TypeSize + PacketHeader.HandshakeNonceSize + 1;
+
+        Assert.True(
+            firstLength == versionedLength && retryLength == versionedLength && firstHandshake[^1] == SessionTokenVersion && retryHandshake[^1] == SessionTokenVersion,
+            $"the handshakes were [{firstLength}] and [{retryLength}] bytes, not a nonce followed by the session token version");
+        Assert.True(
+            firstHandshake.AsSpan(1, SessionTokenSize).SequenceEqual(retryHandshake.AsSpan(1, SessionTokenSize)),
+            "a handshake retry opened with a different session token than the handshake it repeats");
+        Assert.False(
+            firstHandshake.AsSpan(1, PacketHeader.HandshakeNonceSize).SequenceEqual(retryHandshake.AsSpan(1, PacketHeader.HandshakeNonceSize)),
+            "a handshake retry repeated the whole nonce, which the peer's replay cache refuses");
+
+        // The peer answers, advertising session tokens, and then disconnects: first with a wrong token, then with the one the client sent.
+        peer.SendTo(BuildHandshake(PacketHeader.HandshakeNonceSize + 1), clientEndPoint);
+        Assert.True(TestHarness.PumpUntil(() => connection.State is ConnectionState.Connected, 2000, client), "the peer's answer did not connect the client");
+
+        byte[] wrongTokenDisconnect = BuildTokenedPacket([(byte)PacketType.Disconnect], firstHandshake.AsSpan(1, SessionTokenSize));
+        wrongTokenDisconnect[1] ^= 0xFF;
+        peer.SendTo(wrongTokenDisconnect, clientEndPoint);
+        TestHarness.PumpFor(100, client);
+
+        Assert.True(clientEvents.ConnectionsClosed == 0, "a disconnect carrying a wrong session token ended the connection");
+
+        peer.SendTo(BuildTokenedPacket([(byte)PacketType.Disconnect], firstHandshake.AsSpan(1, SessionTokenSize)), clientEndPoint);
+
+        Assert.True(TestHarness.PumpUntil(() => clientEvents.ConnectionsClosed == 1, 2000, client), "a disconnect carrying the session token of the first handshake was refused");
+    }
+
+    /// <summary>
+    /// SYNCONN-1: a control packet carries the session token only between two peers that both advertise it. A peer whose handshake
+    /// advertises it is sent the token, the first bytes of its own nonce, and a keep-alive from it without the token is refused; a peer
+    /// whose handshake predates session tokens is sent none and needs none, exactly as before.
+    /// </summary>
+    /// <param name="isPeerAdvertising">True when the peer's handshake ends in the session token version.</param>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void SYNCONN1_ControlPackets_CarryTheSessionTokenOnlyToAPeerThatAdvertisesIt(bool isPeerAdvertising)
+    {
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port));
+        server.Start();
+
+        IPEndPoint target = new(IPAddress.Loopback, port);
+        using Socket peer = TestHarness.CreateRawSocket();
+        byte[] receiveBuffer = new byte[64];
+        byte[] handshake = BuildHandshake(isPeerAdvertising ? PacketHeader.HandshakeNonceSize + 1 : PacketHeader.HandshakeNonceSize);
+
+        peer.SendTo(handshake, target);
+
+        Assert.True(TryReceiveWhilePumping(peer, receiveBuffer, server, PacketType.Handshake, out int replyLength), "the server never answered the handshake");
+        Assert.True(
+            replyLength == PacketHeader.TypeSize + PacketHeader.HandshakeNonceSize + 1 && receiveBuffer[replyLength - 1] == SessionTokenVersion,
+            $"the server's [{replyLength}]-byte answer does not advertise session tokens");
+
+        SynapseConnection serverConnection = server.Connections.Connections[0];
+
+        // A keep-alive without the token, sent once the poll clock has moved on so a refresh would show.
+        long receivedTicksBefore = serverConnection.LastReceivedTicks;
+        TestHarness.PumpFor(50, server);
+        peer.SendTo([(byte)PacketType.KeepAlive], target);
+        TestHarness.PumpFor(50, server);
+
+        bool isKeepAliveAccepted = serverConnection.LastReceivedTicks != receivedTicksBefore;
+
+        Assert.True(
+            isKeepAliveAccepted != isPeerAdvertising,
+            $"a keep-alive without the session token was [{(isKeepAliveAccepted ? "accepted" : "refused")}] from a peer that [{(isPeerAdvertising ? "advertised" : "never advertised")}] session tokens");
+
+        // The server's own disconnect carries the first bytes of the peer's nonce only to a peer that advertised session tokens.
+        server.Disconnect(serverConnection);
+
+        Assert.True(TryReceiveWhilePumping(peer, receiveBuffer, server, PacketType.Disconnect, out int disconnectLength), "the server's disconnect never arrived");
+
+        if (isPeerAdvertising)
+        {
+            Assert.True(
+                disconnectLength == PacketHeader.TypeSize + SessionTokenSize && receiveBuffer.AsSpan(1, SessionTokenSize).SequenceEqual(handshake.AsSpan(1, SessionTokenSize)),
+                $"the server's [{disconnectLength}]-byte disconnect does not end in the session token the peer's handshake opened with");
+        }
+        else
+        {
+            Assert.Equal(PacketHeader.TypeSize, disconnectLength);
+        }
+    }
+
+    /// <summary>
+    /// SYNCONN-1: a handshake from a connected peer, such as one that restarted, is answered with a challenge rather than resetting the
+    /// session; the proof that comes back starts the new session, which keeps the server's session token and adopts the peer's new one.
+    /// </summary>
+    [Fact]
+    public void SYNCONN1_HandshakeFromAConnectedPeer_IsChallengedAndItsProofStartsANewSession()
+    {
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port));
+
+        TestHarness.EventRecorder serverEvents = new();
+        serverEvents.Attach(server);
+        server.Start();
+
+        IPEndPoint target = new(IPAddress.Loopback, port);
+        using Socket peer = TestHarness.CreateRawSocket();
+        byte[] receiveBuffer = new byte[64];
+
+        peer.SendTo(BuildHandshake(PacketHeader.HandshakeNonceSize + 1), target);
+        Assert.True(TryReceiveWhilePumping(peer, receiveBuffer, server, PacketType.Handshake, out int firstAnswerLength), "the server never answered the first handshake");
+        byte[] firstAnswer = receiveBuffer.AsSpan(0, firstAnswerLength).ToArray();
+
+        // Past IngressEngine.HandshakeAnswerWindowTicks, the peer restarts and handshakes again from the same address with a new nonce.
+        TestHarness.PumpFor(1200, server);
+
+        byte[] secondHandshake = BuildHandshake(PacketHeader.HandshakeNonceSize + 1);
+        peer.SendTo(secondHandshake, target);
+
+        Assert.True(TryReceiveWhilePumping(peer, receiveBuffer, server, PacketType.Handshake, out int challengeLength), "the server never answered the second handshake");
+        Assert.True(
+            challengeLength == PacketHeader.TypeSize + PacketHeader.HandshakeChallengeSize + 1 && serverEvents.ConnectionsClosed == 0,
+            $"the second handshake drew a [{challengeLength}]-byte answer and [{serverEvents.ConnectionsClosed}] closed sessions, not a challenge");
+
+        // The proof: the challenge echoed back verbatim, as the restarted peer's pending connection does.
+        peer.SendTo(receiveBuffer.AsSpan(0, challengeLength).ToArray(), target);
+
+        Assert.True(TryReceiveWhilePumping(peer, receiveBuffer, server, PacketType.Handshake, out int secondAnswerLength), "the proof drew no handshake");
+        Assert.True(
+            serverEvents.ConnectionsClosed == 1 && serverEvents.ConnectionsEstablished == 2,
+            $"the proof left [{serverEvents.ConnectionsClosed}] closed and [{serverEvents.ConnectionsEstablished}] established sessions rather than replacing the first");
+        Assert.True(
+            secondAnswerLength == firstAnswerLength && receiveBuffer.AsSpan(1, SessionTokenSize).SequenceEqual(firstAnswer.AsSpan(1, SessionTokenSize)),
+            "the new session's handshake opened with a different session token than the first, so a peer holding the first answer would be refused");
+
+        // The new session presents the restarted peer's new token.
+        server.Disconnect(server.Connections.Connections[0]);
+
+        Assert.True(TryReceiveWhilePumping(peer, receiveBuffer, server, PacketType.Disconnect, out int disconnectLength), "the server's disconnect never arrived");
+        Assert.True(
+            disconnectLength == PacketHeader.TypeSize + SessionTokenSize && receiveBuffer.AsSpan(1, SessionTokenSize).SequenceEqual(secondHandshake.AsSpan(1, SessionTokenSize)),
+            "the new session's disconnect does not carry the session token of the handshake that started it");
     }
 
     /// <summary>
@@ -117,7 +337,7 @@ public sealed class SecuritySweepTests
     /// Every forged datagram here lands on a live session, so each one is a strike. A strike from a sender with no connection is
     /// SYNCONN-4, which <see cref="SYNCONN4_ForgedDatagramsAfterAKick_DoNotBanTheVictim"/> covers.
     /// </remarks>
-    [Fact(Skip = HeldForSessionAuthentication)]
+    [Fact]
     public void SYNCONN1_ForgedDatagrams_DoNotBanAVictimThatReconnects()
     {
         using ConnectedPair pair = new();
@@ -138,7 +358,7 @@ public sealed class SecuritySweepTests
     /// <summary>
     /// SYNCONN-2: an acknowledgement forged from a peer's address must not release a reliable message the peer never received.
     /// </summary>
-    [Fact(Skip = HeldForSessionAuthentication)]
+    [Fact]
     public void SYNCONN2_ForgedAck_DoesNotLoseAReliableMessage()
     {
         using ConnectedPair pair = new();
@@ -166,16 +386,60 @@ public sealed class SecuritySweepTests
     }
 
     /// <summary>
-    /// SYNCONN-3: sources that never answer a handshake reply must not fill a server whose connection cap is below
+    /// SYNCONN-2: a segment acknowledgement forged from a peer's address, claiming every segment, must not release a reliable segmented
+    /// message the peer never received.
+    /// </summary>
+    [Fact]
+    public void SYNCONN2_ForgedSegmentAck_DoesNotLoseAReliableMessage()
+    {
+        using ConnectedPair pair = new();
+        SynapseConnection serverConnection = pair.ServerConnection;
+
+        byte[]? receivedPayload = null;
+        pair.Client.PacketReceived += packetReceivedEventArgs => receivedPayload = packetReceivedEventArgs.Payload.ToArray();
+
+        // Every segment of the reliable message is lost on its first send.
+        LatencySimulatorConfig latencySimulatorConfig = pair.Server.Config.LatencySimulator;
+        latencySimulatorConfig.PacketLossChance = 1.0;
+        latencySimulatorConfig.Enabled = true;
+
+        byte[] payload = new byte[pair.Server.MaximumPayloadSize * 2];
+        RandomNumberGenerator.Fill(payload);
+        pair.Server.Send(serverConnection, new(payload), isReliable: true);
+
+        // One forged segment acknowledgement for sequence 0 whose bitmap claims every segment index.
+        byte[] forgedSegmentAck = new byte[PacketHeader.ComputeHeaderSize(PacketType.SegmentAck) + PacketHeader.SegmentAckBitmapSize];
+        PacketHeader.Write(forgedSegmentAck, PacketType.SegmentAck, sequence: 0, segmentId: 0, segmentIndex: 0, segmentCount: 0);
+        forgedSegmentAck.AsSpan(PacketHeader.ComputeHeaderSize(PacketType.SegmentAck)).Fill(0xFF);
+
+        pair.Forge(forgedSegmentAck);
+        TestHarness.PumpFor(100, pair.Server);
+
+        latencySimulatorConfig.Enabled = false;
+
+        Assert.True(
+            TestHarness.PumpUntil(() => receivedPayload is not null && receivedPayload.AsSpan().SequenceEqual(payload), 3000, pair.Server, pair.Client),
+            "a forged segment acknowledgement released a reliable message the victim never received, and it was never resent");
+    }
+
+    /// <summary>
+    /// SYNCONN-3: sources that never answer a handshake reply must not fill a server whose connection cap is at or below
     /// <see cref="SecurityConfig.HandshakeChallengeThreshold"/>, which is every capped game server at the default 1024.
     /// </summary>
-    [Fact(Skip = HeldForHandshakeChallenge)]
-    public void SYNCONN3_SpoofedHandshakes_DoNotLockARealClientOutOfACappedServer()
+    /// <param name="handshakeChallengeThreshold">The server's threshold: the default, or the cap itself, where the gate engages only once the server is full.</param>
+    [Theory]
+    [InlineData(1024u)]
+    [InlineData(8u)]
+    public void SYNCONN3_SpoofedHandshakes_DoNotLockARealClientOutOfACappedServer(uint handshakeChallengeThreshold)
     {
         const uint ConnectionCap = 8;
 
         int port = TestHarness.GetFreePort();
-        using SynapseManager server = new(TestHarness.ServerConfig(port, config => config.MaximumConcurrentConnections = ConnectionCap));
+        using SynapseManager server = new(TestHarness.ServerConfig(port, config =>
+        {
+            config.MaximumConcurrentConnections = ConnectionCap;
+            config.Security.HandshakeChallengeThreshold = handshakeChallengeThreshold;
+        }));
         server.Start();
 
         IPEndPoint target = new(IPAddress.Loopback, port);
@@ -207,6 +471,50 @@ public sealed class SecuritySweepTests
             foreach (Socket spoofedSource in spoofedSources)
                 spoofedSource.Dispose();
         }
+    }
+
+    /// <summary>
+    /// SYNCONN-3: under a connection cap at or below <see cref="SecurityConfig.HandshakeChallengeThreshold"/> every handshake is
+    /// challenged, and the challenge carries the protocol version only when the handshake did, because a peer that predates session
+    /// tokens reads a challenge by its exact length. The challenge echoed back connects either peer, and the session takes part in
+    /// session tokens only when the peer advertised them.
+    /// </summary>
+    /// <param name="isPeerAdvertising">True when the peer's handshake ends in the session token version.</param>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void SYNCONN3_CappedServer_ChallengesEveryHandshakeInTheFormThePeerReads(bool isPeerAdvertising)
+    {
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port, config => config.MaximumConcurrentConnections = 8));
+        server.Start();
+
+        IPEndPoint target = new(IPAddress.Loopback, port);
+        using Socket peer = TestHarness.CreateRawSocket();
+        byte[] receiveBuffer = new byte[64];
+        byte[] handshake = BuildHandshake(isPeerAdvertising ? PacketHeader.HandshakeNonceSize + 1 : PacketHeader.HandshakeNonceSize);
+
+        peer.SendTo(handshake, target);
+
+        Assert.True(TryReceiveWhilePumping(peer, receiveBuffer, server, PacketType.Handshake, out int challengeLength), "the server never answered the handshake");
+
+        int expectedChallengeLength = PacketHeader.TypeSize + PacketHeader.HandshakeChallengeSize + (isPeerAdvertising ? 1 : 0);
+
+        Assert.True(
+            challengeLength == expectedChallengeLength && server.Connections.Count == 0,
+            $"a [{handshake.Length}]-byte handshake drew a [{challengeLength}]-byte answer and [{server.Connections.Count}] connections, not a [{expectedChallengeLength}]-byte challenge");
+
+        // The challenge echoed back verbatim, as a pending engine does, is the proof that connects the peer.
+        peer.SendTo(receiveBuffer.AsSpan(0, challengeLength).ToArray(), target);
+
+        Assert.True(TryReceiveWhilePumping(peer, receiveBuffer, server, PacketType.Handshake, out _), "the proof drew no handshake");
+        Assert.Equal(1, server.Connections.Count);
+
+        // The stateless challenge recalls whether the peer advertised session tokens only through the version byte it carried back.
+        server.Disconnect(server.Connections.Connections[0]);
+
+        Assert.True(TryReceiveWhilePumping(peer, receiveBuffer, server, PacketType.Disconnect, out int disconnectLength), "the server's disconnect never arrived");
+        Assert.Equal(isPeerAdvertising ? PacketHeader.TypeSize + SessionTokenSize : PacketHeader.TypeSize, disconnectLength);
     }
 
     /// <summary>
@@ -261,25 +569,38 @@ public sealed class SecuritySweepTests
     }
 
     /// <summary>
-    /// SYNCONN-4: a run of datagrams forged from a connected peer's address must not ban that peer. The first ends its session, which is
-    /// SYNCONN-1; every later one finds no connection and must count toward nothing.
+    /// SYNCONN-4: a run of datagrams forged from the address of a connected peer that predates session tokens must not ban that peer.
+    /// The first still ends its session, as it always has for such a peer; every later one finds no connection and must count toward
+    /// nothing.
     /// </summary>
     [Fact]
     public void SYNCONN4_ForgedDatagramsAfterAKick_DoNotBanTheVictim()
     {
-        using ConnectedPair pair = new();
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port));
+
+        TestHarness.EventRecorder serverEvents = new();
+        serverEvents.Attach(server);
+        server.Start();
+
+        IPEndPoint target = new(IPAddress.Loopback, port);
+        using Socket victim = TestHarness.CreateRawSocket();
+
+        // A handshake without the session token version, so the first forged datagram still ends the session.
+        victim.SendTo(BuildHandshake(), target);
+        Assert.True(TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 1, 2000, server), "the victim never connected");
 
         // ViolationsBeforeBlacklist (5) forged datagrams, back to back from the victim's address.
-        for (int i = 0; i < pair.Server.Config.Security.ViolationsBeforeBlacklist; i++)
-            pair.Forge([UnknownTypeByte]);
+        for (int i = 0; i < server.Config.Security.ViolationsBeforeBlacklist; i++)
+            victim.SendTo([UnknownTypeByte], target);
 
-        TestHarness.PumpFor(300, pair.Server, pair.Client);
+        TestHarness.PumpFor(300, server);
 
-        pair.Reconnect();
+        victim.SendTo(BuildHandshake(), target);
 
         Assert.True(
-            pair.ClientConnection.State is ConnectionState.Connected && !pair.ServerEvents.FailureReasons.Contains(ConnectionRejectedReason.Blacklisted),
-            $"five forged datagrams banned the victim for BlacklistDurationMilliseconds; its reconnect is [{pair.ClientConnection.State}], refusals [{string.Join(", ", pair.ServerEvents.FailureReasons)}]");
+            TestHarness.PumpUntil(() => serverEvents.ConnectionsEstablished == 2, 2000, server) && serverEvents.ConnectionsClosed == 1,
+            $"five forged datagrams banned the victim for BlacklistDurationMilliseconds; [{serverEvents.ConnectionsClosed}] closed, [{serverEvents.ConnectionsEstablished}] established, refusals [{string.Join(", ", serverEvents.FailureReasons)}]");
     }
 
     /// <summary>
@@ -440,14 +761,34 @@ public sealed class SecuritySweepTests
     }
 
     /// <summary>
-    /// Builds a wire-format handshake datagram: the type byte and the 8-byte nonce the protocol expects.
+    /// Builds a wire-format handshake datagram: the type byte and a random payload, by default the 8-byte nonce of a peer that predates
+    /// session tokens. A payload one byte longer than a nonce or a challenge ends in the session token version instead of a random byte.
     /// </summary>
+    /// <param name="payloadLength">The payload's length.</param>
     /// <returns>The datagram.</returns>
-    private static byte[] BuildHandshake()
+    private static byte[] BuildHandshake(int payloadLength = PacketHeader.HandshakeNonceSize)
     {
-        byte[] datagram = new byte[PacketHeader.TypeSize + PacketHeader.HandshakeNonceSize];
+        byte[] datagram = new byte[PacketHeader.TypeSize + payloadLength];
         datagram[0] = (byte)PacketType.Handshake;
         RandomNumberGenerator.Fill(datagram.AsSpan(PacketHeader.TypeSize));
+
+        if (payloadLength is PacketHeader.HandshakeNonceSize + 1 or PacketHeader.HandshakeChallengeSize + 1)
+            datagram[^1] = SessionTokenVersion;
+
+        return datagram;
+    }
+
+    /// <summary>
+    /// Builds a control packet followed by a session token.
+    /// </summary>
+    /// <param name="packet">The packet without its token.</param>
+    /// <param name="sessionToken">The token to append.</param>
+    /// <returns>The datagram.</returns>
+    private static byte[] BuildTokenedPacket(byte[] packet, ReadOnlySpan<byte> sessionToken)
+    {
+        byte[] datagram = new byte[packet.Length + SessionTokenSize];
+        packet.CopyTo(datagram, 0);
+        sessionToken[..SessionTokenSize].CopyTo(datagram.AsSpan(packet.Length));
 
         return datagram;
     }
@@ -498,6 +839,38 @@ public sealed class SecuritySweepTests
         while (TryReceive(socket, buffer, out _))
         {
         }
+    }
+
+    /// <summary>
+    /// Polls <paramref name="engine"/> until a datagram of <paramref name="packetType"/> arrives on <paramref name="socket"/>, discarding
+    /// any other, for up to two seconds.
+    /// </summary>
+    /// <param name="socket">The socket to read.</param>
+    /// <param name="buffer">Receives the datagram.</param>
+    /// <param name="engine">The engine to poll while waiting.</param>
+    /// <param name="packetType">The type of datagram awaited.</param>
+    /// <param name="receivedLength">The datagram's length.</param>
+    /// <returns>False when none arrived in time.</returns>
+    private static bool TryReceiveWhilePumping(Socket socket, byte[] buffer, SynapseManager engine, PacketType packetType, out int receivedLength)
+    {
+        long deadlineMilliseconds = Environment.TickCount64 + 2000;
+
+        while (Environment.TickCount64 < deadlineMilliseconds)
+        {
+            engine.Poll();
+
+            while (TryReceive(socket, buffer, out receivedLength))
+            {
+                if (receivedLength > 0 && buffer[0] == (byte)packetType)
+                    return true;
+            }
+
+            Thread.Sleep(1);
+        }
+
+        receivedLength = 0;
+
+        return false;
     }
 
     /// <summary>
@@ -563,11 +936,12 @@ public sealed class SecuritySweepTests
         /// <summary>
         /// Starts both engines and connects the victim.
         /// </summary>
-        public ConnectedPair()
+        /// <param name="tweakServerConfig">Adjusts the server's configuration before it starts, or null to keep the defaults.</param>
+        public ConnectedPair(Action<SynapseConfig>? tweakServerConfig = null)
         {
             int port = TestHarness.GetFreePort();
 
-            Server = new(TestHarness.ServerConfig(port));
+            Server = new(TestHarness.ServerConfig(port, tweakServerConfig));
             Client = new(TestHarness.ClientConfig());
             ServerEvents.Attach(Server);
 

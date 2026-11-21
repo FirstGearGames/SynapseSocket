@@ -201,21 +201,41 @@ internal sealed partial class IngressEngine
     }
 
     /// <summary>
-    /// Answers an unknown endpoint's handshake with a return-routability challenge: its own nonce echoed back,
-    /// followed by a token bound to its address and the current time bucket. Nothing is allocated for the peer:
-    /// the token is stateless, so a source that cannot receive at the address it claimed simply never returns.
+    /// Answers a handshake from an unknown endpoint, or from a connected peer that takes part in session tokens, with a
+    /// return-routability challenge: its own nonce echoed back, followed by a token bound to its address and the current time
+    /// bucket, and by the handshake's protocol version when it carried one. Nothing is allocated for the peer: the token is
+    /// stateless, so a source that cannot receive at the address it claimed simply never returns.
     /// </summary>
     /// <param name="fromEndPoint">Endpoint being challenged.</param>
     /// <param name="incomingPayload">The handshake payload received, whose leading nonce is echoed.</param>
+    /// <remarks>
+    /// The version goes back only to a peer whose handshake carried it. A peer that predates it reads a challenge by its exact length
+    /// and would take a longer one for a handshake. The version coming back in the proof is how the stateless challenge remembers
+    /// that the peer advertised session tokens.
+    /// </remarks>
     private void SendHandshakeChallenge(IPEndPoint fromEndPoint, ReadOnlySpan<byte> incomingPayload)
     {
-        Span<byte> challenge = stackalloc byte[PacketHeader.HandshakeChallengeSize];
+        Span<byte> challenge = stackalloc byte[PacketHeader.HandshakeChallengeSize + PacketHeader.HandshakeVersionSize];
+        int challengeLength = PacketHeader.HandshakeChallengeSize;
 
         incomingPayload[..PacketHeader.HandshakeNonceSize].CopyTo(challenge);
-        ComputeHandshakeToken(fromEndPoint, Clock.Ticks / NatTokenTimeBucketTicks, challenge[PacketHeader.HandshakeNonceSize..]);
+        ComputeHandshakeToken(fromEndPoint, Clock.Ticks / NatTokenTimeBucketTicks, challenge[PacketHeader.HandshakeNonceSize..PacketHeader.HandshakeChallengeSize]);
 
-        _sender.SendHandshakePayload(fromEndPoint, challenge);
+        if (PacketHeader.IsSessionTokenAdvertised(incomingPayload))
+            challenge[challengeLength++] = incomingPayload[incomingPayload.Length - 1];
+
+        _sender.SendHandshakePayload(fromEndPoint, challenge[..challengeLength]);
     }
+
+    /// <summary>
+    /// Returns true when a handshake payload the size of a challenge, with or without its version, is the proof answering a challenge
+    /// this engine sent <paramref name="endPoint"/>: the token after the echoed nonce verifies.
+    /// </summary>
+    /// <param name="endPoint">The endpoint the proof arrived from.</param>
+    /// <param name="handshakePayload">The handshake payload, at least <see cref="PacketHeader.HandshakeChallengeSize"/> bytes.</param>
+    /// <returns>True when the token is one this engine issued to <paramref name="endPoint"/>.</returns>
+    private bool VerifyHandshakeProof(IPEndPoint endPoint, ReadOnlySpan<byte> handshakePayload)
+        => VerifyEndpointToken(_handshakeChallengeHmac, endPoint, handshakePayload[PacketHeader.HandshakeNonceSize..PacketHeader.HandshakeChallengeSize]);
 
     /// <summary>
     /// Computes the handshake return-routability token for <paramref name="endPoint"/> and <paramref name="timeBucket"/>.

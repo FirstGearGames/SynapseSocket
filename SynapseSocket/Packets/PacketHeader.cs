@@ -12,6 +12,7 @@ namespace SynapseSocket.Packets;
 ///   [5]      : Segment Index (Byte), only for <see cref="PacketType.Segmented"/> and <see cref="PacketType.ReliableSegmented"/>
 ///   [6]      : Segment Count (Byte), only for <see cref="PacketType.Segmented"/> and <see cref="PacketType.ReliableSegmented"/>
 ///   [...]    : Payload
+///   [last 4] : Session token, only for <see cref="PacketType.Disconnect"/>, <see cref="PacketType.KeepAlive"/>, <see cref="PacketType.Ack"/> and <see cref="PacketType.SegmentAck"/> between peers that both advertise <see cref="SessionTokenVersion"/>
 /// Explicit little-endian ordering is used for cross-platform consistency.
 /// </summary>
 public static class PacketHeader
@@ -52,7 +53,9 @@ public static class PacketHeader
     public const int SegmentAckBitmapSize = 32;
 
     /// <summary>
-    /// Payload bytes carried by an ordinary <see cref="PacketType.Handshake"/>: a random nonce.
+    /// Payload bytes carried by an ordinary <see cref="PacketType.Handshake"/>: a nonce, followed by the protocol version. The nonce
+    /// opens with the sender's session token for the connection, the same in every handshake it sends on that connection, and ends
+    /// in random bytes, so each handshake is still a fresh replay key.
     /// </summary>
     public const int HandshakeNonceSize = 8;
 
@@ -67,6 +70,30 @@ public static class PacketHeader
     /// </para>
     /// </summary>
     public const int HandshakeChallengeSize = HandshakeNonceSize + 8;
+
+    /// <summary>
+    /// Size in bytes of the protocol version a handshake, a challenge or a proof ends with, after its nonce or its token.
+    /// <para>
+    /// A peer that predates the version sends none and ignores one it receives, because it reads only the leading nonce. It tells a
+    /// challenge from a handshake by the exact length of a challenge without one, though, and would read a challenge carrying the version
+    /// as a handshake. So a handshake always carries the version, and a challenge carries it only when the handshake it answers did.
+    /// </para>
+    /// </summary>
+    public const int HandshakeVersionSize = 1;
+
+    /// <summary>
+    /// The protocol version this engine ends its handshakes with. Version 1 and later carry session tokens: a peer whose handshake
+    /// carries one of them ends every <see cref="PacketType.Disconnect"/>, <see cref="PacketType.KeepAlive"/>, <see cref="PacketType.Ack"/>
+    /// and <see cref="PacketType.SegmentAck"/> it sends with the session token, when the handshake it accepted from its peer did too.
+    /// </summary>
+    public const byte SessionTokenVersion = 1;
+
+    /// <summary>
+    /// Size in bytes of the session token a control packet ends with between two peers that both advertise
+    /// <see cref="SessionTokenVersion"/>: the first bytes of the handshake nonce the packet's receiver sent, which only the real peer
+    /// received. A source address can be forged, but a sender off the path never sees the token.
+    /// </summary>
+    public const int SessionTokenSize = 4;
 
     /// <summary>
     /// Computes the header size for a given packet type.
@@ -176,4 +203,13 @@ public static class PacketHeader
         headerSize = offset;
         return true;
     }
+
+    /// <summary>
+    /// Returns true when a handshake, challenge or proof payload ends in a protocol version that carries session tokens.
+    /// </summary>
+    /// <param name="payload">The handshake payload, after the type byte.</param>
+    /// <returns>True when the sender advertises session tokens.</returns>
+    internal static bool IsSessionTokenAdvertised(ReadOnlySpan<byte> payload) =>
+        payload.Length is HandshakeNonceSize + HandshakeVersionSize or HandshakeChallengeSize + HandshakeVersionSize
+        && payload[payload.Length - 1] >= SessionTokenVersion;
 }
