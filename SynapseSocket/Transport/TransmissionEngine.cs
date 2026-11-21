@@ -253,8 +253,10 @@ public sealed partial class TransmissionEngine
     /// <returns>Whether the packet was sent, queued, or dropped. A dropped packet never took a sequence number.</returns>
     internal SendResult SendReliableUnsegmented(SynapseConnection synapseConnection, ArraySegment<byte> payload)
     {
+        /* Refused with a result rather than an exception: a peer that stops acknowledging fills the backlog, and an exception would then
+         * be thrown, allocated and usually logged on every reliable send to it until the retry limit drops it. */
         if (synapseConnection.PendingReliableQueue.Count >= _config.Reliable.MaximumPending)
-            throw new InvalidOperationException("Reliable backpressure limit reached.");
+            return SendResult.Dropped;
 
         const PacketType Type = PacketType.Reliable;
         int totalLength = PacketHeader.ComputeHeaderSize(Type) + payload.Count;
@@ -310,8 +312,9 @@ public sealed partial class TransmissionEngine
     /// <returns>Whether every segment was sent, at least one was queued, or the whole payload was dropped.</returns>
     internal SendResult SendSegmented(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable, PacketSplitter splitter)
     {
+        // Refused with a result rather than an exception, as in SendReliableUnsegmented.
         if (isReliable && synapseConnection.PendingReliableQueue.Count >= _config.Reliable.MaximumPending)
-            throw new InvalidOperationException("Reliable backpressure limit reached.");
+            return SendResult.Dropped;
 
         // One last-sent stamp covers the whole burst rather than routing each segment through SendToConnection.
         // The segments leave back to back, so a per-segment clock read would buy nothing on a send of up to 255 of them.

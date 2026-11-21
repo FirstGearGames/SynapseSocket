@@ -5,6 +5,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using SynapseSocket.Connections;
 using SynapseSocket.Core;
+using SynapseSocket.Core.Configuration;
 using SynapseSocket.Core.Events;
 using SynapseSocket.Packets;
 using SynapseSocket.Security;
@@ -103,6 +104,45 @@ public sealed class SecuritySweepTests
         Assert.True(
             pair.ClientConnection.State is ConnectionState.Connected && !pair.ServerEvents.FailureReasons.Contains(ConnectionRejectedReason.Blacklisted),
             $"five forged datagrams banned the victim for BlacklistDurationMilliseconds; its reconnect is [{pair.ClientConnection.State}], refusals [{string.Join(", ", pair.ServerEvents.FailureReasons)}]");
+    }
+
+    /// <summary>
+    /// SYNREL-4: a reliable send past <see cref="ReliableConfig.MaximumPending"/> unacknowledged messages is refused with
+    /// <see cref="SendResult.Dropped"/>, without the exception that a peer which never acknowledges could otherwise draw on every send.
+    /// </summary>
+    [Fact]
+    public void SYNREL4_FullReliableBacklog_DropsTheSendWithoutThrowingOrAllocating()
+    {
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port));
+        server.Start();
+
+        IPEndPoint target = new(IPAddress.Loopback, port);
+
+        // A peer that connects and then acknowledges nothing.
+        using Socket silentPeer = TestHarness.CreateRawSocket();
+        silentPeer.SendTo(BuildHandshake(), target);
+        Assert.True(TestHarness.PumpUntil(() => server.Connections.Count == 1, 2000, server), "the peer never connected");
+
+        SynapseConnection peerConnection = server.Connections.Connections[0];
+        ArraySegment<byte> payload = new(new byte[8]);
+        ArraySegment<byte> segmentedPayload = new(new byte[server.MaximumPayloadSize * 2]);
+
+        for (int i = 0; i < server.Config.Reliable.MaximumPending; i++)
+            server.Send(peerConnection, payload, isReliable: true);
+
+        Assert.Equal(SendResult.Dropped, server.Send(peerConnection, payload, isReliable: true));
+        Assert.Equal(SendResult.Dropped, server.Send(peerConnection, segmentedPayload, isReliable: true));
+
+        long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+
+        for (int i = 0; i < 100; i++)
+        {
+            server.Send(peerConnection, payload, isReliable: true);
+            server.Send(peerConnection, segmentedPayload, isReliable: true);
+        }
+
+        Assert.Equal(0, GC.GetAllocatedBytesForCurrentThread() - allocatedBefore);
     }
 
     /// <summary>

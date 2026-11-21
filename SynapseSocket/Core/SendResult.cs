@@ -17,8 +17,10 @@ public enum SendResult : byte
     Queued,
 
     /// <summary>
-    /// The connection's send queue was full and <see cref="Configuration.SendThrottleConfig.QueueFullAction"/> is
-    /// <see cref="Configuration.SendQueueFullAction.DropNewest"/>, so nothing of the payload was sent.
+    /// Nothing of the payload was sent: the connection's send queue was full and
+    /// <see cref="Configuration.SendThrottleConfig.QueueFullAction"/> is <see cref="Configuration.SendQueueFullAction.DropNewest"/>, or
+    /// the payload was reliable and <see cref="Configuration.ReliableConfig.MaximumPending"/> reliable messages already await
+    /// acknowledgement.
     /// </summary>
     Dropped
 }

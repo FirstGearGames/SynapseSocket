@@ -663,7 +663,7 @@ public sealed partial class SynapseManager : IDisposable
     /// <param name="synapseConnection">The connection to send on.</param>
     /// <param name="payload">The application payload.</param>
     /// <param name="isReliable">True to send on the reliable channel.</param>
-    /// <returns><see cref="SendResult.Sent"/> when every datagram is on the wire, <see cref="SendResult.Queued"/> when at least one waits in the send queue, or <see cref="SendResult.Dropped"/> when the full queue refused the payload. Always <see cref="SendResult.Sent"/> while the throttle is disabled.</returns>
+    /// <returns><see cref="SendResult.Sent"/> when every datagram is on the wire, <see cref="SendResult.Queued"/> when at least one waits in the send queue, or <see cref="SendResult.Dropped"/> when the full queue refused the payload or a reliable payload found <see cref="ReliableConfig.MaximumPending"/> messages already awaiting acknowledgement. Never <see cref="SendResult.Queued"/> while the throttle is disabled.</returns>
     public SendResult Send(SynapseConnection synapseConnection, ArraySegment<byte> payload, bool isReliable)
     {
         EnsureRunning();

@@ -8,7 +8,8 @@ public sealed class ReliableConfig
     // ReSharper disable FieldCanBeMadeReadOnly.Global
 
     /// <summary>
-    /// Maximum number of unacknowledged reliable packets per connection before backpressure is applied.
+    /// Maximum number of unacknowledged reliable packets per connection before backpressure is applied. A reliable send past it is
+    /// refused with <see cref="SynapseSocket.Core.SendResult.Dropped"/> and never takes a sequence number.
     /// </summary>
     public uint MaximumPending = 256;
 
