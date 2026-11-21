@@ -238,7 +238,7 @@ Setting `CopyReceivedPayloads` to false removes the per-packet copy on the unrel
 | `BlacklistDurationMilliseconds` | 300000 | How long a ban lasts. 0 makes bans permanent |
 | `SignatureProvider` | `null` | Custom `ISignatureProvider`; `null` uses `DefaultSignatureProvider` |
 | `SignatureValidator` | `null` | Optional `ISignatureValidator` consulted on every handshake |
-| `AllowUnknownPackets` | `false` | Hand datagrams with an unrecognised type byte to `UnknownPacketReceived` instead of raising an `UnknownPacket` violation outright. The handler's `FilterResult` decides: anything other than `Allowed` still raises `UnknownPacket`. With no handler, or a handler that throws, the datagram passes. **SynapseBeacon requires `true`** |
+| `AllowUnknownPackets` | `false` | Hand datagrams with an unrecognised type byte to `UnknownPacketReceived` instead of raising an `UnknownPacket` violation outright. The handler's `FilterResult` decides: anything other than `Allowed` still raises `UnknownPacket` from a connected peer, and is dropped without one from any other sender. With no handler, or a handler that throws, the datagram passes. **SynapseBeacon requires `true`** |
 
 ### `NatTraversal`
 
@@ -267,7 +267,7 @@ Setting `CopyReceivedPayloads` to false removes the per-packet copy on the unrel
 
 Every inbound datagram is filtered before its payload is copied.
 
-**From an unknown sender:** the signature is computed, and if the provider cannot produce one the datagram is dropped with a `Malformed` violation carrying signature 0, which never counts toward a ban. A blacklisted signature is dropped with `ConnectionFailed(Blacklisted)`, and anything over `MaximumPacketSize` is an `Oversized` violation.
+**From an unknown sender:** the signature is computed, and a blacklisted signature is dropped with `ConnectionFailed(Blacklisted)`. Anything else refused from a sender with no connection (a signature the provider cannot compute, a datagram over `MaximumPacketSize`, an unrecognised type byte, or a header that does not parse) is dropped and counted in `Telemetry.PacketsDroppedIn`, with no violation. There is no connection to kick, and the source address is forgeable, so a violation would let anyone write a warning per datagram and spend another address's strikes toward a ban.
 
 **From a connected peer:** size and the per-second packet and byte limits are checked, raising `Oversized` or `RateLimitExceeded`.
 
@@ -275,8 +275,8 @@ Every inbound datagram is filtered before its payload is copied.
 
 | Condition | Result |
 |---|---|
-| Unrecognised type byte | `UnknownPacket` violation. With `AllowUnknownPackets`, it goes to `UnknownPacketReceived` instead, and a return value other than `FilterResult.Allowed` still raises `UnknownPacket` |
-| Header does not parse | `Malformed` violation |
+| Unrecognised type byte from a connected peer | `UnknownPacket` violation. With `AllowUnknownPackets`, it goes to `UnknownPacketReceived` instead, and a return value other than `FilterResult.Allowed` still raises `UnknownPacket` |
+| Header from a connected peer does not parse | `Malformed` violation |
 | Handshake from a blacklisted signature | `ConnectionFailed(Blacklisted)` |
 | Handshake from an unknown endpoint at or above `HandshakeChallengeThreshold` | Answered with a stateless token; no state is allocated until it comes back |
 | Handshake beyond `MaximumConcurrentConnections` | `ConnectionFailed(ServerFull)` |
@@ -527,7 +527,7 @@ SynapseSocket.Tests/                   the test suite
 
 ## Tests
 
-188 xUnit tests in 22 suites. Almost all of them spin up real engines over loopback UDP sockets, with no mocking. Adversarial tests send hand-built datagrams from a plain `Socket`, the same thing a hostile peer on the network does.
+191 xUnit tests in 23 suites. Almost all of them spin up real engines over loopback UDP sockets, with no mocking. Adversarial tests send hand-built datagrams from a plain `Socket`, the same thing a hostile peer on the network does.
 
 | Suite | Tests | Coverage |
 |---|---|---|
@@ -549,6 +549,7 @@ SynapseSocket.Tests/                   the test suite
 | `SignatureValidatorTests` | 3 | Custom validators and signature providers |
 | `BeaconSecurityTests` | 5 | The beacon's join challenge, forged cookies, host-only heartbeat acknowledgement, per-address rate limiting |
 | `SweepFindingTests` | 49 | The robustness-sweep findings, each asserting the corrected behaviour; see `docs/ROBUSTNESS_SWEEP.md` |
+| `SecuritySweepTests` | 3 | The 2026-11 security sweep findings: a datagram refused from a sender with no connection, outright or by an `UnknownPacketReceived` handler, dropped and counted without a violation, and a forged run against a connected peer earning it one strike rather than a ban |
 | `TelemetryAndLatencyTests` | 15 | Telemetry counts, and the latency simulator's delay, jitter, loss and reordering |
 | `ConnectionStressTests` | 4 | Many clients sending rapidly, and repeated connect, send and disconnect cycles |
 | `PayloadIntegrityStressTests` | 5 | Received payloads never sharing a buffer with an unrelated rental |

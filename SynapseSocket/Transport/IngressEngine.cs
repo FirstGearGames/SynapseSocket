@@ -707,6 +707,12 @@ internal sealed partial class IngressEngine
             return;
         }
 
+        /* A sender with no connection is dropped with nothing but the count above, here and wherever else this engine refuses one.
+         * There is nothing to kick, and the source address is unauthenticated, so a violation would let anyone write a warning line
+         * per datagram, churn the violation table, and spend another address's strikes toward a ban. */
+        if (!isEstablished)
+            return;
+
         ViolationReason violationReason = filterResult switch
         {
             FilterResult.Oversized => ViolationReason.Oversized,
@@ -827,8 +833,11 @@ internal sealed partial class IngressEngine
             if (!_config.Security.AllowUnknownPackets)
             {
                 _telemetry.OnSecurityDroppedReceived();
-                ulong unknownSignature = synapseConnection?.Signature ?? _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
-                ViolationOccurred?.Invoke(fromEndPoint, unknownSignature, ViolationReason.UnknownPacket, length, logEntry: default, ViolationAction.KickAndBlacklist);
+
+                // A sender with no connection is only counted; see HandleDatagram.
+                if (synapseConnection is not null)
+                    ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.UnknownPacket, length, logEntry: default, ViolationAction.KickAndBlacklist);
+
                 return;
             }
 
@@ -837,8 +846,9 @@ internal sealed partial class IngressEngine
             if (unknownFilterResult != FilterResult.Allowed)
             {
                 _telemetry.OnSecurityDroppedReceived();
-                ulong unknownSignature = synapseConnection?.Signature ?? _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
-                ViolationOccurred?.Invoke(fromEndPoint, unknownSignature, ViolationReason.UnknownPacket, length, LogEntry.Warning(ResolveFilterViolationDetails(unknownFilterResult)), ViolationAction.KickAndBlacklist);
+
+                if (synapseConnection is not null)
+                    ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.UnknownPacket, length, LogEntry.Warning(ResolveFilterViolationDetails(unknownFilterResult)), ViolationAction.KickAndBlacklist);
             }
 
             return;
@@ -854,8 +864,11 @@ internal sealed partial class IngressEngine
         if (!PacketHeader.TryRead(buffer.AsSpan(0, length), out headerSize, out type, out sequence, out segmentId, out segmentIndex, out segmentCount))
         {
             _telemetry.OnSecurityDroppedReceived();
-            ulong signature = _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty);
-            ViolationOccurred?.Invoke(fromEndPoint, signature, ViolationReason.Malformed, length, LogEntry.Warning(ViolationHeaderParseFailure), ViolationAction.KickAndBlacklist);
+
+            // A sender with no connection is only counted; see HandleDatagram.
+            if (synapseConnection is not null)
+                ViolationOccurred?.Invoke(fromEndPoint, _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty), ViolationReason.Malformed, length, LogEntry.Warning(ViolationHeaderParseFailure), ViolationAction.KickAndBlacklist);
+
             return;
         }
 

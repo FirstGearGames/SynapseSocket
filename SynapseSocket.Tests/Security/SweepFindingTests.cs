@@ -1820,9 +1820,12 @@ public sealed class SweepFindingTests
         IPEndPoint target = new(IPAddress.Loopback, port);
         using Socket attacker = TestHarness.CreateRawSocket();
 
-        // Enough oversized datagrams to exhaust the violation allowance and earn a blacklist entry.
-        for (int i = 0; i < ViolationsBeforeBlacklist + 1; i++)
+        /* Enough oversized datagrams to exhaust the violation allowance and earn a blacklist entry, each sent on a live connection:
+         * one refused from a sender with no connection is dropped without counting toward anything. */
+        for (int i = 0; i < ViolationsBeforeBlacklist; i++)
         {
+            attacker.SendTo(BuildHandshake(), target);
+            TestHarness.PumpFor(60, server);
             attacker.SendTo(new byte[1401], target);
             TestHarness.PumpFor(60, server);
         }
