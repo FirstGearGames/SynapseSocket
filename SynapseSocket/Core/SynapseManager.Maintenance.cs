@@ -376,5 +376,8 @@ public sealed partial class SynapseManager
             return;
 
         synapseConnection.Reassembler?.RemoveExpiredSegments(nowTicks, _segmentAssemblyTimeoutTicks);
+
+        // The same sweep by the same rule, so the bytes the held-byte budget counts leave with the assemblies holding them.
+        synapseConnection.RemoveExpiredSplitMessages(nowTicks, _segmentAssemblyTimeoutTicks);
     }
 }

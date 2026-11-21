@@ -290,9 +290,15 @@ public sealed partial class SynapseConnection : IPoolResettable
             reorderSegment.PoolArrayIntoShared();
 
         ReorderBuffer.Clear();
+        ReorderBufferByteCount = 0;
 
         ResettableObjectPool<PacketSplitter>.ReturnAndNullifyReference(ref Splitter);
         ResettableObjectPool<PacketReassembler>.ReturnAndNullifyReference(ref Reassembler);
+
+        // The entries count the reliable messages of the reassembler just returned, so they go with it.
+        Array.Clear(SplitMessages, 0, SplitMessageCount);
+        SplitMessageCount = 0;
+        SplitMessageByteCount = 0;
     }
 
     /// <inheritdoc/>
