@@ -160,7 +160,8 @@ public class HandshakeTimeoutTests
         peerSocket.ReceiveFrom(receiveBuffer, ref clientEndPoint);
         Assert.Equal((byte)PacketType.Handshake, receiveBuffer[0]);
 
-        byte[] keepAlivePacket = [(byte)PacketType.KeepAlive];
+        // A keep-alive ending in the session token the client's handshake nonce opened with, as a server that received that handshake sends.
+        byte[] keepAlivePacket = [(byte)PacketType.KeepAlive, receiveBuffer[1], receiveBuffer[2], receiveBuffer[3], receiveBuffer[4]];
         long deadlineMilliseconds = Environment.TickCount64 + CloseWaitMilliseconds;
         long nextKeepAliveMilliseconds = 0;
         /* Sampled inside the loop, while the connection is live, so the assertion describes what the peer's traffic did

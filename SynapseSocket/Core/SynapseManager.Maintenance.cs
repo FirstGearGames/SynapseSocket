@@ -275,7 +275,7 @@ public sealed partial class SynapseManager
 
         synapseConnection.HandshakeAttempts++;
         synapseConnection.LastHandshakeSentTicks = nowTicks;
-        _transmissionEngine.SendHandshake(synapseConnection.RemoteEndPoint);
+        _transmissionEngine.SendHandshake(synapseConnection);
     }
 
     /// <summary>

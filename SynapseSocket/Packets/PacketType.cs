@@ -11,6 +11,10 @@ namespace SynapseSocket.Packets;
 /// </list>
 /// All other types carry no additional header fields; any further bytes are payload.
 /// <para>
+/// Between two peers that both advertise session tokens in their handshakes, <see cref="Ack"/>, <see cref="SegmentAck"/>,
+/// <see cref="KeepAlive"/> and <see cref="Disconnect"/> end with the receiver's 4-byte session token.
+/// </para>
+/// <para>
 /// Byte values strictly greater than <see cref="SegmentAck"/> are reserved for external protocols
 /// that piggyback on the Synapse UDP socket via <c>SynapseManager.UnknownPacketReceived</c>.
 /// </para>
@@ -33,22 +37,24 @@ public enum PacketType : byte
     Reliable = 1,
 
     /// <summary>
-    /// Acknowledgment for a reliable packet. Header includes the acknowledged sequence number.
+    /// Acknowledgment for a reliable packet. Header includes the acknowledged sequence number, and further sequences may follow it,
+    /// before the session token between peers that both advertise one.
     /// </summary>
     Ack = 2,
 
     /// <summary>
-    /// Handshake or handshake acknowledgment. Payload contains an 8-byte nonce.
+    /// Handshake or handshake acknowledgment. Payload contains an 8-byte nonce, which opens with the sender's session token,
+    /// followed by the protocol version.
     /// </summary>
     Handshake = 3,
 
     /// <summary>
-    /// Keep-alive heartbeat. No payload.
+    /// Keep-alive heartbeat. No payload, only the session token between peers that both advertise one.
     /// </summary>
     KeepAlive = 4,
 
     /// <summary>
-    /// Graceful disconnect notification. No payload.
+    /// Graceful disconnect notification. No payload, only the session token between peers that both advertise one.
     /// </summary>
     Disconnect = 5,
 

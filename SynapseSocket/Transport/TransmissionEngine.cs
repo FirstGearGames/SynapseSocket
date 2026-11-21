@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
@@ -438,9 +439,10 @@ public sealed partial class TransmissionEngine
     {
         const PacketType Type = PacketType.Ack;
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
-        byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(headerSize);
+        byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(headerSize + PacketHeader.SessionTokenSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, sequence, 0, 0, 0);
-        SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), synapseConnection);
+        int totalLength = AppendSessionToken(synapseConnection, rentedBuffer, headerSize);
+        SendAndPoolBuffer(new(rentedBuffer, 0, totalLength), synapseConnection);
     }
 
     /// <summary>
@@ -458,7 +460,8 @@ public sealed partial class TransmissionEngine
         if (pendingAcks.Count == 0)
             return;
 
-        int maximumPerDatagram = (int)((_config.MaximumTransmissionUnit - PacketHeader.TypeSize) / PacketHeader.SequenceSize);
+        int sessionTokenSize = synapseConnection.SessionTokenState is SessionTokenState.Supported ? PacketHeader.SessionTokenSize : 0;
+        int maximumPerDatagram = (int)((_config.MaximumTransmissionUnit - PacketHeader.TypeSize - sessionTokenSize) / PacketHeader.SequenceSize);
 
         if (maximumPerDatagram < 1)
             maximumPerDatagram = 1;
@@ -466,8 +469,8 @@ public sealed partial class TransmissionEngine
         while (pendingAcks.Count > 0)
         {
             int sequenceCount = Math.Min(pendingAcks.Count, maximumPerDatagram);
-            int totalLength = PacketHeader.TypeSize + (sequenceCount * PacketHeader.SequenceSize);
-            byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(totalLength);
+            int sequencesLength = PacketHeader.TypeSize + (sequenceCount * PacketHeader.SequenceSize);
+            byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(sequencesLength + sessionTokenSize);
 
             rentedBuffer[0] = (byte)PacketType.Ack;
             int offset = PacketHeader.TypeSize;
@@ -479,6 +482,7 @@ public sealed partial class TransmissionEngine
                 rentedBuffer[offset++] = (byte)((sequence >> 8) & 0xFF);
             }
 
+            int totalLength = AppendSessionToken(synapseConnection, rentedBuffer, sequencesLength);
             SendAndPoolBuffer(new(rentedBuffer, 0, totalLength), synapseConnection);
         }
     }
@@ -494,25 +498,44 @@ public sealed partial class TransmissionEngine
     {
         const PacketType Type = PacketType.SegmentAck;
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
-        int totalLength = headerSize + bitmap.Length;
+        int bitmapEnd = headerSize + bitmap.Length;
 
-        byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(totalLength);
+        byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(bitmapEnd + PacketHeader.SessionTokenSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, sequence, 0, 0, 0);
         bitmap.CopyTo(rentedBuffer.AsSpan(headerSize, bitmap.Length));
+        int totalLength = AppendSessionToken(synapseConnection, rentedBuffer, bitmapEnd);
 
         SendAndPoolBuffer(new(rentedBuffer, 0, totalLength), synapseConnection);
     }
 
     /// <summary>
-    /// Sends a handshake packet with an 8-byte cryptographic nonce in the payload.
+    /// Sends a handshake packet with an 8-byte cryptographic nonce in the payload, followed by the protocol version. Used only where
+    /// no connection exists to send it for; a connection's handshakes go through <see cref="SendHandshake(SynapseConnection)"/>.
     /// </summary>
     /// <param name="target">The remote endpoint to send the handshake to.</param>
     public void SendHandshake(IPEndPoint target)
     {
-        Span<byte> nonce = stackalloc byte[PacketHeader.HandshakeNonceSize];
-        RandomNumberGenerator.Fill(nonce);
+        Span<byte> payload = stackalloc byte[PacketHeader.HandshakeNonceSize + PacketHeader.HandshakeVersionSize];
+        RandomNumberGenerator.Fill(payload[..PacketHeader.HandshakeNonceSize]);
+        payload[PacketHeader.HandshakeNonceSize] = PacketHeader.SessionTokenVersion;
 
-        SendHandshakePayload(target, nonce);
+        SendHandshakePayload(target, payload);
+    }
+
+    /// <summary>
+    /// Sends a handshake for a connection: a nonce that opens with the connection's <see cref="SynapseConnection.LocalSessionToken"/>
+    /// and ends in random bytes, followed by the protocol version. Every handshake sent on one connection opens the same way, so the
+    /// peer learns the session token whichever of them it answers, and each is still a fresh key for the peer's replay cache.
+    /// </summary>
+    /// <param name="synapseConnection">The connection the handshake is for.</param>
+    internal void SendHandshake(SynapseConnection synapseConnection)
+    {
+        Span<byte> payload = stackalloc byte[PacketHeader.HandshakeNonceSize + PacketHeader.HandshakeVersionSize];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, synapseConnection.LocalSessionToken);
+        RandomNumberGenerator.Fill(payload[PacketHeader.SessionTokenSize..PacketHeader.HandshakeNonceSize]);
+        payload[PacketHeader.HandshakeNonceSize] = PacketHeader.SessionTokenVersion;
+
+        SendHandshakePayload(synapseConnection.RemoteEndPoint, payload);
     }
 
     /// <summary>
@@ -540,9 +563,10 @@ public sealed partial class TransmissionEngine
     {
         const PacketType Type = PacketType.KeepAlive;
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
-        byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(headerSize);
+        byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(headerSize + PacketHeader.SessionTokenSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
-        SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), synapseConnection);
+        int totalLength = AppendSessionToken(synapseConnection, rentedBuffer, headerSize);
+        SendAndPoolBuffer(new(rentedBuffer, 0, totalLength), synapseConnection);
     }
 
     /// <summary>
@@ -553,9 +577,10 @@ public sealed partial class TransmissionEngine
     {
         const PacketType Type = PacketType.Disconnect;
         int headerSize = PacketHeader.ComputeHeaderSize(Type);
-        byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(headerSize);
+        byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(headerSize + PacketHeader.SessionTokenSize);
         PacketHeader.Write(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0);
-        SendAndPoolBuffer(new(rentedBuffer, 0, headerSize), synapseConnection);
+        int totalLength = AppendSessionToken(synapseConnection, rentedBuffer, headerSize);
+        SendAndPoolBuffer(new(rentedBuffer, 0, totalLength), synapseConnection);
     }
 
     /// <summary>
@@ -825,6 +850,24 @@ public sealed partial class TransmissionEngine
     {
         synapseConnection.LastSentTicks = Clock.Ticks;
         SendAndPoolBuffer(segment, synapseConnection.RemoteEndPoint);
+    }
+
+    /// <summary>
+    /// Ends a disconnect, keep-alive, acknowledgement or segment acknowledgement with the connection's
+    /// <see cref="SynapseConnection.RemoteSessionToken"/> when its peer takes part in session tokens, and leaves it as it is otherwise.
+    /// </summary>
+    /// <param name="synapseConnection">The connection the packet is for.</param>
+    /// <param name="buffer">The packet, with room for the token after <paramref name="packetLength"/>.</param>
+    /// <param name="packetLength">The packet's length without the token.</param>
+    /// <returns>The packet's length, including the token when one was written.</returns>
+    private static int AppendSessionToken(SynapseConnection synapseConnection, byte[] buffer, int packetLength)
+    {
+        if (synapseConnection.SessionTokenState is not SessionTokenState.Supported)
+            return packetLength;
+
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(packetLength), synapseConnection.RemoteSessionToken);
+
+        return packetLength + PacketHeader.SessionTokenSize;
     }
 
 #if !NET8_0_OR_GREATER

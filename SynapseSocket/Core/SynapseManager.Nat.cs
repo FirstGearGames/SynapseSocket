@@ -119,7 +119,7 @@ public sealed partial class SynapseManager
                 for (uint probe = 0; probe < Config.NatTraversal.ProbeCount; probe++)
                     _transmissionEngine.SendNatProbe(punch.EndPoint);
 
-                _transmissionEngine.SendHandshake(punch.EndPoint);
+                _transmissionEngine.SendHandshake(punch.Connection);
             }
             catch (Exception unexpectedException)
             {

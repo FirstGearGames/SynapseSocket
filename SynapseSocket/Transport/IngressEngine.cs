@@ -1,5 +1,6 @@
 using System;
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
@@ -717,8 +718,12 @@ internal sealed partial class IngressEngine
 
         /* A sender with no connection is dropped with nothing but the count above, here and wherever else this engine refuses one.
          * There is nothing to kick, and the source address is unauthenticated, so a violation would let anyone write a warning line
-         * per datagram, churn the violation table, and spend another address's strikes toward a ban. */
-        if (!isEstablished)
+         * per datagram, churn the violation table, and spend another address's strikes toward a ban.
+         *
+         * An oversized datagram is dropped the same way from a peer that takes part in session tokens, or may yet: a datagram this
+         * engine refuses unread cannot show the token, so it proves no more about its source than one from a stranger. A peer that
+         * predates session tokens is still reported as it always was. */
+        if (!isEstablished || (filterResult is FilterResult.Oversized && synapseConnection!.SessionTokenState is not SessionTokenState.Unsupported))
             return;
 
         ViolationReason violationReason = filterResult switch
@@ -842,8 +847,8 @@ internal sealed partial class IngressEngine
             {
                 _telemetry.OnSecurityDroppedReceived();
 
-                // A sender with no connection is only counted; see HandleDatagram.
-                if (synapseConnection is not null)
+                // A sender with no connection is only counted, and so is a peer that takes part in session tokens; see HandleDatagram.
+                if (synapseConnection is { SessionTokenState: SessionTokenState.Unsupported })
                     ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.UnknownPacket, length, logEntry: default, ViolationAction.KickAndBlacklist);
 
                 return;
@@ -855,7 +860,7 @@ internal sealed partial class IngressEngine
             {
                 _telemetry.OnSecurityDroppedReceived();
 
-                if (synapseConnection is not null)
+                if (synapseConnection is { SessionTokenState: SessionTokenState.Unsupported })
                     ViolationOccurred?.Invoke(fromEndPoint, synapseConnection.Signature, ViolationReason.UnknownPacket, length, LogEntry.Warning(ResolveFilterViolationDetails(unknownFilterResult)), ViolationAction.KickAndBlacklist);
             }
 
@@ -873,8 +878,8 @@ internal sealed partial class IngressEngine
         {
             _telemetry.OnSecurityDroppedReceived();
 
-            // A sender with no connection is only counted; see HandleDatagram.
-            if (synapseConnection is not null)
+            // A sender with no connection is only counted, and so is a peer that takes part in session tokens; see HandleDatagram.
+            if (synapseConnection is { SessionTokenState: SessionTokenState.Unsupported })
                 ViolationOccurred?.Invoke(fromEndPoint, _security.ComputeSignature(fromEndPoint, ReadOnlySpan<byte>.Empty), ViolationReason.Malformed, length, LogEntry.Warning(ViolationHeaderParseFailure), ViolationAction.KickAndBlacklist);
 
             return;
@@ -902,19 +907,13 @@ internal sealed partial class IngressEngine
             return;
         }
 
-        /* See the note on the fast path for why this is stamped in every state.
-         *
-         * A forged packet from a spoofed source does refresh this, holding a session alive after the real peer is
-         * gone. That is not specific to KeepAlive. Every accepted type reaches this line, so authenticating one
-         * type would move the vector rather than close it. Closing it means authenticating every packet, which is
-         * accepted risk by design: this transport does not spend bytes per datagram. Damage is bounded to a held
-         * connection slot, and anyone able to forge here can already inject payloads as that peer. */
-        synapseConnection.LastReceivedTicks = nowTicks;
-
         switch (type)
         {
             case PacketType.Disconnect:
             {
+                if (!TryAcceptControlPacket(buffer, ref length, headerSize, synapseConnection, nowTicks))
+                    return;
+
                 /* Reported before the teardown, so the violation's observers still find the connection live, and torn down
                  * whatever action was settled. A kick has already torn it down, which the teardown checks for, and a handler
                  * that stopped the engine has released it, so nothing more is done then. */
@@ -927,10 +926,14 @@ internal sealed partial class IngressEngine
             }
 
             case PacketType.KeepAlive:
+                _ = TryAcceptControlPacket(buffer, ref length, headerSize, synapseConnection, nowTicks);
                 return;
 
             case PacketType.SegmentAck:
             {
+                if (!TryAcceptControlPacket(buffer, ref length, headerSize, synapseConnection, nowTicks))
+                    return;
+
                 /* Selective acknowledgement: the peer is telling us which segments of this message it already
                  * holds, so the retransmit sweep can skip them instead of resending the whole thing. */
                 if (synapseConnection.PendingReliableQueue.TryGetValue(sequence, out SynapseConnection.PendingReliable? partiallyAcked))
@@ -954,6 +957,9 @@ internal sealed partial class IngressEngine
 
             case PacketType.Ack:
             {
+                if (!TryAcceptControlPacket(buffer, ref length, headerSize, synapseConnection, nowTicks))
+                    return;
+
                 /* An ack datagram carries one or more sequences packed back to back after the type byte. Remove
                  * each immediately (stopping retransmission and freeing backpressure) and return its buffer now:
                  * the engine is single-threaded, so no retransmit can be reading it concurrently. */
@@ -979,6 +985,13 @@ internal sealed partial class IngressEngine
                 return;
             }
         }
+
+        /* See the note on the fast path for why this is stamped in every state.
+         *
+         * A data packet forged from a spoofed source does refresh this, holding a session alive after the real peer is gone. Data
+         * packets carry no session token, which is accepted risk by design: this transport does not spend bytes per data packet.
+         * Damage is bounded to a held connection slot, and anyone able to forge here can already inject payloads as that peer. */
+        synapseConnection.LastReceivedTicks = nowTicks;
 
         // A connection closing after delivery is read only for the acknowledgements and the disconnect above; its data is dropped on arrival.
         if (synapseConnection.IsClosing)
@@ -1071,6 +1084,45 @@ internal sealed partial class IngressEngine
                 return;
             }
         }
+    }
+
+    /// <summary>
+    /// Accepts a disconnect, keep-alive, acknowledgement or segment acknowledgement from an established peer when it ends with the
+    /// session token this side expects, or the peer predates session tokens: <paramref name="length"/> then stops short of the token, and
+    /// the packet is stamped as received. Anything else is dropped and counted.
+    /// </summary>
+    /// <param name="buffer">The raw receive buffer containing the datagram.</param>
+    /// <param name="length">The datagram's length, set to exclude the session token when the packet is accepted.</param>
+    /// <param name="headerSize">The size of the packet's header, which the token must not overlap.</param>
+    /// <param name="synapseConnection">The connection the datagram was resolved to.</param>
+    /// <param name="nowTicks">Monotonic timestamp for the current poll.</param>
+    /// <returns>True when the packet may be acted on.</returns>
+    /// <remarks>
+    /// Each of these packets ends the session, holds it open, or releases reliable messages the peer may never have received, and a
+    /// source address proves nothing over UDP. The token opened every handshake nonce this side sent on the connection, so only a
+    /// sender that received one of those handshakes knows it. A packet without it is never reported as a violation, because nothing
+    /// about it can be pinned on the peer whose address it carries.
+    /// </remarks>
+    private bool TryAcceptControlPacket(byte[] buffer, ref int length, int headerSize, SynapseConnection synapseConnection, long nowTicks)
+    {
+        if (synapseConnection.SessionTokenState is not SessionTokenState.Unsupported)
+        {
+            int sessionTokenOffset = length - PacketHeader.SessionTokenSize;
+
+            if (sessionTokenOffset < headerSize || BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(sessionTokenOffset)) != synapseConnection.LocalSessionToken)
+            {
+                _telemetry.OnSecurityDroppedReceived();
+
+                return false;
+            }
+
+            length = sessionTokenOffset;
+        }
+
+        // See the note on the fast path for why this is stamped in every state.
+        synapseConnection.LastReceivedTicks = nowTicks;
+
+        return true;
     }
 
     /// <summary>
@@ -1199,8 +1251,9 @@ internal sealed partial class IngressEngine
     }
 
     /// <summary>
-    /// Processes an inbound handshake: checks blacklist, connection cap, replay cache, and signature validation.
-    /// Registers the connection on success and sends a handshake-ack.
+    /// Processes an inbound handshake: checks blacklist, return-routability, connection cap, replay cache, and signature validation.
+    /// Registers the connection on success and sends a handshake-ack. A connected peer that takes part in session tokens must prove
+    /// return-routability before its handshake can start a new session.
     /// </summary>
     /// <param name="fromEndPoint">The source endpoint of the handshake datagram.</param>
     /// <param name="buffer">The raw receive buffer.</param>
@@ -1225,14 +1278,47 @@ internal sealed partial class IngressEngine
         if (handshakePayload.Length < PacketHeader.HandshakeNonceSize)
             return;
 
+        bool isChallengeOrProof = handshakePayload.Length is PacketHeader.HandshakeChallengeSize or PacketHeader.HandshakeChallengeSize + PacketHeader.HandshakeVersionSize;
         bool hasConnection = _connections.ConnectionsByEndPoint.TryGetValue(fromEndPoint, out SynapseConnection? existingConnection);
+
+        /* A handshake arriving hard on the heels of one we just sent to this peer is that peer's answer, not a fresh
+         * request. Treating it as a request would reset the live session and emit yet another handshake, which the
+         * peer (running this same code) would answer in kind. That is a self-sustaining reset loop: one injected
+         * handshake against an established pair leaves both sides wiping their sequence spaces forever. Recognising
+         * our own answer terminates the exchange after a single round. */
+        bool isAnswerToOurHandshake = hasConnection
+            && existingConnection!.LastHandshakeSentTicks != 0
+            && entryTicks - existingConnection.LastHandshakeSentTicks < HandshakeAnswerWindowTicks;
 
         /* We initiated to this peer and it is asking us to prove we can receive at the address we claimed. Echo the
          * challenge back verbatim and stay Pending; the peer allocates nothing until this proof lands. */
-        if (hasConnection && existingConnection!.State == ConnectionState.Pending && handshakePayload.Length == PacketHeader.HandshakeChallengeSize)
+        if (hasConnection && existingConnection!.State == ConnectionState.Pending && isChallengeOrProof)
         {
             _sender.SendHandshakePayload(fromEndPoint, handshakePayload);
             return;
+        }
+
+        /* A session with a peer that takes part in session tokens is never reset by a handshake that has not proven it comes from
+         * the peer's address, because any sender can claim that address. Once the window in which a plain handshake reads as the
+         * peer's answer to ours has passed, one is answered with the same stateless challenge an unknown endpoint gets, so a peer
+         * that really restarted pays one round trip and its proof starts the new session below. A challenge from the peer, or a
+         * proof of a challenge this side never sent, is dropped unanswered, so two engines can never bounce challenges between them. */
+        if (existingConnection is { State: ConnectionState.Connected, SessionTokenState: SessionTokenState.Supported })
+        {
+            if (!isChallengeOrProof)
+            {
+                if (!isAnswerToOurHandshake)
+                    SendHandshakeChallenge(fromEndPoint, handshakePayload);
+
+                return;
+            }
+
+            if (!VerifyHandshakeProof(fromEndPoint, handshakePayload))
+            {
+                _telemetry.OnSecurityDroppedReceived();
+
+                return;
+            }
         }
 
         /* Return-routability gate. Above the occupancy threshold an unknown endpoint gets a stateless token instead
@@ -1241,8 +1327,7 @@ internal sealed partial class IngressEngine
          * already hold a connection for skip this. We chose to talk to them. */
         if (!hasConnection && _connections.Count >= _handshakeChallengeThreshold)
         {
-            bool isProven = handshakePayload.Length == PacketHeader.HandshakeChallengeSize
-                && VerifyEndpointToken(_handshakeChallengeHmac, fromEndPoint, handshakePayload[PacketHeader.HandshakeNonceSize..]);
+            bool isProven = isChallengeOrProof && VerifyHandshakeProof(fromEndPoint, handshakePayload);
 
             if (!isProven)
             {
@@ -1297,15 +1382,6 @@ internal sealed partial class IngressEngine
 
         SynapseConnection synapseConnection = _connections.GetOrAdd(fromEndPoint, signature, out bool isExistingConnection);
 
-        /* A handshake arriving hard on the heels of one we just sent to this peer is that peer's answer, not a fresh
-         * request. Treating it as a request would reset the live session and emit yet another handshake, which the
-         * peer (running this same code) would answer in kind. That is a self-sustaining reset loop: one injected
-         * handshake against an established pair leaves both sides wiping their sequence spaces forever. Recognising
-         * our own answer terminates the exchange after a single round. */
-        bool isAnswerToOurHandshake = isExistingConnection
-            && synapseConnection.LastHandshakeSentTicks != 0
-            && entryTicks - synapseConnection.LastHandshakeSentTicks < HandshakeAnswerWindowTicks;
-
         // True when the peer reconnected without a clean disconnect. We need to respond with a
         // handshake-ack in this case just as we would for a brand-new connection.
         bool isReconnecting = isExistingConnection && synapseConnection.State == ConnectionState.Connected && !isAnswerToOurHandshake;
@@ -1336,6 +1412,11 @@ internal sealed partial class IngressEngine
             synapseConnection.LastSentTicks = establishedTicks;
             synapseConnection.TransmissionEngine = _sender;
 
+            /* The session takes the peer's session token from the nonce this handshake opens with, which a proof echoes back
+             * unchanged, and takes part in session tokens only when the handshake advertises them. */
+            synapseConnection.RemoteSessionToken = BinaryPrimitives.ReadUInt32LittleEndian(handshakePayload);
+            synapseConnection.SessionTokenState = PacketHeader.IsSessionTokenAdvertised(handshakePayload) ? SessionTokenState.Supported : SessionTokenState.Unsupported;
+
             // Send a handshake-ack only when this side did not initiate the connection.
             // If the connection was already in our table as Pending, we are the client waiting
             // for the server's reply, echoing back would create an infinite ping-pong.
@@ -1343,7 +1424,7 @@ internal sealed partial class IngressEngine
             // reconnects where the peer was previously fully Connected (isReconnecting).
             if (!isExistingConnection || isReconnecting)
             {
-                _sender.SendHandshake(fromEndPoint);
+                _sender.SendHandshake(synapseConnection);
                 synapseConnection.LastHandshakeSentTicks = Clock.Ticks;
             }
 

@@ -563,7 +563,7 @@ public sealed partial class SynapseManager : IDisposable
 
         SynapseConnection synapseConnection = Connections.CreateNew(endPoint, signature);
 
-        _transmissionEngine!.SendHandshake(endPoint);
+        _transmissionEngine!.SendHandshake(synapseConnection);
         // Stamped so the peer's answering handshake is recognised as an answer rather than a session-resetting request.
         synapseConnection.LastHandshakeSentTicks = Clock.Ticks;
 

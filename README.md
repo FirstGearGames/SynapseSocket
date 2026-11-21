@@ -112,7 +112,7 @@ Call it regularly, on the thread that calls `Send`: once per frame in a game loo
 | Event | Raised when |
 |---|---|
 | `ConnectionEstablished` | A handshake completes, on both sides |
-| `ConnectionClosed` | A connection ends: timeout, kick, `Disconnect` (on both sides), or being replaced by a new `Connect` to the same endpoint. On the other side of such a reconnect, the fresh handshake raises `ConnectionClosed` and then at once `ConnectionEstablished` for the same connection object, which stays live rather than being torn down |
+| `ConnectionClosed` | A connection ends: timeout, kick, `Disconnect` (on both sides), or being replaced by a new `Connect` to the same endpoint. On the other side of such a reconnect, the fresh handshake raises `ConnectionClosed` and then at once `ConnectionEstablished` for the same connection object, which stays live rather than being torn down. Between two engines that support [session tokens](#session-tokens), it is the answer to a challenge, not the handshake itself, that does so |
 | `ConnectionReleased` | A closed connection's pooled buffers have been released. Drop every reference you kept to the connection in this handler: once the handlers return, the object goes back to a pool shared by every `SynapseManager` on the thread, and the next `Connect` or inbound handshake may be handed the same object for a different peer. Raised once per connection: at the end of the `Poll` that closed it, straight after `ConnectionClosed` on the replaced side of a reconnect (the object is not pooled then, but goes straight on as the new session), and for every open connection on `Stop` or `Dispose`, which raise no `ConnectionClosed` |
 | `ConnectionFailed` | A connection never happened; see [Connections](#connections) |
 | `PacketReceived` | A payload arrives, reassembled if it was segmented |
@@ -146,7 +146,7 @@ Setting `CopyReceivedPayloads` to false removes the per-packet copy on the unrel
 
 ## Connections
 
-- **`Connect`** sends a handshake immediately and returns a `Pending` connection. An unanswered handshake is retried every `Connection.HandshakeRetryIntervalMilliseconds` (300 ms), up to `Connection.HandshakeMaximumAttempts` (10) retries after that first send: 11 sends from this schedule. Full-cone NAT traversal adds a handshake to each probe burst on top of these. `Connect` to an endpoint that already has a connection tears the old one down first, raising `ConnectionClosed` for it. If a `ConnectionClosed` handler connects to that endpoint again, the outer `Connect` returns the connection the handler made rather than replacing it.
+- **`Connect`** sends a handshake immediately and returns a `Pending` connection. An unanswered handshake is retried every `Connection.HandshakeRetryIntervalMilliseconds` (300 ms), up to `Connection.HandshakeMaximumAttempts` (10) retries after that first send: 11 sends from this schedule. Full-cone NAT traversal adds a handshake to each probe burst on top of these. `Connect` to an endpoint that already has a connection tears the old one down first, raising `ConnectionClosed` for it. If a `ConnectionClosed` handler connects to that endpoint again, the outer `Connect` returns the connection the handler made rather than replacing it. A peer that still holds the old session answers the new handshake with a challenge, so reconnecting to it takes one extra round trip; see [Session tokens](#session-tokens).
 - **`ConnectionEstablished`** fires on both sides once the handshake completes. `Connections` lists every connection, pending ones included, through `Connections.Connections`, `ConnectionsByEndPoint` and `Count`.
 - **Keep-alives** go out after `Connection.KeepAliveIntervalMilliseconds` (5 s) without sending anything. A peer that sends nothing for `Connection.TimeoutMilliseconds` (15 s) is timed out.
 - **A handshake still unanswered** after `Connection.HandshakeTimeoutMilliseconds` is timed out as well. That setting is unset by default, which falls back to the 15 s idle timeout. The handshake clock starts when the handshake began, so other traffic from the peer cannot hold it open.
@@ -172,10 +172,10 @@ Setting `CopyReceivedPayloads` to false removes the per-packet copy on the unrel
 | Field | Default | Meaning |
 |---|---|---|
 | `BindEndPoints` | *(required)* | Local endpoints to bind. At most one per address family, so one IPv4 plus one IPv6 for dual-stack; two of the same family throw at `Start`. An endpoint that fails to bind raises `ConnectionFailed(BindFailed)` from inside `Start`, which throws only when *no* endpoint binds, so subscribe first and check `BoundEndPoints` afterwards |
-| `MaximumPacketSize` | 1400 | Largest inbound datagram accepted; anything larger is an `Oversized` violation |
+| `MaximumPacketSize` | 1400 | Largest inbound datagram accepted. Anything larger from a connected peer that predates session tokens is an `Oversized` violation, and from anyone else is dropped and counted in `Telemetry.PacketsDroppedIn` |
 | `MaximumTransmissionUnit` | 1200 | Size outbound packets are packed to, less a `PacketTransform`'s `ReservedBytes` (batched acknowledgements excepted; see [Packet transform](#packet-transform)). It also bounds what this side accepts: a received segment larger than this side's MTU is a `Malformed` violation, so give peers the same value |
 | `PacketTransform` | `null` | Optional `IPacketTransform` rewriting Synapse packet payloads in both directions. Segment acknowledgements and raw external-protocol datagrams bypass it |
-| `MaximumConcurrentConnections` | 4096 | Cap on connections admitted by inbound handshake. It counts every connection, pending and outbound ones included, but `Connect` itself is never refused, so outbound connections can take the count past it. A new peer's handshake beyond it is dropped and raises `ConnectionFailed(ServerFull)` on this engine; the joining peer is never told and times out. Set at or below `Security.HandshakeChallengeThreshold`, every new peer must answer a challenge before it takes a slot, so spoofed handshakes cannot fill it; that costs a joining peer one round trip and 34 bytes. 0 disables |
+| `MaximumConcurrentConnections` | 4096 | Cap on connections admitted by inbound handshake. It counts every connection, pending and outbound ones included, but `Connect` itself is never refused, so outbound connections can take the count past it. A new peer's handshake beyond it is dropped and raises `ConnectionFailed(ServerFull)` on this engine; the joining peer is never told and times out. Set at or below `Security.HandshakeChallengeThreshold`, every new peer must answer a challenge before it takes a slot, so spoofed handshakes cannot fill it; that costs a joining peer one round trip and 36 bytes, or 34 for a peer that predates session tokens. 0 disables |
 | `MaximumReceivesPerPoll` | 4096 | Datagrams drained from each socket per `Poll` before it moves on, so a flood cannot hold the loop. 0 disables |
 | `NativeReceiveEnabled` | `true` | Uses direct `recvfrom`/`sendto` bindings on netstandard2.1, where the managed API allocates per datagram. No effect on net8.0, which already allocates nothing |
 | `SocketReceiveBufferBytes` | 1 MiB | OS receive buffer for each socket |
@@ -238,7 +238,7 @@ Setting `CopyReceivedPayloads` to false removes the per-packet copy on the unrel
 | `BlacklistDurationMilliseconds` | 300000 | How long a ban lasts. 0 makes bans permanent |
 | `SignatureProvider` | `null` | Custom `ISignatureProvider`; `null` uses `DefaultSignatureProvider` |
 | `SignatureValidator` | `null` | Optional `ISignatureValidator` consulted on every handshake |
-| `AllowUnknownPackets` | `false` | Hand datagrams with an unrecognised type byte to `UnknownPacketReceived` instead of raising an `UnknownPacket` violation outright. The handler's `FilterResult` decides: anything other than `Allowed` still raises `UnknownPacket` from a connected peer, and is dropped without one from any other sender. With no handler, or a handler that throws, the datagram passes. **SynapseBeacon requires `true`** |
+| `AllowUnknownPackets` | `false` | Hand datagrams with an unrecognised type byte to `UnknownPacketReceived` instead of raising an `UnknownPacket` violation outright. The handler's `FilterResult` decides: anything other than `Allowed` still raises `UnknownPacket` from a connected peer that predates session tokens, and is dropped without one from any other sender. With no handler, or a handler that throws, the datagram passes. **SynapseBeacon requires `true`** |
 
 ### `NatTraversal`
 
@@ -269,14 +269,16 @@ Every inbound datagram is filtered before its payload is copied.
 
 **From an unknown sender:** the signature is computed, and a blacklisted signature is dropped with `ConnectionFailed(Blacklisted)`. Anything else refused from a sender with no connection (a signature the provider cannot compute, a datagram over `MaximumPacketSize`, an unrecognised type byte, or a header that does not parse) is dropped and counted in `Telemetry.PacketsDroppedIn`, with no violation. There is no connection to kick, and the source address is forgeable, so a violation would let anyone write a warning per datagram and spend another address's strikes toward a ban.
 
-**From a connected peer:** size and the per-second packet and byte limits are checked, raising `Oversized` or `RateLimitExceeded`.
+**From a connected peer:** size and the per-second packet and byte limits are checked. A peer over its limits raises `RateLimitExceeded`. A datagram over `MaximumPacketSize` is an `Oversized` violation from a peer that predates [session tokens](#session-tokens), and is dropped and counted from one that takes part in them, because a datagram refused unread cannot show the token and so proves nothing about its source.
 
 **While processing the packet:**
 
 | Condition | Result |
 |---|---|
-| Unrecognised type byte from a connected peer | `UnknownPacket` violation. With `AllowUnknownPackets`, it goes to `UnknownPacketReceived` instead, and a return value other than `FilterResult.Allowed` still raises `UnknownPacket` |
-| Header from a connected peer does not parse | `Malformed` violation |
+| Unrecognised type byte from a connected peer | `UnknownPacket` violation from a peer that predates session tokens. With `AllowUnknownPackets`, it goes to `UnknownPacketReceived` instead, and a return value other than `FilterResult.Allowed` still raises `UnknownPacket`. From a peer that takes part in session tokens, dropped and counted instead of either violation |
+| Header from a connected peer does not parse | `Malformed` violation from a peer that predates session tokens; dropped and counted from one that takes part in them |
+| Disconnect, keep-alive, acknowledgement or segment acknowledgement without the receiver's session token | Dropped and counted, never a violation |
+| Handshake from a connected peer that takes part in session tokens | Answered with a stateless token, as an unknown endpoint's handshake is; only the token coming back replaces the session. A challenge, or a token this side never issued, from such a peer is dropped and counted |
 | Handshake from a blacklisted signature | `ConnectionFailed(Blacklisted)` |
 | Handshake from an unknown endpoint at or above `HandshakeChallengeThreshold`, or at any occupancy when `MaximumConcurrentConnections` is at or below it | Answered with a stateless token; no state is allocated until it comes back |
 | Handshake beyond `MaximumConcurrentConnections` | `ConnectionFailed(ServerFull)` |
@@ -285,6 +287,17 @@ Every inbound datagram is filtered before its payload is copied.
 | Reorder buffer over its cap, or a declared segment count × MTU over `MaximumReassembledPacketSize` | `Oversized` violation |
 | Too many messages in reassembly at once, segment headers that contradict each other, or a segment larger than this side's MTU | `Malformed` violation. On the reliable channel, a segment carrying the last index of its message, including any single-segment message, is dropped without one |
 | Packet transform rejects the payload | `TransformRejected` violation |
+
+### Session tokens
+
+A connected peer is recognised by its address, which anyone can write on a forged datagram. Session tokens stop a forger who is not on the path between two peers from ending a session, holding it open, or making it drop reliable messages, when all the forger can do is send datagrams carrying the peer's address.
+
+- **The token.** Each side picks a random 4-byte token for each connection and opens the nonce of every handshake it sends on that connection with it, retries included, so the peer learns it whichever handshake it answers. The rest of the nonce stays random, so each handshake is still a fresh key for the replay cache. The token adds nothing to the handshake: it is part of the nonce it always carried. Each connection stores its own token and the peer's, 8 bytes.
+- **Where it goes.** Every disconnect, keep-alive, acknowledgement and segment acknowledgement ends with the receiver's token, which only a sender that received one of the receiver's handshakes knows. Data packets carry none and are unchanged. A control packet whose token is missing or wrong is dropped and counted in `Telemetry.PacketsDroppedIn`, never reported as a violation, because nothing about it can be pinned on the peer whose address it carries. Checking it is one 4-byte comparison and allocates nothing.
+- **What it costs.** 4 bytes on each acknowledgement datagram, segment acknowledgement and keep-alive, a disconnect grows from 1 byte to 5, and a handshake carries one more byte for the version below. Reconnecting costs one more round trip: a handshake from an address that already holds a session is answered with the same stateless challenge an unknown endpoint gets, and only the answer to it replaces the session. A plain handshake within a second of this side's own is still read as the peer's answer and ignored, as before.
+- **Compatibility.** A handshake ends with a protocol version byte, which a peer that predates session tokens ignores, and a challenge carries the version only when the handshake it answers did. Tokens are used only when both sides' handshakes carry the version. A connection to a peer whose handshake does not behaves exactly as before, violations included, and can still be ended by a forged disconnect. An outbound connection still waiting on its handshake requires the token on what it receives from the start, and sends none until it has learned the peer's.
+
+Tokens do not cover data packets: a forger can still inject a payload as the peer, and a data packet whose body is malformed, such as a segment that contradicts its message or one that overflows the reorder buffer, still ends the session as a violation. Nor do they cover the handshake reply a connecting client is waiting for, which a forger who knows the client's address and port could beat to it.
 
 ### Violations and bans
 
@@ -318,7 +331,7 @@ With no handler attached, the engine applies its default for each reason. `Overs
 
 `DefaultSignatureProvider` hashes the remote **IP address and port** with FNV-1a, which keeps clients behind one NAT address distinct. The consequence is that **a ban is per IP:port, not per IP**: a banned peer that reconnects from a new source port has a new signature. A custom `ISignatureProvider` can key on the address alone, at the cost of every client behind one address sharing a signature.
 
-`ISignatureValidator.Validate` receives the endpoint, the signature and the handshake payload, and rejecting raises `ConnectionFailed(SignatureRejected)`. The built-in handshake carries only a random 8-byte nonce. Once live connections reach `HandshakeChallengeThreshold`, the payload a new peer's validator sees is 16 bytes: the nonce followed by the 8-byte token the peer echoed back. `Connect` offers no way to add application data, so today a validator is suited to allowing or denying by endpoint or signature rather than checking a token.
+`ISignatureValidator.Validate` receives the endpoint, the signature and the handshake payload, and rejecting raises `ConnectionFailed(SignatureRejected)`. The built-in handshake carries an 8-byte nonce, which opens with the peer's session token, followed by the protocol version: 9 bytes, or 8 from a peer that predates session tokens. When the handshake was challenged, the payload a validator sees is the answer instead: the nonce, the 8-byte token the peer echoed back, and the version, 17 bytes, or 16 from an older peer. `Connect` offers no way to add application data, so today a validator is suited to allowing or denying by endpoint or signature rather than checking a token.
 
 ---
 
@@ -340,7 +353,7 @@ engine.MaximumTransmissionUnit;  // 1380: what the engine packs against
 engine.MaximumPayloadSize;       // 1377: largest unsegmented payload
 ```
 
-Data, segment and control packets therefore land at or under the 1400 that was configured. **Batched acknowledgements are the exception:** they are still sized against the configured MTU rather than the reduced one, so a batch near the maximum of 699 acks to one peer can land up to `ReservedBytes` over it, and a receiver whose `MaximumPacketSize` equals that MTU treats it as `Oversized`. Both peers must run an equivalent transform.
+Data, segment and control packets therefore land at or under the 1400 that was configured. **Batched acknowledgements are the exception:** they are still sized against the configured MTU rather than the reduced one, so a batch near the maximum of 697 acks to one peer (699 to a peer that predates session tokens) can land up to `ReservedBytes` over it, and a receiver whose `MaximumPacketSize` equals that MTU drops it. Both peers must run an equivalent transform.
 
 ### Worked example: `ExampleXorPacketTransform`
 
@@ -463,7 +476,7 @@ The latency simulator delays, drops and reorders **this engine's outbound** pack
 - **A timeout never shows up in `ConnectionFailed`.** Both idle and handshake timeouts arrive as `ConnectionClosed` plus a `Timeout` violation, even for a connection that was never established.
 - **A refused peer is never told.** When this side rejects a handshake as `ServerFull`, `SignatureRejected` or `Blacklisted`, `ConnectionFailed` fires here and nothing is sent back to say so. At or above `HandshakeChallengeThreshold` the other side may first get a challenge and answer it, but its handshake is still never accepted, so it eventually times out.
 - **`NatTraversalFailed` leaves the connection pending.** It stops the probing; the handshake timeout closes the connection later.
-- **Peers with different MTUs can kick each other.** A received segment larger than this side's MTU is `Malformed`, and a datagram larger than `MaximumPacketSize` (1400) is `Oversized`. Give every peer the same MTU, at or below every peer's `MaximumPacketSize`.
+- **Peers with different MTUs can kick each other.** A received segment larger than this side's MTU is `Malformed`, and a datagram larger than `MaximumPacketSize` (1400) is dropped, or is `Oversized` from a peer that predates session tokens. Give every peer the same MTU, at or below every peer's `MaximumPacketSize`.
 
 ---
 
@@ -527,7 +540,7 @@ SynapseSocket.Tests/                   the test suite
 
 ## Tests
 
-201 xUnit tests in 23 suites. Almost all of them spin up real engines over loopback UDP sockets, with no mocking. Adversarial tests send hand-built datagrams from a plain `Socket`, the same thing a hostile peer on the network does.
+215 xUnit tests in 23 suites. Almost all of them spin up real engines over loopback UDP sockets, with no mocking. Adversarial tests send hand-built datagrams from a plain `Socket`, the same thing a hostile peer on the network does.
 
 | Suite | Tests | Coverage |
 |---|---|---|
@@ -549,7 +562,7 @@ SynapseSocket.Tests/                   the test suite
 | `SignatureValidatorTests` | 3 | Custom validators and signature providers |
 | `BeaconSecurityTests` | 5 | The beacon's join challenge, forged cookies, host-only heartbeat acknowledgement, per-address rate limiting |
 | `SweepFindingTests` | 49 | The robustness-sweep findings, each asserting the corrected behaviour; see `docs/ROBUSTNESS_SWEEP.md` |
-| `SecuritySweepTests` | 13 | The 2026-11 security sweep findings: a datagram refused from a sender with no connection, outright or by an `UnknownPacketReceived` handler, dropped and counted without a violation; a forged run against a connected peer earning it one strike rather than a ban; a server capped at or below `HandshakeChallengeThreshold` challenging every handshake, so unanswered handshakes cannot fill it; a reliable send past `Reliable.MaximumPending` returning `Dropped` without throwing or allocating; and seven reproductions skipped while their fixes are held for a design decision: forged datagrams ending or banning a connected peer, a forged acknowledgement losing a reliable message, a peer pinning memory behind a reliable gap, and duplicate segments each drawing a segment acknowledgement |
+| `SecuritySweepTests` | 27 | The 2026-11 security sweep findings: forged disconnects, keep-alives, acknowledgements, segment acknowledgements, handshakes and malformed datagrams that no longer end, hold open, empty or ban a connected peer's session, nor end a connection still waiting on its handshake; the session token opening every handshake retry and travelling only between peers that both advertise it; a connected peer's new handshake challenged before its proof replaces the session; a server capped at or below `HandshakeChallengeThreshold` challenging every handshake in the form the peer reads, so spoofed handshakes cannot fill it; a datagram refused from a sender with no connection, outright or by an `UnknownPacketReceived` handler, dropped and counted without a violation; a forged run against a peer that predates session tokens earning it one strike rather than a ban; a reliable send past `Reliable.MaximumPending` returning `Dropped` without throwing or allocating; and two reproductions skipped while their fixes are held for a design decision: a peer pinning memory behind a reliable gap, and duplicate segments each drawing a segment acknowledgement |
 | `TelemetryAndLatencyTests` | 15 | Telemetry counts, and the latency simulator's delay, jitter, loss and reordering |
 | `ConnectionStressTests` | 4 | Many clients sending rapidly, and repeated connect, send and disconnect cycles |
 | `PayloadIntegrityStressTests` | 5 | Received payloads never sharing a buffer with an unrelated rental |
