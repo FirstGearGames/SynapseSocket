@@ -527,7 +527,7 @@ SynapseSocket.Tests/                   the test suite
 
 ## Tests
 
-192 xUnit tests in 23 suites. Almost all of them spin up real engines over loopback UDP sockets, with no mocking. Adversarial tests send hand-built datagrams from a plain `Socket`, the same thing a hostile peer on the network does.
+200 xUnit tests in 23 suites. Almost all of them spin up real engines over loopback UDP sockets, with no mocking. Adversarial tests send hand-built datagrams from a plain `Socket`, the same thing a hostile peer on the network does.
 
 | Suite | Tests | Coverage |
 |---|---|---|
@@ -549,7 +549,7 @@ SynapseSocket.Tests/                   the test suite
 | `SignatureValidatorTests` | 3 | Custom validators and signature providers |
 | `BeaconSecurityTests` | 5 | The beacon's join challenge, forged cookies, host-only heartbeat acknowledgement, per-address rate limiting |
 | `SweepFindingTests` | 49 | The robustness-sweep findings, each asserting the corrected behaviour; see `docs/ROBUSTNESS_SWEEP.md` |
-| `SecuritySweepTests` | 4 | The 2026-11 security sweep findings: a datagram refused from a sender with no connection, outright or by an `UnknownPacketReceived` handler, dropped and counted without a violation; a forged run against a connected peer earning it one strike rather than a ban; and a reliable send past `Reliable.MaximumPending` returning `Dropped` without throwing or allocating |
+| `SecuritySweepTests` | 12 | The 2026-11 security sweep findings: a datagram refused from a sender with no connection, outright or by an `UnknownPacketReceived` handler, dropped and counted without a violation; a forged run against a connected peer earning it one strike rather than a ban; a reliable send past `Reliable.MaximumPending` returning `Dropped` without throwing or allocating; and eight reproductions skipped while their fixes are held for a design decision: forged datagrams ending or banning a connected peer, a forged acknowledgement losing a reliable message, unanswered handshakes filling a capped server, a peer pinning memory behind a reliable gap, and duplicate segments each drawing a segment acknowledgement |
 | `TelemetryAndLatencyTests` | 15 | Telemetry counts, and the latency simulator's delay, jitter, loss and reordering |
 | `ConnectionStressTests` | 4 | Many clients sending rapidly, and repeated connect, send and disconnect cycles |
 | `PayloadIntegrityStressTests` | 5 | Received payloads never sharing a buffer with an unrelated rental |
