@@ -285,6 +285,7 @@ Every inbound datagram is filtered before its payload is copied.
 | Reorder buffer over its cap, or a declared segment count × MTU over `MaximumReassembledPacketSize` | `Oversized` violation |
 | Segment headers that contradict each other, or a segment larger than this side's MTU | `Malformed` or `Oversized` violation. On the reliable channel, a segment carrying the last index of its message, including any single-segment message, is dropped without one |
 | A segment that would open more messages in reassembly than `MaximumConcurrentAssembliesPerConnection` | The oldest incomplete unreliable message is evicted for it, or, when every open one is reliable, the segment is dropped without a violation and the sender resends it |
+| A duplicate of a reliable segment this side already holds | Draws a segment acknowledgement at most once per message each `Reliable.ResendMilliseconds`, so resending held segments cannot multiply traffic; paced rather than dropped, since a sender whose final acknowledgement was lost recovers the message through it |
 | An out-of-order reliable message, or a reliable segment, that would take what a peer has held waiting for a gap past its byte allowance | Dropped unacknowledged and reported as the per-second limits report a drop: `RateLimitExceeded`, default `Drop`, counted in `Telemetry.PacketsDroppedIn`; see the held-byte budget below |
 | Packet transform rejects the payload | `TransformRejected` violation |
 
@@ -531,7 +532,7 @@ SynapseSocket.Tests/                   the test suite
 
 ## Tests
 
-209 xUnit tests in 23 suites. Almost all of them spin up real engines over loopback UDP sockets, with no mocking. Adversarial tests send hand-built datagrams from a plain `Socket`, the same thing a hostile peer on the network does.
+210 xUnit tests in 23 suites. Almost all of them spin up real engines over loopback UDP sockets, with no mocking. Adversarial tests send hand-built datagrams from a plain `Socket`, the same thing a hostile peer on the network does.
 
 | Suite | Tests | Coverage |
 |---|---|---|
@@ -553,7 +554,7 @@ SynapseSocket.Tests/                   the test suite
 | `SignatureValidatorTests` | 3 | Custom validators and signature providers |
 | `BeaconSecurityTests` | 5 | The beacon's join challenge, forged cookies, host-only heartbeat acknowledgement, per-address rate limiting |
 | `SweepFindingTests` | 49 | The robustness-sweep findings, each asserting the corrected behaviour; see `docs/ROBUSTNESS_SWEEP.md` |
-| `SecuritySweepTests` | 21 | The 2026-11 security sweep findings: a datagram refused from a sender with no connection, outright or by an `UnknownPacketReceived` handler, dropped and counted without a violation; a forged run against a connected peer earning it one strike rather than a ban; a reliable send past `Reliable.MaximumPending` returning `Dropped` without throwing or allocating; the held-byte budget holding a peer that never fills a reliable gap to its byte allowance, dropping what goes past it unacknowledged and reported as rate limited, giving an abandoned message's bytes back when its assembly expires, never holding a message it cannot count, and letting an honest sender deliver everything in order once the gap fills, with the budget off wherever the limits are; and seven reproductions skipped while their fixes are held for a design decision: forged datagrams ending or banning a connected peer, a forged acknowledgement losing a reliable message, unanswered handshakes filling a capped server, and duplicate segments each drawing a segment acknowledgement |
+| `SecuritySweepTests` | 22 | The 2026-11 security sweep findings: a datagram refused from a sender with no connection, outright or by an `UnknownPacketReceived` handler, dropped and counted without a violation; a forged run against a connected peer earning it one strike rather than a ban; a reliable send past `Reliable.MaximumPending` returning `Dropped` without throwing or allocating; the held-byte budget holding a peer that never fills a reliable gap to its byte allowance, dropping what goes past it unacknowledged and reported as rate limited, giving an abandoned message's bytes back when its assembly expires, never holding a message it cannot count, and letting an honest sender deliver everything in order once the gap fills, with the budget off wherever the limits are; duplicate segments drawing one segment acknowledgement per resend interval, and a message whose acknowledgements are lost still completing through them; and six reproductions skipped while their fixes are held for a design decision: forged datagrams ending or banning a connected peer, a forged acknowledgement losing a reliable message, and unanswered handshakes filling a capped server |
 | `TelemetryAndLatencyTests` | 15 | Telemetry counts, and the latency simulator's delay, jitter, loss and reordering |
 | `ConnectionStressTests` | 4 | Many clients sending rapidly, and repeated connect, send and disconnect cycles |
 | `PayloadIntegrityStressTests` | 5 | Received payloads never sharing a buffer with an unrelated rental |

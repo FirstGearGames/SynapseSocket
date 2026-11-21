@@ -145,7 +145,8 @@ public sealed partial class SynapseConnection
     /// <param name="segmentId">The segment id the message's segments carry.</param>
     /// <param name="segmentLength">The stored segment's payload length.</param>
     /// <param name="nowTicks">When the segment arrived, which for a new entry is when its message began, as the reassembler records it.</param>
-    internal void AddSplitMessageBytes(int splitMessageIndex, ushort segmentId, int segmentLength, long nowTicks)
+    /// <returns>The message's entry.</returns>
+    internal int AddSplitMessageBytes(int splitMessageIndex, ushort segmentId, int segmentLength, long nowTicks)
     {
         if (splitMessageIndex == UnsetSplitMessageIndex)
         {
@@ -155,6 +156,8 @@ public sealed partial class SynapseConnection
 
         SplitMessages[splitMessageIndex].HeldLength += (uint)segmentLength;
         SplitMessageByteCount += (uint)segmentLength;
+
+        return splitMessageIndex;
     }
 
     /// <summary>
@@ -184,6 +187,37 @@ public sealed partial class SynapseConnection
     }
 
     /// <summary>
+    /// True when a duplicate segment of the message at <paramref name="splitMessageIndex"/> may draw a segment acknowledgement: none has
+    /// gone out for the message within <paramref name="intervalTicks"/>, or the message has no entry to keep the time in.
+    /// </summary>
+    /// <param name="splitMessageIndex">The message's entry, or <see cref="UnsetSplitMessageIndex"/> for one the table does not count.</param>
+    /// <param name="nowTicks">The current time.</param>
+    /// <param name="intervalTicks">The least time between two segment acknowledgements for one message.</param>
+    /// <returns>True when the acknowledgement may be sent.</returns>
+    internal bool IsSegmentAckDue(int splitMessageIndex, long nowTicks, long intervalTicks)
+    {
+        // A message the table does not count has nowhere to keep the time, so its acknowledgements go unpaced, as they always have.
+        if (splitMessageIndex == UnsetSplitMessageIndex)
+            return true;
+
+        long lastSegmentAckTicks = SplitMessages[splitMessageIndex].LastSegmentAckTicks;
+
+        return lastSegmentAckTicks == SplitMessage.UnsetSegmentAckTicks || nowTicks - lastSegmentAckTicks >= intervalTicks;
+    }
+
+    /// <summary>
+    /// Records that a segment acknowledgement for the message at <paramref name="splitMessageIndex"/> went out at
+    /// <paramref name="nowTicks"/>, which paces the next one a duplicate segment can draw.
+    /// </summary>
+    /// <param name="splitMessageIndex">The message's entry, or <see cref="UnsetSplitMessageIndex"/> for one the table does not count.</param>
+    /// <param name="nowTicks">When the acknowledgement went out.</param>
+    internal void RecordSegmentAck(int splitMessageIndex, long nowTicks)
+    {
+        if (splitMessageIndex != UnsetSplitMessageIndex)
+            SplitMessages[splitMessageIndex].LastSegmentAckTicks = nowTicks;
+    }
+
+    /// <summary>
     /// One reliable message in reassembly, as <see cref="SplitMessages"/> counts it.
     /// </summary>
     internal struct SplitMessage
@@ -200,6 +234,14 @@ public sealed partial class SynapseConnection
         /// When the message's first segment arrived, which its expiry is measured from.
         /// </summary>
         public long FirstReceivedTicks;
+        /// <summary>
+        /// When the last segment acknowledgement for the message went out, or <see cref="UnsetSegmentAckTicks"/> before the first.
+        /// </summary>
+        public long LastSegmentAckTicks;
+        /// <summary>
+        /// The value of <see cref="LastSegmentAckTicks"/> before any segment acknowledgement for the message has gone out.
+        /// </summary>
+        public const long UnsetSegmentAckTicks = long.MinValue;
 
         /// <summary>
         /// Opens an entry for a message whose first segment arrived at <paramref name="firstReceivedTicks"/>.
@@ -211,6 +253,7 @@ public sealed partial class SynapseConnection
             SegmentId = segmentId;
             HeldLength = 0;
             FirstReceivedTicks = firstReceivedTicks;
+            LastSegmentAckTicks = UnsetSegmentAckTicks;
         }
     }
 }

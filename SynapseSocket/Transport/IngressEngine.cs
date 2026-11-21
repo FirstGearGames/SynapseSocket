@@ -237,6 +237,11 @@ internal sealed partial class IngressEngine
     /// one the table has no room to count is dropped as past the budget rather than held uncounted.
     /// </summary>
     private readonly bool _uncountedSplitMessageRefusalEnabled;
+    /// <summary>
+    /// The least time between two segment acknowledgements one reliable message draws from duplicate segments:
+    /// <see cref="ReliableConfig.ResendMilliseconds"/>, the interval an honest sender resends at.
+    /// </summary>
+    private readonly long _segmentAckIntervalTicks;
 
     /// <summary>
     /// Window within which an inbound handshake is read as the peer's answer to one we just sent, rather than as a
@@ -349,6 +354,7 @@ internal sealed partial class IngressEngine
 
         uint effectiveMaximumConcurrentAssemblies = SynapseConfig.ToEffectiveLimit(config.Segment.MaximumConcurrentAssembliesPerConnection);
         _splitMessageLimit = (int)Math.Min(effectiveMaximumConcurrentAssemblies, SynapseConnection.SplitMessageTableLength);
+        _segmentAckIntervalTicks = config.Reliable.ResendMilliseconds * TimeSpan.TicksPerMillisecond;
 
         /* The budget applies exactly where the byte allowance does. A client that sets no limits on its server therefore holds whatever a
          * gap in a large reliable snapshot needs, as it always has. */
@@ -1119,7 +1125,7 @@ internal sealed partial class IngressEngine
                      * for a contradicting segment keeps its entry until the entry expires: only a peer breaking the protocol sends one, and
                      * the bytes still counted come out of that peer's own allowance. */
                     if (!isDuplicateSegment && !isProtocolViolation && hasSplitMessageRoom && segmentIndex < segmentCount && segmentCount <= _effectiveMaximumSegments)
-                        synapseConnection.AddSplitMessageBytes(splitMessageIndex, segmentId, payloadLength, nowTicks);
+                        splitMessageIndex = synapseConnection.AddSplitMessageBytes(splitMessageIndex, segmentId, payloadLength, nowTicks);
 
                     if (isDuplicateSegment || segmentIndex == segmentCount - 1)
                     {
@@ -1128,9 +1134,17 @@ internal sealed partial class IngressEngine
                          * Two triggers. The last segment arriving while the assembly is still incomplete means the
                          * burst finished and something was lost. Reporting immediately avoids the sender's first
                          * blind retransmit of everything. A duplicate segment covers the case where the last one
-                         * was itself lost, so the only signal is the sender retransmitting. */
-                        if (reassembler.TryWriteReceivedBitmap(segmentId, new(_receivedBitmapBuffer), out _))
+                         * was itself lost, so the only signal is the sender retransmitting.
+                         *
+                         * A duplicate draws a report at most once per resend interval for its message: resending a held
+                         * segment costs a few bytes, and every report is a full bitmap. It is paced rather than dropped,
+                         * because a sender whose final acknowledgement was lost recovers the message through it. */
+                        if ((!isDuplicateSegment || synapseConnection.IsSegmentAckDue(splitMessageIndex, nowTicks, _segmentAckIntervalTicks))
+                            && reassembler.TryWriteReceivedBitmap(segmentId, new(_receivedBitmapBuffer), out _))
+                        {
+                            synapseConnection.RecordSegmentAck(splitMessageIndex, nowTicks);
                             _sender.SendSegmentAck(synapseConnection, sequence, _receivedBitmapBuffer);
+                        }
                     }
                     else if (isProtocolViolation)
                         ReportSegmentViolation(fromEndPoint, synapseConnection, payloadLength, length);

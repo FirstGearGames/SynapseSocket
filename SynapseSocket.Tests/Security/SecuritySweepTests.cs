@@ -40,10 +40,6 @@ public sealed class SecuritySweepTests
     /// </summary>
     private const string HeldForHandshakeChallenge = "Held for Ben: SYNCONN-3 needs the handshake challenge below the cap, an extra round trip at connect.";
     /// <summary>
-    /// Skip reason for the finding whose fix needs per-assembly state in CodeBoost's PacketReassembler.
-    /// </summary>
-    private const string HeldForSegmentAckPacing = "Held for Ben: SYNREL-3 needs per-assembly state in CodeBoost's PacketReassembler.";
-    /// <summary>
     /// The type byte of a datagram no Synapse packet uses.
     /// </summary>
     private const byte UnknownTypeByte = 0xFF;
@@ -728,7 +724,7 @@ public sealed class SecuritySweepTests
     /// SYNREL-3: duplicates of a segment the receiver already holds must not each draw a segment acknowledgement, which turns a 7-byte
     /// datagram into a 35-byte one.
     /// </summary>
-    [Fact(Skip = HeldForSegmentAckPacing)]
+    [Fact]
     public void SYNREL3_DuplicateSegments_DoNotEachDrawASegmentAck()
     {
         const int DuplicateCount = 50;
@@ -776,6 +772,46 @@ public sealed class SecuritySweepTests
         Assert.True(
             segmentAckCount <= 1,
             $"[{sentBytes}] bytes of one segment, sent [{DuplicateCount + 1}] times inside one resend interval, drew [{segmentAckCount}] segment acknowledgements totalling [{segmentAckBytes}] bytes");
+    }
+
+    /// <summary>
+    /// SYNREL-3: segment acknowledgements are paced, not removed. A reliable message whose every acknowledgement is lost, along with the
+    /// first segment acknowledgement it draws, still completes on the sender within its default resends, through the reports its resent
+    /// segments draw once the interval has passed.
+    /// </summary>
+    [Fact]
+    public void SYNREL3_MessageWhoseAcknowledgementIsLost_StillCompletes()
+    {
+        const int SegmentsPerMessage = 5;
+
+        AcknowledgementDroppingTransform acknowledgementDroppingTransform = new();
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port, config => config.PacketTransform = acknowledgementDroppingTransform));
+        using SynapseManager client = new(TestHarness.ClientConfig());
+
+        TestHarness.EventRecorder clientEvents = new();
+        clientEvents.Attach(client);
+        List<byte[]> deliveredPayloads = [];
+        server.PacketReceived += packetReceivedEventArgs => deliveredPayloads.Add(packetReceivedEventArgs.Payload.ToArray());
+
+        server.Start();
+        client.Start();
+
+        SynapseConnection clientConnection = client.Connect(new(IPAddress.Loopback, port));
+        Assert.True(TestHarness.PumpUntil(() => clientConnection.State is ConnectionState.Connected && server.Connections.Count == 1, 3000, server, client), "the sender never connected");
+
+        byte[] message = BuildFilledMessage(fill: 1, SegmentsPerMessage * ((int)client.MaximumTransmissionUnit - PacketHeader.ComputeHeaderSize(PacketType.ReliableSegmented)));
+
+        acknowledgementDroppingTransform.IsDroppingAcknowledgements = true;
+        client.Send(clientConnection, message, isReliable: true);
+
+        // Released, not torn down: a sender that exhausts its resends closes the connection, which empties the queue as well.
+        Assert.True(
+            TestHarness.PumpUntil(() => clientConnection.PendingReliableQueue.Count == 0 || clientEvents.ConnectionsClosed > 0, 4000, server, client) && clientEvents.ConnectionsClosed == 0,
+            $"the message was never released: [{acknowledgementDroppingTransform.DroppedAckCount}] acknowledgements lost, [{string.Join(", ", clientEvents.ViolationReasons)}] raised");
+
+        Assert.True(acknowledgementDroppingTransform.DroppedAckCount > 0 && acknowledgementDroppingTransform.DroppedSegmentAckCount == 1, "no acknowledgement was lost, so the test proved nothing");
+        Assert.True(deliveredPayloads.Count == 1 && message.AsSpan().SequenceEqual(deliveredPayloads[0]), $"the message was delivered [{deliveredPayloads.Count}] times");
     }
 
     /// <summary>
@@ -1240,6 +1276,55 @@ public sealed class SecuritySweepTests
 
             if (IsDroppingGapMessage && packetTransformDirection == PacketTransformDirection.Outbound && packetType == PacketType.ReliableSegmented && source.Length > 0 && source[0] == GapMessageFill)
                 return false;
+
+            source.CopyTo(destination);
+
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// A pass-through transform for a receiver that, while armed, loses every acknowledgement it sends and the first segment
+    /// acknowledgement, standing in for a network that keeps losing the receiver's answers.
+    /// </summary>
+    private sealed class AcknowledgementDroppingTransform : IPacketTransform
+    {
+        /// <summary>
+        /// True while acknowledgements are lost.
+        /// </summary>
+        public bool IsDroppingAcknowledgements;
+        /// <summary>
+        /// The acknowledgements lost so far.
+        /// </summary>
+        public int DroppedAckCount;
+        /// <summary>
+        /// The segment acknowledgements lost so far, which is never more than one.
+        /// </summary>
+        public int DroppedSegmentAckCount;
+        /// <inheritdoc/>
+        public uint ReservedBytes => 0;
+
+        /// <inheritdoc/>
+        public bool TryTransform(PacketTransformDirection packetTransformDirection, PacketType packetType, IPEndPoint endPoint, ReadOnlySpan<byte> source, Span<byte> destination, out int writtenLength)
+        {
+            writtenLength = source.Length;
+
+            if (IsDroppingAcknowledgements && packetTransformDirection == PacketTransformDirection.Outbound)
+            {
+                if (packetType == PacketType.Ack)
+                {
+                    DroppedAckCount++;
+
+                    return false;
+                }
+
+                if (packetType == PacketType.SegmentAck && DroppedSegmentAckCount == 0)
+                {
+                    DroppedSegmentAckCount++;
+
+                    return false;
+                }
+            }
 
             source.CopyTo(destination);
 
