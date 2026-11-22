@@ -217,19 +217,12 @@ internal sealed partial class IngressEngine
     /// </summary>
     /// <remarks>
     /// An out-of-order reliable packet or a reliable segment that would take a connection past it is dropped unacknowledged, and reported
-    /// as the per-second rate limit reports a drop, so an honest sender resends it once the gap has drained. A connection marked
+    /// as the per-second rate limit reports a drop, so an honest sender resends it once the gap has drained. The segments of the message
+    /// the gap waits on are held to it too: a peer holding a whole second of its allowance behind its own gap is sending far more than it
+    /// should, and if that gap cannot fill, the peer's resends run out and the connection ends like any dead link. A connection marked
     /// <see cref="SynapseConnection.IsRateLimitExempt"/> skips the budget as it skips the rate limits.
     /// </remarks>
     private readonly ulong _heldByteBudget;
-    /// <summary>
-    /// <see cref="_heldByteBudget"/> raised by the most one assembly can hold, applied to the segments of the reliable message a gap
-    /// waits on, or <see cref="UnlimitedHeldByteBudget"/> where the budget is not applied.
-    /// </summary>
-    /// <remarks>
-    /// Without the headroom, later messages filling the budget would refuse the segments of the one message that drains it, and the gap
-    /// would never fill.
-    /// </remarks>
-    private readonly ulong _gapHeldByteBudget;
     /// <summary>
     /// The most reliable messages <see cref="SynapseConnection.SplitMessages"/> counts for one connection: the concurrent-assembly cap,
     /// at which the reassembler itself refuses one more, or the table's length where the cap is larger or disabled.
@@ -257,8 +250,8 @@ internal sealed partial class IngressEngine
     /// </summary>
     private const ushort SequenceHalfSpace = 32768;
     /// <summary>
-    /// The value of <see cref="_heldByteBudget"/> and <see cref="_gapHeldByteBudget"/> where the budget is not applied, which no
-    /// connection can reach, so the check stays one comparison.
+    /// The value of <see cref="_heldByteBudget"/> where the budget is not applied, which no connection can reach, so the check stays one
+    /// comparison.
     /// </summary>
     private const ulong UnlimitedHeldByteBudget = ulong.MaxValue;
 
@@ -364,14 +357,10 @@ internal sealed partial class IngressEngine
         if (_isSecurityEnabled && config.Security.MaximumBytesPerSecond != SecurityConfig.DisabledMaximumBytesPerSecond)
         {
             _heldByteBudget = config.Security.MaximumBytesPerSecond;
-            _gapHeldByteBudget = _heldByteBudget + (ulong)_effectiveMaximumSegments * _effectiveMaximumTransmissionUnit;
             _uncountedSplitMessageRefusalEnabled = effectiveMaximumConcurrentAssemblies > SynapseConnection.SplitMessageTableLength;
         }
         else
-        {
             _heldByteBudget = UnlimitedHeldByteBudget;
-            _gapHeldByteBudget = UnlimitedHeldByteBudget;
-        }
 
         /* A connection cap at or below the threshold fills before the gate engages, so every slot would go to whoever sends a
          * handshake, from any source address, spoofed or not. Under such a cap every handshake from an unknown endpoint is
@@ -1120,7 +1109,7 @@ internal sealed partial class IngressEngine
                     bool hasSplitMessageRoom = splitMessageIndex != SynapseConnection.UnsetSplitMessageIndex || synapseConnection.SplitMessageCount < _splitMessageLimit;
 
                     // Held until its message completes, so a segment past the budget is dropped before it is stored; the sender resends it.
-                    if (IsReliableSegmentPastBudget(synapseConnection, payloadLength, isNextExpectedSequence: sequence == synapseConnection.NextExpectedSequence, hasSplitMessageRoom))
+                    if (IsReliableSegmentPastBudget(synapseConnection, payloadLength, hasSplitMessageRoom))
                     {
                         ReportHeldByteBudgetExceeded(fromEndPoint, synapseConnection, length);
                         return;
@@ -1301,14 +1290,12 @@ internal sealed partial class IngressEngine
     /// </summary>
     /// <param name="synapseConnection">The connection the segment arrived on.</param>
     /// <param name="payloadLength">The segment's payload length.</param>
-    /// <param name="isNextExpectedSequence">True for a segment of the message the gap waits on, held to <see cref="_gapHeldByteBudget"/>.</param>
     /// <param name="hasSplitMessageRoom">True when the segment's message has an entry or there is room to open one.</param>
     /// <returns>True when the segment must be dropped.</returns>
     /// <remarks>Within the budget this costs one addition and one comparison; the exemption is read only past it.</remarks>
-    private bool IsReliableSegmentPastBudget(SynapseConnection synapseConnection, int payloadLength, bool isNextExpectedSequence, bool hasSplitMessageRoom)
+    private bool IsReliableSegmentPastBudget(SynapseConnection synapseConnection, int payloadLength, bool hasSplitMessageRoom)
     {
-        ulong heldByteLimit = isNextExpectedSequence ? _gapHeldByteBudget : _heldByteBudget;
-        bool isPastBudget = synapseConnection.HeldByteCount + (uint)payloadLength > heldByteLimit || (!hasSplitMessageRoom && _uncountedSplitMessageRefusalEnabled);
+        bool isPastBudget = synapseConnection.HeldByteCount + (uint)payloadLength > _heldByteBudget || (!hasSplitMessageRoom && _uncountedSplitMessageRefusalEnabled);
 
         return isPastBudget && !synapseConnection.IsRateLimitExempt;
     }

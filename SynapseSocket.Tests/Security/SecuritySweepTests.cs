@@ -819,12 +819,11 @@ public sealed class SecuritySweepTests
     }
 
     /// <summary>
-    /// SYNREL-2: the segments of the message a gap waits on may go one message past the allowance, so a full budget never keeps out the
-    /// message that drains it, and that headroom is all a peer gets: assemblies opened on the awaited sequence hold no more than the
-    /// allowance and one message.
+    /// SYNREL-2: nothing goes past the allowance, not even the segments of the message a gap waits on, so assemblies opened on the
+    /// awaited sequence hold no more than the allowance.
     /// </summary>
     [Fact]
-    public void SYNREL2_AssembliesOnTheAwaitedSequence_HoldNoMoreThanTheBudgetAndOneMessage()
+    public void SYNREL2_AssembliesOnTheAwaitedSequence_HoldNoMoreThanTheBudget()
     {
         const byte SegmentCount = 255;
         const int SentSegmentCount = 250;
@@ -854,9 +853,9 @@ public sealed class SecuritySweepTests
         TestHarness.PumpFor(200, server);
 
         long assemblyBytes = MeasureAssemblyBytes(attackerConnection, lastSegmentId: AssemblyCount, segmentPayloadLength);
-        long heldByteCeiling = server.Config.Security.MaximumBytesPerSecond + (long)SegmentCount * server.MaximumTransmissionUnit;
+        long byteAllowance = server.Config.Security.MaximumBytesPerSecond;
 
-        Assert.True(assemblyBytes <= heldByteCeiling, $"[{assemblyBytes}] payload bytes held in assemblies on the awaited sequence against the allowance and one message, [{heldByteCeiling}]");
+        Assert.True(assemblyBytes <= byteAllowance, $"[{assemblyBytes}] payload bytes held in assemblies on the awaited sequence against an allowance of [{byteAllowance}]");
     }
 
     /// <summary>
@@ -865,10 +864,11 @@ public sealed class SecuritySweepTests
     /// gap drains, which gives the whole budget back for the next gap.
     /// </summary>
     /// <remarks>
-    /// The lost message is segmented and stays lost until the backlog has filled the budget, so it can only complete through the headroom
-    /// its segments get past the budget. Each burst ends with an unsegmented message, and the second one lands past the budget: had it
-    /// been acknowledged, the sender would have released it and it would never arrive. The sender is allowed more resends than the default
-    /// because the test holds the gap open, on purpose, for longer than the default resends last.
+    /// This is the normal case, where the message the gap waits on fits: the first lost message is unsegmented, so it is delivered as it
+    /// arrives and never held, and the second gap's segmented one fits beside a backlog under the budget. Each burst ends with an
+    /// unsegmented message, and the second one lands past the budget: had it been acknowledged, the sender would have released it and it
+    /// would never arrive. The sender is allowed more resends than the default because the test holds the gap open, on purpose, for
+    /// longer than the default resends last.
     /// </remarks>
     [Fact]
     public void SYNREL1_HonestSenderPastTheBudget_DeliversEveryMessageInOrderOnceTheGapFills()
@@ -902,7 +902,7 @@ public sealed class SecuritySweepTests
         Assert.True(TestHarness.PumpUntil(() => clientConnection.State is ConnectionState.Connected && server.Connections.Count == 1, 3000, server, client), "the sender never connected");
 
         int segmentedMessageLength = SegmentsPerMessage * ((int)client.MaximumTransmissionUnit - PacketHeader.ComputeHeaderSize(PacketType.ReliableSegmented));
-        List<byte[]> sentMessages = [BuildFilledMessage(GapTransform.GapMessageFill, segmentedMessageLength)];
+        List<byte[]> sentMessages = [BuildFilledMessage(GapTransform.GapMessageFill, UnsegmentedMessageLength)];
 
         gapTransform.IsDroppingGapMessage = true;
         client.Send(clientConnection, sentMessages[0], isReliable: true);
@@ -958,6 +958,88 @@ public sealed class SecuritySweepTests
 
         for (int i = 0; i < sentMessages.Count; i++)
             Assert.True(sentMessages[i].AsSpan().SequenceEqual(deliveredPayloads[i]), $"message [{i}] arrived out of order or altered");
+    }
+
+    /// <summary>
+    /// SYNREL-1: a sender that fills the budget behind its own gap, while the message the gap waits on is segmented, stays stuck behind it,
+    /// since nothing goes past the allowance. That is the accepted outcome, and it ends like any dead link: what the receiver holds never
+    /// goes past the allowance, the sender's resends run out, and the receiver releases the connection on its timeout.
+    /// </summary>
+    [Fact]
+    public void SYNREL1_SenderStuckBehindItsOwnGap_IsHeldToTheBudgetUntilTheConnectionTimesOut()
+    {
+        const int ByteAllowance = 128 * 1024;
+        const int SegmentsPerMessage = 20;
+        const int MessagesPerBurst = 5;
+        const int BurstCount = 2;
+        // Longer than the silence after the first burst, when everything sent is acknowledged and only the lost message is resent.
+        const uint TimeoutMilliseconds = 2000;
+        const int ReleaseWaitMilliseconds = 10_000;
+
+        GapTransform gapTransform = new();
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port, config =>
+        {
+            config.Security.MaximumBytesPerSecond = ByteAllowance;
+            config.Connection.TimeoutMilliseconds = TimeoutMilliseconds;
+        }));
+        using SynapseManager client = new(TestHarness.ClientConfig(config => config.PacketTransform = gapTransform));
+
+        TestHarness.EventRecorder serverEvents = new();
+        serverEvents.Attach(server);
+        TestHarness.EventRecorder clientEvents = new();
+        clientEvents.Attach(client);
+
+        server.Start();
+        client.Start();
+
+        SynapseConnection clientConnection = client.Connect(new(IPAddress.Loopback, port));
+        Assert.True(TestHarness.PumpUntil(() => clientConnection.State is ConnectionState.Connected && server.Connections.Count == 1, 3000, server, client), "the sender never connected");
+
+        SynapseConnection serverConnection = server.Connections.Connections[0];
+        int segmentPayloadLength = (int)client.MaximumTransmissionUnit - PacketHeader.ComputeHeaderSize(PacketType.ReliableSegmented);
+        int segmentedMessageLength = SegmentsPerMessage * segmentPayloadLength;
+
+        // The lost message is segmented, so it needs room in the budget that the backlog behind it is about to fill.
+        gapTransform.IsDroppingGapMessage = true;
+        client.Send(clientConnection, BuildFilledMessage(GapTransform.GapMessageFill, segmentedMessageLength), isReliable: true);
+
+        // One burst per rate window, each under the allowance, so nothing is rate limited and every drop is the budget's.
+        for (int burst = 0; burst < BurstCount; burst++)
+        {
+            for (int burstIndex = 0; burstIndex < MessagesPerBurst; burstIndex++)
+                client.Send(clientConnection, BuildFilledMessage((byte)(1 + burst * MessagesPerBurst + burstIndex), segmentedMessageLength), isReliable: true);
+
+            TestHarness.PumpFor(1100, server, client);
+        }
+
+        // The lost message's resends now reach the receiver, and find the budget full.
+        gapTransform.IsDroppingGapMessage = false;
+
+        long peakHeldBytes = 0;
+        long deadlineMilliseconds = Environment.TickCount64 + ReleaseWaitMilliseconds;
+
+        while (server.Connections.Count > 0 && Environment.TickCount64 < deadlineMilliseconds)
+        {
+            // Every message sent opened its own segment id, 1 to 11, so measuring those covers everything held.
+            long heldBytes = MeasureAssemblyBytes(serverConnection, lastSegmentId: 1 + BurstCount * MessagesPerBurst, segmentPayloadLength);
+
+            foreach (ArraySegment<byte> reorderedPayload in serverConnection.ReorderBuffer.Values)
+                heldBytes += reorderedPayload.Count;
+
+            peakHeldBytes = Math.Max(peakHeldBytes, heldBytes);
+
+            server.Poll();
+            client.Poll();
+            Thread.Sleep(1);
+        }
+
+        Assert.True(server.Connections.Count == 0, $"the receiver still held the stuck connection [{ReleaseWaitMilliseconds}] ms after the gap's resends began");
+        Assert.True(peakHeldBytes > ByteAllowance - segmentPayloadLength && peakHeldBytes <= ByteAllowance, $"the receiver held at most [{peakHeldBytes}] payload bytes against an allowance of [{ByteAllowance}]");
+        Assert.True(serverEvents.PacketsReceived == 0, $"[{serverEvents.PacketsReceived}] messages were delivered past a gap that never filled");
+        Assert.Contains(ViolationReason.ReliableExhausted, clientEvents.ViolationReasons);
+        Assert.Contains(ViolationReason.Timeout, serverEvents.ViolationReasons);
+        Assert.All(serverEvents.ViolationReasons, violationReason => Assert.True(violationReason is ViolationReason.RateLimitExceeded or ViolationReason.Timeout, $"the receiver raised [{violationReason}]"));
     }
 
     /// <summary>
@@ -1627,8 +1709,8 @@ public sealed class SecuritySweepTests
     }
 
     /// <summary>
-    /// A pass-through transform for a sender that loses every reliable segment of the gap message while armed, standing in for a message
-    /// lost on the network for as long as a test needs the backlog behind it to build.
+    /// A pass-through transform for a sender that loses the gap message, segmented or not, while armed, standing in for a message lost on
+    /// the network for as long as a test needs the backlog behind it to build.
     /// </summary>
     private sealed class GapTransform : IPacketTransform
     {
@@ -1648,7 +1730,7 @@ public sealed class SecuritySweepTests
         {
             writtenLength = source.Length;
 
-            if (IsDroppingGapMessage && packetTransformDirection == PacketTransformDirection.Outbound && packetType == PacketType.ReliableSegmented && source.Length > 0 && source[0] == GapMessageFill)
+            if (IsDroppingGapMessage && packetTransformDirection == PacketTransformDirection.Outbound && packetType is PacketType.Reliable or PacketType.ReliableSegmented && source.Length > 0 && source[0] == GapMessageFill)
                 return false;
 
             source.CopyTo(destination);
