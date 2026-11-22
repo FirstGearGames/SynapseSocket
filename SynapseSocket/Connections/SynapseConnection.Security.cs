@@ -1,5 +1,8 @@
 using System;
+using System.Buffers.Binary;
+using System.Collections.Generic;
 using CodeBoost.CodeAnalysis;
+using SynapseSocket.Packets;
 
 namespace SynapseSocket.Connections;
 
@@ -38,6 +41,16 @@ public sealed partial class SynapseConnection
     /// </summary>
     [PoolResettableMember]
     internal SessionTokenState SessionTokenState;
+    /// <summary>
+    /// Whether this connection's data packets carry the session token, decided from the handshake that established the session.
+    /// </summary>
+    [PoolResettableMember]
+    internal DataSessionTokenState DataSessionTokenState;
+    /// <summary>
+    /// The bytes every data packet built for this connection leaves free after it for the session token: <see cref="PacketHeader.SessionTokenSize"/>,
+    /// or 0 while <see cref="DataSessionTokenState"/> is <see cref="Connections.DataSessionTokenState.Disabled"/>.
+    /// </summary>
+    internal int DataSessionTokenReservedSize => DataSessionTokenState is DataSessionTokenState.Disabled ? 0 : PacketHeader.SessionTokenSize;
 
     /// <summary>
     /// The payload bytes this peer has held waiting for a reliable gap: <see cref="ReorderBufferByteCount"/> and
@@ -127,6 +140,32 @@ public sealed partial class SynapseConnection
             return false;
 
         return true;
+    }
+
+    /// <summary>
+    /// Ends each of <paramref name="dataPackets"/> with <see cref="RemoteSessionToken"/>, written into the room left after it when it was
+    /// built, so the data packets carry the session token.
+    /// </summary>
+    /// <param name="dataPackets">Data packets, each built with <see cref="PacketHeader.SessionTokenSize"/> bytes free after it.</param>
+    internal void AppendSessionToken(List<ArraySegment<byte>> dataPackets)
+    {
+        for (int i = 0; i < dataPackets.Count; i++)
+        {
+            ArraySegment<byte> dataPacket = dataPackets[i];
+            BinaryPrimitives.WriteUInt32LittleEndian(dataPacket.Array.AsSpan(dataPacket.Offset + dataPacket.Count), RemoteSessionToken);
+            dataPackets[i] = new(dataPacket.Array!, dataPacket.Offset, dataPacket.Count + PacketHeader.SessionTokenSize);
+        }
+    }
+
+    /// <summary>
+    /// Ends the data packets of every reliable message awaiting acknowledgement with <see cref="RemoteSessionToken"/>, once a session
+    /// requested with data session tokens is established with them. Those messages were sent while the peer's token was not known, and
+    /// left room for it, so their resends now carry it.
+    /// </summary>
+    internal void AppendSessionTokenToPendingReliables()
+    {
+        foreach (KeyValuePair<ushort, PendingReliable> entry in PendingReliableQueue)
+            AppendSessionToken(entry.Value.Segments);
     }
 
     /// <summary>

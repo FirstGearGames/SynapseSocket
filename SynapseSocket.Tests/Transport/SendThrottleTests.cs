@@ -261,6 +261,84 @@ public sealed class SendThrottleTests
     }
 
     /// <summary>
+    /// With data session tokens on at both ends, payloads the throttle queues on both channels, whole and split, arrive intact, each
+    /// datagram carrying the token, which the server refuses any data packet without.
+    /// </summary>
+    [Fact]
+    public void Queued_Payloads_With_Data_Session_Tokens_Arrive_Intact()
+    {
+        const int SendCount = 24;
+
+        using ConnectedPair connectedPair = ConnectedPair.Create(sendThrottleConfig =>
+        {
+            sendThrottleConfig.MaximumBytesPerRelease = NineDatagramRelease;
+            sendThrottleConfig.MinimumReleaseIntervalMilliseconds = 20;
+        }, isDataSessionTokenEnabled: true);
+
+        int queuedCount = 0;
+
+        for (int i = 0; i < SendCount; i++)
+        {
+            if (connectedPair.Client.Send(connectedPair.Connection, CreatePayload(i), isReliable: i % 2 == 1) is SendResult.Queued)
+                queuedCount++;
+        }
+
+        Assert.True(queuedCount > 0, "nothing was queued, so the test proved nothing");
+        Assert.True(connectedPair.PumpUntilReceived(SendCount), $"The server received [{connectedPair.ReceivedPayloads.Count}] of [{SendCount}].");
+        connectedPair.AssertReceivedEachOnce(SendCount);
+
+        byte[] unreliablePayload = CreateLargePayload(length: 40_000, seed: 5);
+        byte[] reliablePayload = CreateLargePayload(length: 40_000, seed: 6);
+
+        Assert.Equal(SendResult.Queued, connectedPair.Client.Send(connectedPair.Connection, unreliablePayload, isReliable: false));
+        Assert.Equal(SendResult.Queued, connectedPair.Client.Send(connectedPair.Connection, reliablePayload, isReliable: true));
+
+        Assert.True(connectedPair.PumpUntilReceived(SendCount + 2), $"The server received [{connectedPair.ReceivedPayloads.Count}] of [{SendCount + 2}].");
+        Assert.Contains(connectedPair.ReceivedPayloads, receivedPayload => receivedPayload.AsSpan().SequenceEqual(unreliablePayload));
+        Assert.Contains(connectedPair.ReceivedPayloads, receivedPayload => receivedPayload.AsSpan().SequenceEqual(reliablePayload));
+    }
+
+    /// <summary>
+    /// With data session tokens on at both ends, under <see cref="SendQueueFullAction.DropNewest"/>, a split is admitted only when the queue
+    /// holds every segment with its token: ten full reliable segments are 12,000 bytes at the default transmission unit, which a queue of
+    /// exactly that takes and one a byte smaller drops whole.
+    /// </summary>
+    /// <param name="queueSlack">The queue limit's difference from the split's length on the wire.</param>
+    /// <param name="expectedSendResult">What the send of the split reports.</param>
+    [Theory]
+    [InlineData(0, SendResult.Queued)]
+    [InlineData(-1, SendResult.Dropped)]
+    public void Split_With_Data_Session_Tokens_Is_Admitted_Only_When_The_Queue_Holds_Every_Segment_With_Its_Token(int queueSlack, SendResult expectedSendResult)
+    {
+        const int SegmentCount = 10;
+
+        int transmissionUnit = (int)new SynapseConfig().MaximumTransmissionUnit;
+        int segmentPayloadLength = transmissionUnit - PacketHeader.ComputeHeaderSize(PacketType.ReliableSegmented) - PacketHeader.SessionTokenSize;
+
+        using ConnectedPair connectedPair = ConnectedPair.Create(sendThrottleConfig =>
+        {
+            sendThrottleConfig.MaximumBytesPerRelease = OneDatagramRelease;
+            sendThrottleConfig.MinimumReleaseIntervalMilliseconds = 20;
+            sendThrottleConfig.MaximumQueuedBytes = (uint)(SegmentCount * transmissionUnit + queueSlack);
+            sendThrottleConfig.QueueFullAction = SendQueueFullAction.DropNewest;
+        }, isDataSessionTokenEnabled: true);
+
+        byte[] payload = CreateLargePayload(length: SegmentCount * segmentPayloadLength, seed: 7);
+
+        Assert.Equal(expectedSendResult, connectedPair.Client.Send(connectedPair.Connection, payload, isReliable: true));
+
+        if (expectedSendResult is SendResult.Dropped)
+        {
+            Assert.Equal(SegmentCount, connectedPair.Client.Telemetry.PacketsDroppedOut);
+        }
+        else
+        {
+            Assert.True(connectedPair.PumpUntilReceived(1), "The admitted split never arrived.");
+            Assert.Equal(payload, connectedPair.ReceivedPayloads[0]);
+        }
+    }
+
+    /// <summary>
     /// Once the pools are warm, queueing and releasing a burst allocates nothing on the thread that sends and polls.
     /// </summary>
     [Fact]
@@ -429,13 +507,16 @@ public sealed class SendThrottleTests
         /// Starts a server and a client over UDP loopback and connects them.
         /// </summary>
         /// <param name="configureThrottle">Configures and enables the client's throttle, or null to leave it at its defaults.</param>
+        /// <param name="isDataSessionTokenEnabled">True to turn <see cref="SecurityConfig.DataSessionTokenEnabled"/> on at both ends.</param>
         /// <returns>The connected pair.</returns>
-        public static ConnectedPair Create(Action<SendThrottleConfig>? configureThrottle)
+        public static ConnectedPair Create(Action<SendThrottleConfig>? configureThrottle, bool isDataSessionTokenEnabled = false)
         {
             int port = TestHarness.GetFreePort();
-            SynapseManager server = new(TestHarness.ServerConfig(port));
+            SynapseManager server = new(TestHarness.ServerConfig(port, synapseConfig => synapseConfig.Security.DataSessionTokenEnabled = isDataSessionTokenEnabled));
             SynapseManager client = new(TestHarness.ClientConfig(synapseConfig =>
             {
+                synapseConfig.Security.DataSessionTokenEnabled = isDataSessionTokenEnabled;
+
                 if (configureThrottle is null)
                     return;
 

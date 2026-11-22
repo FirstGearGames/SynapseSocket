@@ -29,11 +29,15 @@ public sealed class PacketSplitter : PacketSegmenter
     /// <param name="segmentCount">Receives the number of valid segments produced.</param>
     /// <param name="sequence">Reliable sequence number to embed in each segment header; used only when <paramref name="isReliable"/> is true.</param>
     /// <param name = "backingBuffer">All packets built into a single array.</param>
+    /// <param name="sessionTokenSize">
+    /// Bytes left free after each segment, and taken from what it carries, for the session token its sender ends it with; 0 packs the
+    /// segments back to back. Each returned segment stops short of the room.
+    /// </param>
     /// <returns>A rented array of <see cref="ArraySegment{T}"/> values, each representing one wire-ready segment packet.</returns>
-    public List<ArraySegment<byte>> Split(ReadOnlySpan<byte> payload, bool isReliable, out int segmentCount, ushort sequence, out byte[] backingBuffer)
+    public List<ArraySegment<byte>> Split(ReadOnlySpan<byte> payload, bool isReliable, out int segmentCount, ushort sequence, out byte[] backingBuffer, int sessionTokenSize = 0)
     {
         PacketType type = isReliable ? PacketType.ReliableSegmented : PacketType.Segmented;
-        int segmentPayloadSize = (int)MaximumTransmissionUnit - PacketHeader.ComputeHeaderSize(type);
+        int segmentPayloadSize = (int)MaximumTransmissionUnit - PacketHeader.ComputeHeaderSize(type) - sessionTokenSize;
 
         if (segmentPayloadSize <= 0)
             throw new InvalidOperationException("MTU too small for segmentation headers.");
@@ -47,9 +51,9 @@ public sealed class PacketSplitter : PacketSegmenter
         ushort segmentId = (ushort)Interlocked.Increment(ref _segmentIdCounter);
         int headerSize = PacketHeader.ComputeHeaderSize(type);
 
-        // Single backing buffer: all N segment packets packed contiguously.
+        // Single backing buffer: all N segment packets packed contiguously, each followed by its session token room.
         // N * headerSize is a slight over-estimate because the last segment payload may be smaller, but renting a touch more is cheaper than computing the exact size.
-        int totalBufferSize = totalSegments * headerSize + payload.Length;
+        int totalBufferSize = totalSegments * (headerSize + sessionTokenSize) + payload.Length;
         backingBuffer = TrackedArrayPool<byte>.Rent(totalBufferSize);
         List<ArraySegment<byte>> segments = ListPool<ArraySegment<byte>>.Rent();
 
@@ -61,7 +65,7 @@ public sealed class PacketSplitter : PacketSegmenter
             int segmentLength = Math.Min(segmentPayloadSize, payload.Length - segmentStartOffset);
             int written = PacketHeader.BuildPacket(backingBuffer.AsSpan(bufferOffset), type, sequence, segmentId, (byte)i, (byte)totalSegments, payload.Slice(segmentStartOffset, segmentLength));
             segments.Add(new(backingBuffer, bufferOffset, written));
-            bufferOffset += written;
+            bufferOffset += written + sessionTokenSize;
         }
 
         return segments;

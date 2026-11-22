@@ -238,6 +238,10 @@ internal sealed partial class IngressEngine
     /// <see cref="ReliableConfig.ResendMilliseconds"/>, the interval an honest sender resends at.
     /// </summary>
     private readonly long _segmentAckIntervalTicks;
+    /// <summary>
+    /// True when this side asks for the session token on data packets, from <see cref="SecurityConfig.DataSessionTokenEnabled"/>.
+    /// </summary>
+    private readonly bool _dataSessionTokenEnabled;
 
     /// <summary>
     /// Window within which an inbound handshake is read as the peer's answer to one we just sent, rather than as a
@@ -339,6 +343,7 @@ internal sealed partial class IngressEngine
         _isNatEnabled = _config.NatTraversal.Mode != NatTraversalMode.Disabled;
         _isAckBatchingEnabled = _config.Reliable.AckBatchingEnabled;
         _isSecurityEnabled = config.Security.Enabled;
+        _dataSessionTokenEnabled = config.Security.DataSessionTokenEnabled;
         _packetTransform = config.PacketTransform;
         _effectiveMaximumTransmissionUnit = config.MaximumTransmissionUnit - (_packetTransform?.ReservedBytes ?? 0);
         _effectiveMaximumOutOfOrderReliablePackets = SynapseConfig.ToEffectiveLimit(config.Security.MaximumOutOfOrderReliablePackets);
@@ -865,6 +870,10 @@ internal sealed partial class IngressEngine
                 return;
             }
 
+            // A data packet without the session token, where this connection's data packets carry one, proves nothing about its sender.
+            if (synapseConnection.DataSessionTokenState is not DataSessionTokenState.Disabled && !TryRemoveSessionToken(buffer, ref length, PacketHeader.TypeSize, synapseConnection))
+                return;
+
             /* Stamped whatever the state, so this stays a truthful record of the last packet seen. A pending
              * session cannot be held open by that: its timeout is measured from
              * <see cref="SynapseConnection.HandshakeStartedTicks"/>, which inbound traffic never refreshes. */
@@ -1044,11 +1053,16 @@ internal sealed partial class IngressEngine
             }
         }
 
+        // As on the fast path, and before anything is held, acknowledged or reported as a violation for the packet.
+        if (synapseConnection.DataSessionTokenState is not DataSessionTokenState.Disabled && !TryRemoveSessionToken(buffer, ref length, headerSize, synapseConnection))
+            return;
+
         /* See the note on the fast path for why this is stamped in every state.
          *
-         * A data packet forged from a spoofed source does refresh this, holding a session alive after the real peer is gone. Data
-         * packets carry no session token, which is accepted risk by design: this transport does not spend bytes per data packet.
-         * Damage is bounded to a held connection slot, and anyone able to forge here can already inject payloads as that peer. */
+         * Unless both sides have SecurityConfig.DataSessionTokenEnabled on, data packets carry no session token, so a data packet forged
+         * from a spoofed source does refresh this, holding a session alive after the real peer is gone. That is accepted risk by design for
+         * the default, which does not spend bytes per data packet: damage is bounded to a held connection slot, and anyone able to forge
+         * here can already inject payloads as that peer. */
         synapseConnection.LastReceivedTicks = nowTicks;
 
         // A connection closing after delivery is read only for the acknowledgements and the disconnect above; its data is dropped on arrival.
@@ -1202,22 +1216,38 @@ internal sealed partial class IngressEngine
     /// </remarks>
     private bool TryAcceptControlPacket(byte[] buffer, ref int length, int headerSize, SynapseConnection synapseConnection, long nowTicks)
     {
-        if (synapseConnection.SessionTokenState is not SessionTokenState.Unsupported)
-        {
-            int sessionTokenOffset = length - PacketHeader.SessionTokenSize;
-
-            if (sessionTokenOffset < headerSize || BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(sessionTokenOffset)) != synapseConnection.LocalSessionToken)
-            {
-                _telemetry.OnSecurityDroppedReceived();
-
-                return false;
-            }
-
-            length = sessionTokenOffset;
-        }
+        if (synapseConnection.SessionTokenState is not SessionTokenState.Unsupported && !TryRemoveSessionToken(buffer, ref length, headerSize, synapseConnection))
+            return false;
 
         // See the note on the fast path for why this is stamped in every state.
         synapseConnection.LastReceivedTicks = nowTicks;
+
+        return true;
+    }
+
+    /// <summary>
+    /// Takes the session token this side expects off the end of a packet from an established peer: <paramref name="length"/> then stops
+    /// short of it. A packet that does not end with it is dropped and counted, never reported as a violation, because nothing about it
+    /// can be pinned on the peer whose address it carries.
+    /// </summary>
+    /// <param name="buffer">The raw receive buffer containing the datagram.</param>
+    /// <param name="length">The datagram's length, set to exclude the session token when it is there.</param>
+    /// <param name="headerSize">The size of the packet's header, which the token must not overlap.</param>
+    /// <param name="synapseConnection">The connection the datagram was resolved to.</param>
+    /// <returns>True when the packet ended with the token.</returns>
+    /// <remarks>One 4-byte comparison, allocating nothing.</remarks>
+    private bool TryRemoveSessionToken(byte[] buffer, ref int length, int headerSize, SynapseConnection synapseConnection)
+    {
+        int sessionTokenOffset = length - PacketHeader.SessionTokenSize;
+
+        if (sessionTokenOffset < headerSize || BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(sessionTokenOffset)) != synapseConnection.LocalSessionToken)
+        {
+            _telemetry.OnSecurityDroppedReceived();
+
+            return false;
+        }
+
+        length = sessionTokenOffset;
 
         return true;
     }
@@ -1541,6 +1571,12 @@ internal sealed partial class IngressEngine
             // Reset per-session state so the new session starts with fresh sequence numbers
             // and a clean reorder buffer, then fall through to normal connection initialisation.
             synapseConnection.ResetForReconnect();
+
+            /* Data a ConnectionClosed handler sends on the connection belongs to the new session, so it leaves room for that session's token,
+             * which is written once the session is established, rather than carrying the old session's. */
+            if (_dataSessionTokenEnabled)
+                synapseConnection.DataSessionTokenState = DataSessionTokenState.Requested;
+
             ConnectionClosed?.Invoke(synapseConnection);
 
             /* A ConnectionClosed handler that disconnected this connection, or stopped the engine, has torn it down and
@@ -1562,9 +1598,17 @@ internal sealed partial class IngressEngine
             synapseConnection.TransmissionEngine = _sender;
 
             /* The session takes the peer's session token from the nonce this handshake opens with, which a proof echoes back
-             * unchanged, and takes part in session tokens only when the handshake advertises them. */
+             * unchanged, and takes part in session tokens only when the handshake advertises them. Its data packets carry the token
+             * only when this side asks for that and the handshake does too, a proof carrying back the version of the handshake it answers. */
+            DataSessionTokenState previousDataSessionTokenState = synapseConnection.DataSessionTokenState;
+
             synapseConnection.RemoteSessionToken = BinaryPrimitives.ReadUInt32LittleEndian(handshakePayload);
             synapseConnection.SessionTokenState = PacketHeader.IsSessionTokenAdvertised(handshakePayload) ? SessionTokenState.Supported : SessionTokenState.Unsupported;
+            synapseConnection.DataSessionTokenState = _dataSessionTokenEnabled && PacketHeader.IsDataSessionTokenAdvertised(handshakePayload) ? DataSessionTokenState.Enabled : DataSessionTokenState.Disabled;
+
+            // Reliable messages sent while the peer's token was not known left room for it; written now, their resends carry it.
+            if (previousDataSessionTokenState is DataSessionTokenState.Requested && synapseConnection.DataSessionTokenState is DataSessionTokenState.Enabled)
+                synapseConnection.AppendSessionTokenToPendingReliables();
 
             // Send a handshake-ack only when this side did not initiate the connection.
             // If the connection was already in our table as Pending, we are the client waiting

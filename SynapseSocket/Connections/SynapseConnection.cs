@@ -338,6 +338,7 @@ public sealed partial class SynapseConnection : IPoolResettable
         LocalSessionToken = 0;
         RemoteSessionToken = 0;
         SessionTokenState = SessionTokenState.Unknown;
+        DataSessionTokenState = DataSessionTokenState.Disabled;
         _inboundRateCountersResetTick = 0;
         _receivedByPacketCount = 0;
         _receivedByBytesCount = 0;

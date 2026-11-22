@@ -124,6 +124,25 @@ public sealed class SecurityConfig
     public bool AllowUnknownPackets = false;
 
     /// <summary>
+    /// When true, this side asks for the session token on every data packet, and a connection carries it there when the peer's
+    /// handshake asks for it too. Defaults to false.
+    /// <para>
+    /// Session tokens already stop a sender off the path between two peers from ending a session or holding it open with a
+    /// disconnect, keep-alive or acknowledgement forged from the peer's address. Data packets carry none by default, so such a sender
+    /// can still inject a payload that is delivered as the peer's, or end the peer's session with a forged malformed segment or by
+    /// overflowing its reorder buffer. With this on at both ends, every unreliable, reliable and segmented data packet ends with the
+    /// receiver's 4-byte session token as well, and a data packet without it is dropped and counted in
+    /// <see cref="SynapseSocket.Diagnostics.Telemetry.PacketsDroppedIn"/>, never delivered, acknowledged or reported as a violation.
+    /// </para>
+    /// <para>
+    /// It costs 4 bytes on every data packet, so 4 bytes less payload fit in an unsegmented packet or a segment, and one 4-byte
+    /// comparison per data packet received. A connection to a peer that has it off, or that predates it, carries no token on its data
+    /// packets and behaves exactly as it does with this off.
+    /// </para>
+    /// </summary>
+    public bool DataSessionTokenEnabled = false;
+
+    /// <summary>
     /// Sentinel value: pass as <see cref="MaximumPacketsPerSecond"/> to disable packet rate limiting.
     /// </summary>
     public const uint DisabledMaximumPacketsPerSecond = 0;

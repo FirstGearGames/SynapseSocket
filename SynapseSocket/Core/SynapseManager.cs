@@ -140,6 +140,8 @@ public sealed partial class SynapseManager : IDisposable
     /// Maximum payload bytes that fit in a single unsegmented packet, derived from
     /// <see cref="MaximumTransmissionUnit"/> minus header overhead.
     /// Larger payloads are segmented, or rejected when segmentation is disabled.
+    /// A connection whose data packets carry the session token, under <see cref="SecurityConfig.DataSessionTokenEnabled"/>, fits
+    /// <see cref="PacketHeader.SessionTokenSize"/> bytes less.
     /// </summary>
     public int MaximumPayloadSize { get; }
     /// <summary>
@@ -563,6 +565,10 @@ public sealed partial class SynapseManager : IDisposable
 
         SynapseConnection synapseConnection = Connections.CreateNew(endPoint, signature);
 
+        // The handshake asks for data session tokens, so until the answer settles them the connection requires the token on the data it receives.
+        if (Config.Security.DataSessionTokenEnabled)
+            synapseConnection.DataSessionTokenState = DataSessionTokenState.Requested;
+
         _transmissionEngine!.SendHandshake(synapseConnection);
         // Stamped so the peer's answering handshake is recognised as an answer rather than a session-resetting request.
         synapseConnection.LastHandshakeSentTicks = Clock.Ticks;
@@ -674,7 +680,10 @@ public sealed partial class SynapseManager : IDisposable
         if (synapseConnection.IsTornDown || synapseConnection.IsClosing)
             throw new InvalidOperationException("Cannot send on a connection that has been closed.");
 
-        if (payload.Count <= MaximumPayloadSize)
+        // A connection whose data packets carry the session token, or may once its handshake is answered, fits that much less in one packet.
+        int maximumPayloadSize = MaximumPayloadSize - synapseConnection.DataSessionTokenReservedSize;
+
+        if (payload.Count <= maximumPayloadSize)
         {
             SendResult sendResult = isReliable ? _transmissionEngine!.SendReliableUnsegmented(synapseConnection, payload) : _transmissionEngine!.SendUnreliableUnsegmented(synapseConnection, payload);
 
@@ -688,7 +697,7 @@ public sealed partial class SynapseManager : IDisposable
 
         // Segmenting is disabled entirely.
         if (!_isSegmentingEnabled)
-            throw new InvalidOperationException($"Payload ({payload.Count} bytes) exceeds the MTU-based limit ({MaximumPayloadSize} bytes). Enable segmentation via Segment.ReliableEnabled or Segment.UnreliableMode.");
+            throw new InvalidOperationException($"A payload of [{payload.Count}] bytes exceeds the MTU-based limit of [{maximumPayloadSize}] bytes. Enable segmentation via Segment.ReliableEnabled or Segment.UnreliableMode.");
 
         // An additional check on segmentation is required for unreliable sending.
         if (!isReliable)
@@ -696,7 +705,7 @@ public sealed partial class SynapseManager : IDisposable
             UnreliableSegmentMode unreliableSegmentMode = Config.Segment.UnreliableMode;
 
             if (unreliableSegmentMode is UnreliableSegmentMode.Disabled)
-                throw new InvalidOperationException($"Unreliable payload ({payload.Count} bytes) exceeds the MTU-based limit ({MaximumPayloadSize} bytes). Set Segment.UnreliableMode or reduce payload size.");
+                throw new InvalidOperationException($"An unreliable payload of [{payload.Count}] bytes exceeds the MTU-based limit of [{maximumPayloadSize}] bytes. Set Segment.UnreliableMode or reduce payload size.");
 
             // Make reliable if the unreliableSegmentMode permits.
             isReliable = unreliableSegmentMode is UnreliableSegmentMode.SegmentReliable;

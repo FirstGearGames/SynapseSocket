@@ -12,7 +12,7 @@ namespace SynapseSocket.Packets;
 ///   [5]      : Segment Index (Byte), only for <see cref="PacketType.Segmented"/> and <see cref="PacketType.ReliableSegmented"/>
 ///   [6]      : Segment Count (Byte), only for <see cref="PacketType.Segmented"/> and <see cref="PacketType.ReliableSegmented"/>
 ///   [...]    : Payload
-///   [last 4] : Session token, only for <see cref="PacketType.Disconnect"/>, <see cref="PacketType.KeepAlive"/>, <see cref="PacketType.Ack"/> and <see cref="PacketType.SegmentAck"/> between peers that both advertise <see cref="SessionTokenVersion"/>
+///   [last 4] : Session token, only for <see cref="PacketType.Disconnect"/>, <see cref="PacketType.KeepAlive"/>, <see cref="PacketType.Ack"/> and <see cref="PacketType.SegmentAck"/> between peers that both advertise <see cref="SessionTokenVersion"/>, and for every data packet between peers whose handshakes both set <see cref="DataSessionTokenFlag"/>
 /// Explicit little-endian ordering is used for cross-platform consistency.
 /// </summary>
 public static class PacketHeader
@@ -82,16 +82,30 @@ public static class PacketHeader
     public const int HandshakeVersionSize = 1;
 
     /// <summary>
-    /// The protocol version this engine ends its handshakes with. Version 1 and later carry session tokens: a peer whose handshake
-    /// carries one of them ends every <see cref="PacketType.Disconnect"/>, <see cref="PacketType.KeepAlive"/>, <see cref="PacketType.Ack"/>
-    /// and <see cref="PacketType.SegmentAck"/> it sends with the session token, when the handshake it accepted from its peer did too.
+    /// The protocol version this engine ends its handshakes with, with <see cref="DataSessionTokenFlag"/> set while
+    /// <see cref="SynapseSocket.Core.Configuration.SecurityConfig.DataSessionTokenEnabled"/> is on. Version 1 and later carry session
+    /// tokens: a peer whose handshake carries one of them ends every <see cref="PacketType.Disconnect"/>, <see cref="PacketType.KeepAlive"/>,
+    /// <see cref="PacketType.Ack"/> and <see cref="PacketType.SegmentAck"/> it sends with the session token, when the handshake it accepted
+    /// from its peer did too.
     /// </summary>
     public const byte SessionTokenVersion = 1;
 
     /// <summary>
+    /// The bit a handshake sets in its protocol version when its sender has
+    /// <see cref="SynapseSocket.Core.Configuration.SecurityConfig.DataSessionTokenEnabled"/> on, asking for the session token on data
+    /// packets too. A connection's data packets carry the token only when the handshakes from both sides set it.
+    /// <para>
+    /// A peer that predates it reads the whole byte as the version, which the bit keeps at or above <see cref="SessionTokenVersion"/>, so
+    /// that peer still takes part in session tokens and carries none on data packets, exactly as before.
+    /// </para>
+    /// </summary>
+    public const byte DataSessionTokenFlag = 0x80;
+
+    /// <summary>
     /// Size in bytes of the session token a control packet ends with between two peers that both advertise
-    /// <see cref="SessionTokenVersion"/>: the first bytes of the handshake nonce the packet's receiver sent, which only the real peer
-    /// received. A source address can be forged, but a sender off the path never sees the token.
+    /// <see cref="SessionTokenVersion"/>, and a data packet between two peers whose handshakes both set <see cref="DataSessionTokenFlag"/>:
+    /// the first bytes of the handshake nonce the packet's receiver sent, which only the real peer received. A source address can be
+    /// forged, but a sender off the path never sees the token.
     /// </summary>
     public const int SessionTokenSize = 4;
 
@@ -212,4 +226,13 @@ public static class PacketHeader
     internal static bool IsSessionTokenAdvertised(ReadOnlySpan<byte> payload) =>
         payload.Length is HandshakeNonceSize + HandshakeVersionSize or HandshakeChallengeSize + HandshakeVersionSize
         && payload[payload.Length - 1] >= SessionTokenVersion;
+
+    /// <summary>
+    /// Returns true when a handshake, challenge or proof payload ends in a protocol version that carries session tokens and sets
+    /// <see cref="DataSessionTokenFlag"/>.
+    /// </summary>
+    /// <param name="payload">The handshake payload, after the type byte.</param>
+    /// <returns>True when the sender asks for the session token on data packets too.</returns>
+    internal static bool IsDataSessionTokenAdvertised(ReadOnlySpan<byte> payload) =>
+        IsSessionTokenAdvertised(payload) && (payload[payload.Length - 1] & DataSessionTokenFlag) != 0;
 }

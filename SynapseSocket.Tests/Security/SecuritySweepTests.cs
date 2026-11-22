@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
@@ -45,6 +46,11 @@ public sealed class SecuritySweepTests
     /// The protocol version byte a handshake, a challenge or a proof ends with to advertise session tokens.
     /// </summary>
     private const byte SessionTokenVersion = 1;
+    /// <summary>
+    /// The protocol version byte a handshake ends with to advertise session tokens and ask for them on data packets too:
+    /// <see cref="SessionTokenVersion"/> with its high bit set.
+    /// </summary>
+    private const byte DataSessionTokenVersion = SessionTokenVersion | 0x80;
 
     /// <summary>
     /// SYNCONN-1: a malformed or oversized datagram forged from a connected peer's address must not end that peer's session.
@@ -1257,25 +1263,630 @@ public sealed class SecuritySweepTests
     }
 
     /// <summary>
+    /// H8: with <see cref="SecurityConfig.DataSessionTokenEnabled"/> on at both ends, an unreliable data packet forged from a connected
+    /// peer's address, from a bare type byte to one carrying a payload, is dropped and counted rather than delivered as the peer's, and
+    /// raises no violation; the peer's own unreliable data still arrives.
+    /// </summary>
+    /// <param name="length">The forged datagram's length.</param>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    [InlineData(5)]
+    [InlineData(64)]
+    public void H8_DataSessionToken_ForgedUnreliablePacket_IsNotDeliveredAsThePeers(int length)
+    {
+        using ConnectedPair pair = new(EnableDataSessionToken, EnableDataSessionToken);
+        List<byte[]> serverDeliveries = RecordDeliveries(pair.Server);
+        long droppedBefore = pair.Server.Telemetry.PacketsDroppedIn;
+
+        // PacketType.None followed by random bytes, which the receiver's token is never likely to match.
+        byte[] forged = new byte[length];
+        RandomNumberGenerator.Fill(forged.AsSpan(PacketHeader.TypeSize));
+
+        pair.Forge(forged);
+        TestHarness.PumpFor(200, pair.Server, pair.Client);
+
+        Assert.True(serverDeliveries.Count == 0, $"a forged [{length}]-byte unreliable packet was delivered as the peer's");
+        Assert.Equal(droppedBefore + 1, pair.Server.Telemetry.PacketsDroppedIn);
+        Assert.True(pair.ServerEvents.Violations == 0, $"a forged unreliable packet raised [{string.Join(", ", pair.ServerEvents.ViolationReasons)}]");
+
+        byte[] honestPayload = BuildFilledMessage(0x3C, 32);
+        pair.Client.Send(pair.ClientConnection, new(honestPayload), isReliable: false);
+
+        Assert.True(
+            TestHarness.PumpUntil(() => serverDeliveries.Count == 1, 2000, pair.Server, pair.Client) && serverDeliveries[0].AsSpan().SequenceEqual(honestPayload),
+            "the peer's own unreliable payload did not arrive intact after the forged one");
+    }
+
+    /// <summary>
+    /// M7: with data session tokens on at both ends, a reliable data packet forged from a connected peer's address with the sequence the
+    /// peer's first reliable message will carry is dropped and counted: it is neither delivered nor acknowledged, and the peer's own message
+    /// under that sequence then arrives intact rather than being discarded as a resend.
+    /// </summary>
+    [Fact]
+    public void M7_DataSessionToken_ForgedReliablePacket_IsNeitherDeliveredNorAcknowledged()
+    {
+        using ConnectedPair pair = new(EnableDataSessionToken, EnableDataSessionToken);
+        List<byte[]> serverDeliveries = RecordDeliveries(pair.Server);
+        int reliableHeaderSize = PacketHeader.ComputeHeaderSize(PacketType.Reliable);
+        long droppedBefore = pair.Server.Telemetry.PacketsDroppedIn;
+        long sentBefore = pair.Server.Telemetry.PacketsOut;
+
+        byte[] forged = new byte[reliableHeaderSize + 16];
+        PacketHeader.Write(forged, PacketType.Reliable, sequence: 0, segmentId: 0, segmentIndex: 0, segmentCount: 0);
+        forged.AsSpan(reliableHeaderSize).Fill(0xEE);
+
+        pair.Forge(forged);
+        TestHarness.PumpFor(200, pair.Server, pair.Client);
+
+        Assert.True(serverDeliveries.Count == 0, "a forged reliable packet was delivered as the peer's");
+        Assert.True(pair.Server.Telemetry.PacketsOut == sentBefore, $"the server sent [{pair.Server.Telemetry.PacketsOut - sentBefore}] datagrams after a forged reliable packet, acknowledging it");
+        Assert.Equal(droppedBefore + 1, pair.Server.Telemetry.PacketsDroppedIn);
+        Assert.True(pair.ServerEvents.Violations == 0, $"a forged reliable packet raised [{string.Join(", ", pair.ServerEvents.ViolationReasons)}]");
+
+        byte[] honestPayload = BuildFilledMessage(0x3C, 16);
+        pair.Client.Send(pair.ClientConnection, new(honestPayload), isReliable: true);
+
+        Assert.True(
+            TestHarness.PumpUntil(() => serverDeliveries.Count == 1, 2000, pair.Server, pair.Client) && serverDeliveries[0].AsSpan().SequenceEqual(honestPayload),
+            "the peer's own first reliable message did not arrive intact after a forged packet carrying its sequence");
+    }
+
+    /// <summary>
+    /// SYNCONN-1: with data session tokens on at both ends, a segment forged from a connected peer's address that would be a violation from
+    /// the peer itself is dropped and counted instead, and the peer's session goes on untouched: a segment larger than the transmission unit
+    /// on either channel, one contradicting the segment count its message opened with, and one declaring an assembly over
+    /// <see cref="SecurityConfig.MaximumReassembledPacketSize"/>.
+    /// </summary>
+    /// <param name="malformedSegment">Which malformed segment is forged.</param>
+    [Theory]
+    [InlineData(MalformedSegment.UnreliableLargerThanTransmissionUnit)]
+    [InlineData(MalformedSegment.ReliableLargerThanTransmissionUnit)]
+    [InlineData(MalformedSegment.ContradictingSegmentCount)]
+    [InlineData(MalformedSegment.DeclaredAssemblyOversized)]
+    public void SYNCONN1_DataSessionToken_ForgedMalformedSegment_DoesNotEndThePeersSession(MalformedSegment malformedSegment)
+    {
+        const ushort SegmentId = 900;
+
+        using ConnectedPair pair = new(
+            synapseConfig =>
+            {
+                EnableDataSessionToken(synapseConfig);
+                synapseConfig.Security.MaximumReassembledPacketSize = 100_000;
+            },
+            EnableDataSessionToken);
+
+        SynapseConnection serverConnection = pair.ServerConnection;
+        int oversizedLength = (int)pair.Server.MaximumTransmissionUnit + 1;
+        long droppedBefore = pair.Server.Telemetry.PacketsDroppedIn;
+
+        List<byte[]> forgeries = malformedSegment switch
+        {
+            MalformedSegment.UnreliableLargerThanTransmissionUnit => [BuildSegment(PacketType.Segmented, SegmentId, segmentIndex: 0, segmentCount: 2, oversizedLength)],
+            MalformedSegment.ReliableLargerThanTransmissionUnit => [BuildSegment(PacketType.ReliableSegmented, SegmentId, segmentIndex: 0, segmentCount: 2, oversizedLength)],
+            MalformedSegment.ContradictingSegmentCount => [BuildSegment(PacketType.Segmented, SegmentId, segmentIndex: 0, segmentCount: 2, 16), BuildSegment(PacketType.Segmented, SegmentId, segmentIndex: 1, segmentCount: 3, 16)],
+            _ => [BuildSegment(PacketType.ReliableSegmented, SegmentId, segmentIndex: 0, segmentCount: byte.MaxValue, 16)]
+        };
+
+        foreach (byte[] forgery in forgeries)
+            pair.Forge(forgery);
+
+        TestHarness.PumpFor(300, pair.Server, pair.Client);
+
+        AssertSessionIntact(pair, serverConnection, $"a forged [{malformedSegment}] segment");
+        Assert.Equal(droppedBefore + forgeries.Count, pair.Server.Telemetry.PacketsDroppedIn);
+        Assert.True(pair.ServerEvents.Violations == 0, $"a forged [{malformedSegment}] segment raised [{string.Join(", ", pair.ServerEvents.ViolationReasons)}]");
+    }
+
+    /// <summary>
+    /// M7: with data session tokens on at both ends, reliable packets forged from a connected peer's address ahead of the sequence it
+    /// expects, one more than the reorder buffer holds, are dropped and counted rather than held, so they cannot overflow the buffer and end
+    /// the peer's session; the peer's own reliable messages then arrive in order.
+    /// </summary>
+    [Fact]
+    public void M7_DataSessionToken_ForgedOutOfOrderReliablePackets_DoNotOverflowThePeersReorderBuffer()
+    {
+        using ConnectedPair pair = new(EnableDataSessionToken, EnableDataSessionToken);
+        SynapseConnection serverConnection = pair.ServerConnection;
+        List<byte[]> serverDeliveries = RecordDeliveries(pair.Server);
+        int forgedCount = (int)pair.Server.Config.Security.MaximumOutOfOrderReliablePackets + 1;
+        long droppedBefore = pair.Server.Telemetry.PacketsDroppedIn;
+
+        // Sequences 1 onward, never 0, so each would wait in the reorder buffer for a gap that never fills.
+        for (int sequence = 1; sequence <= forgedCount; sequence++)
+        {
+            byte[] forged = new byte[PacketHeader.ComputeHeaderSize(PacketType.Reliable) + 1];
+            PacketHeader.Write(forged, PacketType.Reliable, (ushort)sequence, segmentId: 0, segmentIndex: 0, segmentCount: 0);
+            pair.Forge(forged);
+        }
+
+        TestHarness.PumpFor(300, pair.Server, pair.Client);
+
+        AssertSessionIntact(pair, serverConnection, $"[{forgedCount}] forged out-of-order reliable packets");
+        Assert.True(serverConnection.ReorderBuffer.Count == 0, $"[{serverConnection.ReorderBuffer.Count}] forged reliable packets wait in the reorder buffer");
+        Assert.Equal(droppedBefore + forgedCount, pair.Server.Telemetry.PacketsDroppedIn);
+        Assert.True(pair.ServerEvents.Violations == 0, $"forged reliable packets raised [{string.Join(", ", pair.ServerEvents.ViolationReasons)}]");
+
+        for (byte fill = 1; fill <= 3; fill++)
+            pair.Client.Send(pair.ClientConnection, new(BuildFilledMessage(fill, 8)), isReliable: true);
+
+        Assert.True(TestHarness.PumpUntil(() => serverDeliveries.Count == 3, 2000, pair.Server, pair.Client), $"[{serverDeliveries.Count}] of the peer's 3 reliable messages arrived");
+
+        for (byte fill = 1; fill <= 3; fill++)
+            Assert.True(serverDeliveries[fill - 1].AsSpan().SequenceEqual(BuildFilledMessage(fill, 8)), $"the peer's reliable message [{fill}] arrived out of order or damaged");
+    }
+
+    /// <summary>
+    /// With data session tokens on at both ends, honest traffic of every kind arrives intact in both directions: unreliable and reliable
+    /// payloads up to the largest one packet carries with the token, and split ones just past it and around segment boundaries. Every data
+    /// packet ends with its receiver's session token, and none is larger than the transmission unit, which the largest fill exactly.
+    /// </summary>
+    [Fact]
+    public void DataSessionToken_HonestTrafficOfEveryKind_ArrivesIntactWithinTheTransmissionUnit()
+    {
+        RecordingTransform serverTransform = new();
+        RecordingTransform clientTransform = new();
+
+        using ConnectedPair pair = new(
+            synapseConfig =>
+            {
+                EnableDataSessionToken(synapseConfig);
+                synapseConfig.PacketTransform = serverTransform;
+            },
+            synapseConfig =>
+            {
+                EnableDataSessionToken(synapseConfig);
+                synapseConfig.PacketTransform = clientTransform;
+            });
+
+        List<byte[]> serverDeliveries = RecordDeliveries(pair.Server);
+        List<byte[]> clientDeliveries = RecordDeliveries(pair.Client);
+        int transmissionUnit = (int)pair.Server.MaximumTransmissionUnit;
+        int largestWholePayload = pair.Server.MaximumPayloadSize - SessionTokenSize;
+        int reliableSegmentPayload = transmissionUnit - PacketHeader.ComputeHeaderSize(PacketType.ReliableSegmented) - SessionTokenSize;
+        int unreliableSegmentPayload = transmissionUnit - PacketHeader.ComputeHeaderSize(PacketType.Segmented) - SessionTokenSize;
+        int[] payloadLengths = [0, 1, largestWholePayload - 1, largestWholePayload, largestWholePayload + 1, pair.Server.MaximumPayloadSize, reliableSegmentPayload * 2, reliableSegmentPayload * 2 + 1, unreliableSegmentPayload * 2, unreliableSegmentPayload * 2 + 1, 40_000];
+        bool[] reliabilities = [false, true];
+
+        foreach (bool isReliable in reliabilities)
+        {
+            foreach (int payloadLength in payloadLengths)
+            {
+                byte[] payload = new byte[payloadLength];
+                RandomNumberGenerator.Fill(payload);
+
+                int expectedCount = serverDeliveries.Count + 1;
+                string channel = isReliable ? "reliable" : "unreliable";
+
+                pair.Client.Send(pair.ClientConnection, new(payload), isReliable);
+                pair.Server.Send(pair.ServerConnection, new(payload), isReliable);
+
+                Assert.True(
+                    TestHarness.PumpUntil(() => serverDeliveries.Count == expectedCount && clientDeliveries.Count == expectedCount, 3000, pair.Server, pair.Client),
+                    $"a [{payloadLength}]-byte {channel} payload did not arrive in both directions");
+                Assert.True(serverDeliveries[^1].AsSpan().SequenceEqual(payload) && clientDeliveries[^1].AsSpan().SequenceEqual(payload), $"a [{payloadLength}]-byte {channel} payload arrived damaged");
+            }
+        }
+
+        Assert.Equal(2 * payloadLengths.Length, serverDeliveries.Count);
+        Assert.Equal(transmissionUnit, clientTransform.LargestDatagramLength);
+        Assert.Equal(transmissionUnit, serverTransform.LargestDatagramLength);
+        Assert.All(clientTransform.DataPacketTrailers, dataPacketTrailer => Assert.Equal(pair.ServerConnection.LocalSessionToken, dataPacketTrailer));
+        Assert.All(serverTransform.DataPacketTrailers, dataPacketTrailer => Assert.Equal(pair.ClientConnection.LocalSessionToken, dataPacketTrailer));
+    }
+
+    /// <summary>
+    /// With data session tokens on at both ends, reliable messages a client sends before its handshake is answered, one whole and one split,
+    /// leave without the token, since the server's is not known yet, and the server drops them; once the session is established they are
+    /// resent carrying it, and arrive intact and in order.
+    /// </summary>
+    [Fact]
+    public void DataSessionToken_ReliableMessagesSentBeforeTheHandshakeIsAnswered_ArriveOnceEstablished()
+    {
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port, EnableDataSessionToken));
+        using SynapseManager client = new(TestHarness.ClientConfig(EnableDataSessionToken));
+        List<byte[]> serverDeliveries = RecordDeliveries(server);
+
+        server.Start();
+        client.Start();
+
+        SynapseConnection connection = client.Connect(new IPEndPoint(IPAddress.Loopback, port));
+        // 125 bytes and the 3-byte header fill a 128-byte pooled array exactly, so the token fits after them only in the room left for it.
+        byte[] wholeMessage = BuildFilledMessage(0x11, 125);
+        byte[] splitMessage = new byte[client.MaximumPayloadSize * 4];
+        RandomNumberGenerator.Fill(splitMessage);
+
+        // Neither engine has been polled, so the connection is still waiting on its handshake.
+        Assert.Equal(ConnectionState.Pending, connection.State);
+        client.Send(connection, new(wholeMessage), isReliable: true);
+        client.Send(connection, new(splitMessage), isReliable: true);
+
+        Assert.True(TestHarness.PumpUntil(() => serverDeliveries.Count == 2, 5000, server, client), $"[{serverDeliveries.Count}] of 2 reliable messages sent before the handshake was answered arrived");
+        Assert.True(serverDeliveries[0].AsSpan().SequenceEqual(wholeMessage) && serverDeliveries[1].AsSpan().SequenceEqual(splitMessage), "the reliable messages sent before the handshake was answered arrived damaged or out of order");
+    }
+
+    /// <summary>
+    /// A client with data session tokens on asks for them in its handshake, and while that handshake waits for an answer it requires its
+    /// token on the data it receives: data ending with it is delivered without it, and data without it is dropped. The answer then decides:
+    /// the session keeps the token only when the answer asked for it too, and otherwise delivers data exactly as sent.
+    /// </summary>
+    /// <param name="isAnswerAsking">True when the answering handshake asks for data session tokens.</param>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void DataSessionToken_PendingConnection_RequiresTheTokenOnTheDataItReceives(bool isAnswerAsking)
+    {
+        using Socket peer = TestHarness.CreateRawSocket();
+        using SynapseManager client = new(TestHarness.ClientConfig(EnableDataSessionToken));
+        List<byte[]> clientDeliveries = RecordDeliveries(client);
+
+        client.Start();
+
+        IPEndPoint clientEndPoint = client.BoundEndPoints[0];
+        SynapseConnection connection = client.Connect((IPEndPoint)peer.LocalEndPoint!);
+        byte[] receiveBuffer = new byte[64];
+
+        Assert.True(TryReceiveWhilePumping(peer, receiveBuffer, client, PacketType.Handshake, out int handshakeLength), "the client sent no handshake");
+        Assert.True(
+            handshakeLength == PacketHeader.TypeSize + PacketHeader.HandshakeNonceSize + 1 && receiveBuffer[handshakeLength - 1] == DataSessionTokenVersion,
+            $"the client's [{handshakeLength}]-byte handshake ending in [{receiveBuffer[handshakeLength - 1]}] does not ask for data session tokens");
+
+        byte[] payload = BuildFilledMessage(0x42, 20);
+        byte[] untokened = [(byte)PacketType.None, .. payload];
+        byte[] tokened = BuildTokenedPacket(untokened, receiveBuffer.AsSpan(PacketHeader.TypeSize, SessionTokenSize));
+
+        peer.SendTo(untokened, clientEndPoint);
+        peer.SendTo(tokened, clientEndPoint);
+        TestHarness.PumpFor(100, client);
+
+        Assert.Equal(ConnectionState.Pending, connection.State);
+        Assert.True(
+            clientDeliveries.Count == 1 && clientDeliveries[0].AsSpan().SequenceEqual(payload),
+            $"a pending connection asking for data session tokens delivered [{clientDeliveries.Count}] payloads, not just the tokened one without its token");
+
+        peer.SendTo(BuildHandshake(PacketHeader.HandshakeNonceSize + 1, isAnswerAsking ? DataSessionTokenVersion : SessionTokenVersion), clientEndPoint);
+        Assert.True(TestHarness.PumpUntil(() => connection.State is ConnectionState.Connected, 2000, client), "the peer's answer did not connect the client");
+
+        peer.SendTo(untokened, clientEndPoint);
+        peer.SendTo(tokened, clientEndPoint);
+        TestHarness.PumpFor(100, client);
+
+        if (isAnswerAsking)
+            Assert.True(clientDeliveries.Count == 2 && clientDeliveries[1].AsSpan().SequenceEqual(payload), $"a session with data session tokens delivered [{clientDeliveries.Count - 1}] payloads, not just the tokened one without its token");
+        else
+            Assert.True(
+                clientDeliveries.Count == 3 && clientDeliveries[1].AsSpan().SequenceEqual(untokened.AsSpan(PacketHeader.TypeSize)) && clientDeliveries[2].AsSpan().SequenceEqual(tokened.AsSpan(PacketHeader.TypeSize)),
+                $"a session without data session tokens delivered [{clientDeliveries.Count - 1}] payloads, not both exactly as sent");
+    }
+
+    /// <summary>
+    /// Data session tokens are used only between two engines that both have <see cref="SecurityConfig.DataSessionTokenEnabled"/> on: each
+    /// side's handshake asks for them exactly when it has them on, and only when both do does every data packet grow by the 4-byte token and
+    /// a data packet forged from the peer's address stop being delivered. Any other pairing puts on the wire exactly what it always did.
+    /// </summary>
+    /// <param name="isServerEnabled">True when the server has data session tokens on.</param>
+    /// <param name="isClientEnabled">True when the client has data session tokens on.</param>
+    [Theory]
+    [InlineData(true, true)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(false, false)]
+    public void DataSessionToken_IsUsedOnlyWhenBothEnginesEnableIt(bool isServerEnabled, bool isClientEnabled)
+    {
+        const int PayloadLength = 100;
+
+        RecordingTransform serverTransform = new();
+        RecordingTransform clientTransform = new();
+
+        using ConnectedPair pair = new(
+            synapseConfig =>
+            {
+                synapseConfig.Security.DataSessionTokenEnabled = isServerEnabled;
+                synapseConfig.PacketTransform = serverTransform;
+            },
+            synapseConfig =>
+            {
+                synapseConfig.Security.DataSessionTokenEnabled = isClientEnabled;
+                synapseConfig.PacketTransform = clientTransform;
+            });
+
+        List<byte[]> serverDeliveries = RecordDeliveries(pair.Server);
+        List<byte[]> clientDeliveries = RecordDeliveries(pair.Client);
+        bool isUsed = isServerEnabled && isClientEnabled;
+        byte[] payload = BuildFilledMessage(0x5A, PayloadLength);
+
+        pair.Client.Send(pair.ClientConnection, new(payload), isReliable: false);
+        pair.Client.Send(pair.ClientConnection, new(payload), isReliable: true);
+        pair.Server.Send(pair.ServerConnection, new(payload), isReliable: false);
+        pair.Server.Send(pair.ServerConnection, new(payload), isReliable: true);
+
+        Assert.True(TestHarness.PumpUntil(() => serverDeliveries.Count == 2 && clientDeliveries.Count == 2, 2000, pair.Server, pair.Client), $"[{serverDeliveries.Count}] and [{clientDeliveries.Count}] of 2 payloads each way arrived");
+        Assert.All(serverDeliveries, serverDelivery => Assert.Equal(payload, serverDelivery));
+        Assert.All(clientDeliveries, clientDelivery => Assert.Equal(payload, clientDelivery));
+
+        // An unreliable packet is the type byte and the payload, a reliable one adds its sequence, and either ends in the token only when both sides use it.
+        int sessionTokenLength = isUsed ? SessionTokenSize : 0;
+        int[] expectedLengths = [PacketHeader.TypeSize + PayloadLength + sessionTokenLength, PacketHeader.ComputeHeaderSize(PacketType.Reliable) + PayloadLength + sessionTokenLength];
+
+        Assert.NotEmpty(serverTransform.HandshakeVersions);
+        Assert.NotEmpty(clientTransform.HandshakeVersions);
+        Assert.All(serverTransform.HandshakeVersions, handshakeVersion => Assert.Equal(isServerEnabled ? DataSessionTokenVersion : SessionTokenVersion, handshakeVersion));
+        Assert.All(clientTransform.HandshakeVersions, handshakeVersion => Assert.Equal(isClientEnabled ? DataSessionTokenVersion : SessionTokenVersion, handshakeVersion));
+        Assert.Equal(expectedLengths, serverTransform.DataPacketLengths);
+        Assert.Equal(expectedLengths, clientTransform.DataPacketLengths);
+
+        // An unreliable packet forged from the client's address is delivered exactly when no token is used, as it always was.
+        pair.Forge([(byte)PacketType.None, 0x01, 0x02, 0x03, 0x04, 0x05]);
+        TestHarness.PumpFor(200, pair.Server, pair.Client);
+
+        Assert.True(serverDeliveries.Count == (isUsed ? 2 : 3), $"a forged unreliable packet was [{(serverDeliveries.Count == 3 ? "delivered" : "dropped")}] where data session tokens are [{(isUsed ? "used" : "not used")}]");
+    }
+
+    /// <summary>
+    /// A server answers every handshake asking for data session tokens exactly when it has them on, and carries the token on data packets,
+    /// in both directions, only when the peer's handshake asked for them too. A peer whose handshake predates data session tokens, or session
+    /// tokens altogether, even one whose random nonce happens to end in the byte that asks for them, is served exactly as before.
+    /// </summary>
+    /// <param name="isServerEnabled">True when the server has data session tokens on.</param>
+    /// <param name="handshakePayloadLength">The length of the peer's handshake payload: a bare nonce, or a nonce and a version.</param>
+    /// <param name="lastHandshakeByte">The last byte of the peer's handshake: its version, or the last byte of a bare nonce.</param>
+    [Theory]
+    [InlineData(true, PacketHeader.HandshakeNonceSize + 1, DataSessionTokenVersion)]
+    [InlineData(true, PacketHeader.HandshakeNonceSize + 1, SessionTokenVersion)]
+    [InlineData(true, PacketHeader.HandshakeNonceSize, DataSessionTokenVersion)]
+    [InlineData(false, PacketHeader.HandshakeNonceSize + 1, DataSessionTokenVersion)]
+    [InlineData(false, PacketHeader.HandshakeNonceSize + 1, SessionTokenVersion)]
+    public void DataSessionToken_IsUsedWithAPeerOnlyWhenItsHandshakeAsksForIt(bool isServerEnabled, int handshakePayloadLength, byte lastHandshakeByte)
+    {
+        const int PayloadLength = 50;
+
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port, synapseConfig => synapseConfig.Security.DataSessionTokenEnabled = isServerEnabled));
+        List<byte[]> serverDeliveries = RecordDeliveries(server);
+
+        server.Start();
+
+        IPEndPoint target = new(IPAddress.Loopback, port);
+        using Socket peer = TestHarness.CreateRawSocket();
+        byte[] receiveBuffer = new byte[256];
+        byte[] handshake = BuildHandshake(handshakePayloadLength);
+        handshake[^1] = lastHandshakeByte;
+
+        peer.SendTo(handshake, target);
+
+        Assert.True(TryReceiveWhilePumping(peer, receiveBuffer, server, PacketType.Handshake, out int answerLength), "the server never answered the handshake");
+        Assert.True(
+            answerLength == PacketHeader.TypeSize + PacketHeader.HandshakeNonceSize + 1 && receiveBuffer[answerLength - 1] == (isServerEnabled ? DataSessionTokenVersion : SessionTokenVersion),
+            $"the server's [{answerLength}]-byte answer ends in [{receiveBuffer[answerLength - 1]}]");
+
+        byte[] serverToken = receiveBuffer.AsSpan(PacketHeader.TypeSize, SessionTokenSize).ToArray();
+        bool isUsed = isServerEnabled && handshakePayloadLength == PacketHeader.HandshakeNonceSize + 1 && lastHandshakeByte == DataSessionTokenVersion;
+
+        // The server's data is the type byte and the payload, ending in the first bytes of the peer's nonce only when the token is used.
+        server.Send(server.Connections.Connections[0], new(BuildFilledMessage(0x5A, PayloadLength)), isReliable: false);
+
+        Assert.True(TryReceiveWhilePumping(peer, receiveBuffer, server, PacketType.None, out int dataLength), "the server's data never arrived");
+        Assert.Equal(PacketHeader.TypeSize + PayloadLength + (isUsed ? SessionTokenSize : 0), dataLength);
+
+        if (isUsed)
+            Assert.True(receiveBuffer.AsSpan(dataLength - SessionTokenSize, SessionTokenSize).SequenceEqual(handshake.AsSpan(PacketHeader.TypeSize, SessionTokenSize)), "the server's data does not end with the session token the peer's handshake opened with");
+
+        // The peer's data without the token is delivered exactly when the token is not used; with the server's token, it is delivered when it is.
+        byte[] peerPayload = BuildFilledMessage(0x6B, PayloadLength);
+        byte[] untokened = [(byte)PacketType.None, .. peerPayload];
+
+        peer.SendTo(untokened, target);
+        TestHarness.PumpFor(100, server);
+
+        Assert.True(serverDeliveries.Count == (isUsed ? 0 : 1), $"the peer's data without the token was [{(serverDeliveries.Count == 0 ? "dropped" : "delivered")}] where the token is [{(isUsed ? "used" : "not used")}]");
+
+        if (isUsed)
+            peer.SendTo(BuildTokenedPacket(untokened, serverToken), target);
+
+        Assert.True(TestHarness.PumpUntil(() => serverDeliveries.Count == 1, 2000, server) && serverDeliveries[0].AsSpan().SequenceEqual(peerPayload), "the peer's data did not arrive intact");
+    }
+
+    /// <summary>
+    /// With data session tokens in use, a data packet too short to carry the token after its header is dropped and counted, even when its
+    /// last four bytes, which then overlap the header, equal the receiver's token. It is not read as a packet with a negative payload
+    /// length, which from the peer is a violation that ends its session.
+    /// </summary>
+    [Fact]
+    public void DataSessionToken_PacketTooShortForTheToken_IsDroppedEvenWhenItsLastBytesMatch()
+    {
+        int port = TestHarness.GetFreePort();
+        using SynapseManager server = new(TestHarness.ServerConfig(port, EnableDataSessionToken));
+
+        TestHarness.EventRecorder serverEvents = new();
+        serverEvents.Attach(server);
+        server.Start();
+
+        IPEndPoint target = new(IPAddress.Loopback, port);
+        using Socket peer = TestHarness.CreateRawSocket();
+        byte[] receiveBuffer = new byte[64];
+
+        peer.SendTo(BuildHandshake(PacketHeader.HandshakeNonceSize + 1, DataSessionTokenVersion), target);
+        Assert.True(TryReceiveWhilePumping(peer, receiveBuffer, server, PacketType.Handshake, out _), "the server never answered the handshake");
+
+        long droppedBefore = server.Telemetry.PacketsDroppedIn;
+
+        // The type byte and the server's token: five bytes, two short of a reliable header and the token.
+        byte[] tooShort = BuildTokenedPacket([(byte)PacketType.Reliable], receiveBuffer.AsSpan(PacketHeader.TypeSize, SessionTokenSize));
+
+        peer.SendTo(tooShort, target);
+        TestHarness.PumpFor(100, server);
+
+        Assert.True(
+            serverEvents.Violations == 0 && serverEvents.ConnectionsClosed == 0 && server.Connections.Count == 1,
+            $"a [{tooShort.Length}]-byte reliable packet ending in the token raised [{string.Join(", ", serverEvents.ViolationReasons)}] and closed [{serverEvents.ConnectionsClosed}] sessions");
+        Assert.Equal(0, serverEvents.PacketsReceived);
+        Assert.Equal(droppedBefore + 1, server.Telemetry.PacketsDroppedIn);
+    }
+
+    /// <summary>
+    /// With data session tokens on at both ends, a reliable message the server sends from its <see cref="SynapseManager.ConnectionClosed"/>
+    /// handler while a restarted client's proof replaces the session reaches the new session: like a message sent before a handshake is
+    /// answered, it waits for the new session's token rather than carrying the old session's.
+    /// </summary>
+    [Fact]
+    public void DataSessionToken_ReliableMessageSentWhileASessionIsReplaced_ReachesTheNewSession()
+    {
+        using ConnectedPair pair = new(EnableDataSessionToken, EnableDataSessionToken);
+        List<byte[]> clientDeliveries = RecordDeliveries(pair.Client);
+        byte[] message = BuildFilledMessage(0x77, 64);
+
+        pair.Server.ConnectionClosed += connectionEventArgs => pair.Server.Send(connectionEventArgs.Connection, new(message), isReliable: true);
+
+        // Past IngressEngine.HandshakeAnswerWindowTicks, the client restarts and connects again; the server challenges it, and its proof replaces the session.
+        TestHarness.PumpFor(1200, pair.Server, pair.Client);
+        pair.Reconnect();
+
+        Assert.True(pair.ServerEvents.ConnectionsClosed == 1 && pair.ClientConnection.State is ConnectionState.Connected, $"the reconnect left [{pair.ServerEvents.ConnectionsClosed}] closed sessions and the client [{pair.ClientConnection.State}]");
+        Assert.True(
+            TestHarness.PumpUntil(() => clientDeliveries.Count == 1, 3000, pair.Server, pair.Client) && clientDeliveries[0].AsSpan().SequenceEqual(message),
+            "a reliable message sent while the session was replaced never reached the new session");
+    }
+
+    /// <summary>
+    /// Once the pools are warm, data packets in both directions, unreliable, reliable and split, with forged ones mixed in, allocate nothing
+    /// on the thread that sends and polls, whether or not they carry the session token.
+    /// </summary>
+    /// <param name="isDataSessionTokenEnabled">True to turn data session tokens on at both ends.</param>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void DataSessionToken_WarmDataTraffic_AllocatesNothing(bool isDataSessionTokenEnabled)
+    {
+        const int ExchangeCount = 50;
+
+        int port = TestHarness.GetFreePort();
+
+        // The rate limits are off, since the exchanges are not paced and a refused one would raise a violation.
+        void Configure(SynapseConfig synapseConfig)
+        {
+            synapseConfig.Security.DataSessionTokenEnabled = isDataSessionTokenEnabled;
+            synapseConfig.Security.MaximumPacketsPerSecond = SecurityConfig.DisabledMaximumPacketsPerSecond;
+            synapseConfig.Security.MaximumBytesPerSecond = SecurityConfig.DisabledMaximumBytesPerSecond;
+        }
+
+        using SynapseManager server = new(TestHarness.ServerConfig(port, Configure));
+        using SynapseManager client = new(TestHarness.ClientConfig(Configure));
+
+        // A one-element box the handlers count into, so no delivery allocates.
+        int[] deliveredCount = [0];
+        server.PacketReceived += _ => deliveredCount[0]++;
+        client.PacketReceived += _ => deliveredCount[0]++;
+
+        server.Start();
+        client.Start();
+
+        IPEndPoint serverEndPoint = new(IPAddress.Loopback, port);
+        SynapseConnection clientConnection = client.Connect(serverEndPoint);
+
+        Assert.True(TestHarness.PumpUntil(() => clientConnection.State is ConnectionState.Connected && server.Connections.Count == 1, 3000, server, client), "the client never connected");
+
+        SynapseConnection serverConnection = server.Connections.Connections[0];
+        ArraySegment<byte> payload = new(new byte[100]);
+        ArraySegment<byte> splitPayload = new(new byte[server.MaximumPayloadSize * 3]);
+        ArraySegment<byte> forged = new([(byte)PacketType.None, 1, 2, 3, 4, 5, 6]);
+        // Four honest payloads arrive per exchange, and the forged one too where no token is carried.
+        int deliveriesPerExchange = isDataSessionTokenEnabled ? 4 : 5;
+        long droppedBefore = server.Telemetry.PacketsDroppedIn;
+
+        // The first round grows the pools and the tables; the second is measured.
+        for (int round = 0; round < 2; round++)
+        {
+            long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+
+            for (int exchange = 0; exchange < ExchangeCount; exchange++)
+            {
+                int expectedCount = deliveredCount[0] + deliveriesPerExchange;
+
+                client.Send(clientConnection, payload, isReliable: false);
+                client.Send(clientConnection, splitPayload, isReliable: true);
+                server.Send(serverConnection, payload, isReliable: true);
+                server.Send(serverConnection, splitPayload, isReliable: false);
+                client.SendRaw(serverEndPoint, forged);
+
+                long deadlineMilliseconds = Environment.TickCount64 + 2000;
+
+                while (deliveredCount[0] < expectedCount && Environment.TickCount64 < deadlineMilliseconds)
+                {
+                    server.Poll();
+                    client.Poll();
+                }
+            }
+
+            long allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+
+            Assert.Equal((round + 1) * ExchangeCount * deliveriesPerExchange, deliveredCount[0]);
+
+            if (round == 1)
+                Assert.Equal(0, allocatedBytes);
+        }
+
+        Assert.Equal(droppedBefore + (isDataSessionTokenEnabled ? 2 * ExchangeCount : 0), server.Telemetry.PacketsDroppedIn);
+    }
+
+    /// <summary>
     /// Builds a wire-format handshake datagram: the type byte and a random payload, by default the 8-byte nonce of a peer that predates
-    /// session tokens. A payload one byte longer than a nonce or a challenge ends in the session token version instead of a random byte.
+    /// session tokens. A payload one byte longer than a nonce or a challenge ends in <paramref name="version"/> instead of a random byte.
     /// </summary>
     /// <param name="payloadLength">The payload's length.</param>
+    /// <param name="version">The protocol version byte a versioned payload ends with.</param>
     /// <returns>The datagram.</returns>
-    private static byte[] BuildHandshake(int payloadLength = PacketHeader.HandshakeNonceSize)
+    private static byte[] BuildHandshake(int payloadLength = PacketHeader.HandshakeNonceSize, byte version = SessionTokenVersion)
     {
         byte[] datagram = new byte[PacketHeader.TypeSize + payloadLength];
         datagram[0] = (byte)PacketType.Handshake;
         RandomNumberGenerator.Fill(datagram.AsSpan(PacketHeader.TypeSize));
 
         if (payloadLength is PacketHeader.HandshakeNonceSize + 1 or PacketHeader.HandshakeChallengeSize + 1)
-            datagram[^1] = SessionTokenVersion;
+            datagram[^1] = version;
 
         return datagram;
     }
 
     /// <summary>
-    /// Builds a control packet followed by a session token.
+    /// Builds a wire-format segment of <paramref name="packetType"/> carrying <paramref name="payloadLength"/> zero bytes, under reliable
+    /// sequence 0 when the type carries one.
+    /// </summary>
+    /// <param name="packetType"><see cref="PacketType.Segmented"/> or <see cref="PacketType.ReliableSegmented"/>.</param>
+    /// <param name="segmentId">The message's segment id.</param>
+    /// <param name="segmentIndex">The segment's index.</param>
+    /// <param name="segmentCount">The segments the message declares.</param>
+    /// <param name="payloadLength">The bytes after the header.</param>
+    /// <returns>The datagram.</returns>
+    private static byte[] BuildSegment(PacketType packetType, ushort segmentId, byte segmentIndex, byte segmentCount, int payloadLength)
+    {
+        byte[] datagram = new byte[PacketHeader.ComputeHeaderSize(packetType) + payloadLength];
+        PacketHeader.Write(datagram, packetType, sequence: 0, segmentId, segmentIndex, segmentCount);
+
+        return datagram;
+    }
+
+    /// <summary>
+    /// Turns <see cref="SecurityConfig.DataSessionTokenEnabled"/> on.
+    /// </summary>
+    /// <param name="synapseConfig">The configuration to change.</param>
+    private static void EnableDataSessionToken(SynapseConfig synapseConfig) => synapseConfig.Security.DataSessionTokenEnabled = true;
+
+    /// <summary>
+    /// Records a copy of every payload <paramref name="synapseManager"/> delivers, in arrival order.
+    /// </summary>
+    /// <param name="synapseManager">The engine whose deliveries are recorded.</param>
+    /// <returns>The delivered payloads.</returns>
+    private static List<byte[]> RecordDeliveries(SynapseManager synapseManager)
+    {
+        List<byte[]> deliveredPayloads = [];
+        synapseManager.PacketReceived += packetReceivedEventArgs => deliveredPayloads.Add(packetReceivedEventArgs.Payload.ToArray());
+
+        return deliveredPayloads;
+    }
+
+    /// <summary>
+    /// Builds a packet followed by a session token.
     /// </summary>
     /// <param name="packet">The packet without its token.</param>
     /// <param name="sessionToken">The token to append.</param>
@@ -1511,6 +2122,30 @@ public sealed class SecuritySweepTests
     }
 
     /// <summary>
+    /// A segment that is a violation when its sender's session sends it.
+    /// </summary>
+    public enum MalformedSegment : byte
+    {
+        /// <summary>
+        /// An unreliable segment carrying one byte more than the transmission unit.
+        /// </summary>
+        UnreliableLargerThanTransmissionUnit,
+        /// <summary>
+        /// A reliable segment, not the last of its message, carrying one byte more than the transmission unit.
+        /// </summary>
+        ReliableLargerThanTransmissionUnit,
+        /// <summary>
+        /// Two unreliable segments of one message, the second declaring a different segment count than the first.
+        /// </summary>
+        ContradictingSegmentCount,
+        /// <summary>
+        /// A reliable segment declaring 255 segments, which at the transmission unit is more than the server's
+        /// <see cref="SecurityConfig.MaximumReassembledPacketSize"/> allows.
+        /// </summary>
+        DeclaredAssemblyOversized
+    }
+
+    /// <summary>
     /// A server and a real client connected over loopback, the client being the victim whose address is forged.
     /// </summary>
     private sealed class ConnectedPair : IDisposable
@@ -1548,12 +2183,13 @@ public sealed class SecuritySweepTests
         /// Starts both engines and connects the victim.
         /// </summary>
         /// <param name="tweakServerConfig">Adjusts the server's configuration before it starts, or null to keep the defaults.</param>
-        public ConnectedPair(Action<SynapseConfig>? tweakServerConfig = null)
+        /// <param name="tweakClientConfig">Adjusts the victim's configuration before it starts, or null to keep the defaults.</param>
+        public ConnectedPair(Action<SynapseConfig>? tweakServerConfig = null, Action<SynapseConfig>? tweakClientConfig = null)
         {
             int port = TestHarness.GetFreePort();
 
             Server = new(TestHarness.ServerConfig(port, tweakServerConfig));
-            Client = new(TestHarness.ClientConfig());
+            Client = new(TestHarness.ClientConfig(tweakClientConfig));
             ServerEvents.Attach(Server);
 
             Server.Start();
@@ -1783,6 +2419,59 @@ public sealed class SecuritySweepTests
             }
 
             source.CopyTo(destination);
+
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// A pass-through transform that records what its engine sends: the protocol version each handshake ends with, the length and the last
+    /// four bytes of each data packet, and the largest datagram of any kind.
+    /// </summary>
+    private sealed class RecordingTransform : IPacketTransform
+    {
+        /// <summary>
+        /// The last byte of each handshake sent, which is its protocol version.
+        /// </summary>
+        public readonly List<byte> HandshakeVersions = [];
+        /// <summary>
+        /// The length of each data packet sent, header included.
+        /// </summary>
+        public readonly List<int> DataPacketLengths = [];
+        /// <summary>
+        /// The last four bytes of each data packet sent, read as a little-endian session token.
+        /// </summary>
+        public readonly List<uint> DataPacketTrailers = [];
+        /// <summary>
+        /// The length of the largest datagram sent, header included.
+        /// </summary>
+        public int LargestDatagramLength;
+        /// <inheritdoc/>
+        public uint ReservedBytes => 0;
+
+        /// <inheritdoc/>
+        public bool TryTransform(PacketTransformDirection packetTransformDirection, PacketType packetType, IPEndPoint endPoint, ReadOnlySpan<byte> source, Span<byte> destination, out int writtenLength)
+        {
+            source.CopyTo(destination);
+            writtenLength = source.Length;
+
+            if (packetTransformDirection != PacketTransformDirection.Outbound)
+                return true;
+
+            int datagramLength = PacketHeader.ComputeHeaderSize(packetType) + source.Length;
+            LargestDatagramLength = Math.Max(LargestDatagramLength, datagramLength);
+
+            if (packetType == PacketType.Handshake)
+            {
+                HandshakeVersions.Add(source[^1]);
+            }
+            else if (packetType is PacketType.None or PacketType.Reliable or PacketType.Segmented or PacketType.ReliableSegmented)
+            {
+                DataPacketLengths.Add(datagramLength);
+
+                if (source.Length >= SessionTokenSize)
+                    DataPacketTrailers.Add(BinaryPrimitives.ReadUInt32LittleEndian(source[^SessionTokenSize..]));
+            }
 
             return true;
         }

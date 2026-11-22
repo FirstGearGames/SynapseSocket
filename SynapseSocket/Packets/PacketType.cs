@@ -12,7 +12,9 @@ namespace SynapseSocket.Packets;
 /// All other types carry no additional header fields; any further bytes are payload.
 /// <para>
 /// Between two peers that both advertise session tokens in their handshakes, <see cref="Ack"/>, <see cref="SegmentAck"/>,
-/// <see cref="KeepAlive"/> and <see cref="Disconnect"/> end with the receiver's 4-byte session token.
+/// <see cref="KeepAlive"/> and <see cref="Disconnect"/> end with the receiver's 4-byte session token. Between two peers whose
+/// handshakes both set <see cref="PacketHeader.DataSessionTokenFlag"/>, <see cref="None"/>, <see cref="Reliable"/>,
+/// <see cref="Segmented"/> and <see cref="ReliableSegmented"/> end with it too.
 /// </para>
 /// <para>
 /// Byte values strictly greater than <see cref="SegmentAck"/> are reserved for external protocols

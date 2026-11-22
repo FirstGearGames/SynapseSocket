@@ -72,6 +72,11 @@ public sealed partial class TransmissionEngine
     /// </summary>
     private readonly SendQueueFullAction _sendQueueFullAction;
     /// <summary>
+    /// The protocol version every handshake this engine sends ends with: <see cref="PacketHeader.SessionTokenVersion"/>, with
+    /// <see cref="PacketHeader.DataSessionTokenFlag"/> set while <see cref="SecurityConfig.DataSessionTokenEnabled"/> is on.
+    /// </summary>
+    private readonly byte _handshakeVersion;
+    /// <summary>
     /// Scratch buffer the transformed packet is assembled into, allocated once and reused for every send.
     /// Null when no transform is configured, so an engine without one allocates nothing.
     /// </summary>
@@ -146,6 +151,7 @@ public sealed partial class TransmissionEngine
         // Never below one datagram, so a full queue can always make room for the next one by sending what it holds.
         _maximumQueuedBytes = (int)Math.Min(Math.Max(sendThrottleConfig.MaximumQueuedBytes, config.MaximumTransmissionUnit), int.MaxValue);
         _sendQueueFullAction = sendThrottleConfig.QueueFullAction;
+        _handshakeVersion = config.Security.DataSessionTokenEnabled ? (byte)(PacketHeader.SessionTokenVersion | PacketHeader.DataSessionTokenFlag) : PacketHeader.SessionTokenVersion;
 
         // Sized for the largest packet the engine can legally frame plus the headroom the transform reserved,
         // so a transformed packet never runs out of destination.
@@ -206,10 +212,16 @@ public sealed partial class TransmissionEngine
     /// <param name="synapseConnection">The target connection.</param>
     /// <param name="payload">The application payload to send.</param>
     /// <returns>Whether the packet was sent, queued, or dropped.</returns>
+    /// <remarks>
+    /// Only a session that knows its peer's token ends the packet with it. Unreliable data sent while the session waits on its handshake
+    /// carries none, and a peer requiring data session tokens drops it.
+    /// </remarks>
     internal SendResult SendUnreliableUnsegmented(SynapseConnection synapseConnection, ArraySegment<byte> payload)
     {
         const PacketType Type = PacketType.None;
-        int totalLength = PacketHeader.ComputeHeaderSize(Type) + payload.Count;
+        bool isSessionTokenAppended = synapseConnection.DataSessionTokenState is DataSessionTokenState.Enabled;
+        int packetLength = PacketHeader.ComputeHeaderSize(Type) + payload.Count;
+        int totalLength = isSessionTokenAppended ? packetLength + PacketHeader.SessionTokenSize : packetLength;
 
         if (_isSendThrottleEnabled)
         {
@@ -222,7 +234,7 @@ public sealed partial class TransmissionEngine
             {
                 SendThrottle sendThrottle = synapseConnection.SendThrottle;
                 ArraySegment<byte> reservedSegment = sendThrottle.Reserve(totalLength);
-                int queuedLength = PacketHeader.BuildPacket(reservedSegment.AsSpan(), Type, 0, 0, 0, 0, payload.AsSpan());
+                int queuedLength = BuildDataPacket(reservedSegment.AsSpan(), Type, sequence: 0, payload.AsSpan(), synapseConnection, isSessionTokenAppended);
                 sendThrottle.EnqueueReserved(queuedLength);
 
                 return SendResult.Queued;
@@ -232,7 +244,7 @@ public sealed partial class TransmissionEngine
         byte[] rentedBuffer = TrackedArrayPool<byte>.Rent(totalLength);
         try
         {
-            int written = PacketHeader.BuildPacket(rentedBuffer.AsSpan(), Type, 0, 0, 0, 0, payload.AsSpan());
+            int written = BuildDataPacket(rentedBuffer.AsSpan(), Type, sequence: 0, payload.AsSpan(), synapseConnection, isSessionTokenAppended);
             SendToConnection(new(rentedBuffer, 0, written), synapseConnection);
         }
         finally
@@ -260,7 +272,9 @@ public sealed partial class TransmissionEngine
             return SendResult.Dropped;
 
         const PacketType Type = PacketType.Reliable;
-        int totalLength = PacketHeader.ComputeHeaderSize(Type) + payload.Count;
+        bool isSessionTokenAppended = synapseConnection.DataSessionTokenState is DataSessionTokenState.Enabled;
+        int packetLength = PacketHeader.ComputeHeaderSize(Type) + payload.Count;
+        int totalLength = isSessionTokenAppended ? packetLength + PacketHeader.SessionTokenSize : packetLength;
         long nowTicks = Clock.Ticks;
         SendResult sendResult = SendResult.Sent;
 
@@ -275,8 +289,10 @@ public sealed partial class TransmissionEngine
 
         ushort sequence = synapseConnection.NextOutgoingSequence++;
 
-        byte[] packetBuffer = TrackedArrayPool<byte>.Rent(totalLength);
-        int written = PacketHeader.BuildPacket(packetBuffer.AsSpan(), Type, sequence, 0, 0, 0, payload.AsSpan());
+        /* The room for the token is kept even while the session waits on its handshake, when the token is not written, so it can be written
+         * once the session is established and the resends carry it. */
+        byte[] packetBuffer = TrackedArrayPool<byte>.Rent(packetLength + synapseConnection.DataSessionTokenReservedSize);
+        int written = BuildDataPacket(packetBuffer.AsSpan(), Type, sequence, payload.AsSpan(), synapseConnection, isSessionTokenAppended);
 
         List<ArraySegment<byte>> segments = ListPool<ArraySegment<byte>>.Rent();
         segments.Add(new(packetBuffer, 0, written));
@@ -320,11 +336,12 @@ public sealed partial class TransmissionEngine
         // One last-sent stamp covers the whole burst rather than routing each segment through SendToConnection.
         // The segments leave back to back, so a per-segment clock read would buy nothing on a send of up to 255 of them.
         long nowTicks = Clock.Ticks;
+        int sessionTokenReservedSize = synapseConnection.DataSessionTokenReservedSize;
 
         /* Refused whole, before it takes a sequence number or is split, unless the queue has room for every segment. Checking the
          * whole payload against the room left is what lets the loops below queue each segment without ever being refused partway,
          * which would leave a reliable message waiting forever or an unreliable one that can never assemble. */
-        if (_isSendThrottleEnabled && _sendQueueFullAction is SendQueueFullAction.DropNewest && !HasQueueRoomForSplit(synapseConnection, splitter, payload.Count, isReliable, out int droppedSegmentCount))
+        if (_isSendThrottleEnabled && _sendQueueFullAction is SendQueueFullAction.DropNewest && !HasQueueRoomForSplit(synapseConnection, splitter, payload.Count, isReliable, sessionTokenReservedSize, out int droppedSegmentCount))
         {
             _telemetry.OnThrottleDroppedSent(droppedSegmentCount);
 
@@ -336,7 +353,12 @@ public sealed partial class TransmissionEngine
         if (isReliable)
             sequence = synapseConnection.NextOutgoingSequence++;
 
-        List<ArraySegment<byte>> segments = splitter.Split(payload.AsSpan(), isReliable, out int segmentCount, sequence, out byte[] backingBuffer);
+        List<ArraySegment<byte>> segments = splitter.Split(payload.AsSpan(), isReliable, out int segmentCount, sequence, out byte[] backingBuffer, sessionTokenReservedSize);
+
+        /* Each segment has room for the token after it. While the session waits on its handshake the room stays empty, and a reliable
+         * message's is filled once the session is established, so its resends carry the token. */
+        if (synapseConnection.DataSessionTokenState is DataSessionTokenState.Enabled)
+            synapseConnection.AppendSessionToken(segments);
 
         synapseConnection.LastSentTicks = nowTicks;
 
@@ -517,7 +539,7 @@ public sealed partial class TransmissionEngine
     {
         Span<byte> payload = stackalloc byte[PacketHeader.HandshakeNonceSize + PacketHeader.HandshakeVersionSize];
         RandomNumberGenerator.Fill(payload[..PacketHeader.HandshakeNonceSize]);
-        payload[PacketHeader.HandshakeNonceSize] = PacketHeader.SessionTokenVersion;
+        payload[PacketHeader.HandshakeNonceSize] = _handshakeVersion;
 
         SendHandshakePayload(target, payload);
     }
@@ -533,7 +555,7 @@ public sealed partial class TransmissionEngine
         Span<byte> payload = stackalloc byte[PacketHeader.HandshakeNonceSize + PacketHeader.HandshakeVersionSize];
         BinaryPrimitives.WriteUInt32LittleEndian(payload, synapseConnection.LocalSessionToken);
         RandomNumberGenerator.Fill(payload[PacketHeader.SessionTokenSize..PacketHeader.HandshakeNonceSize]);
-        payload[PacketHeader.HandshakeNonceSize] = PacketHeader.SessionTokenVersion;
+        payload[PacketHeader.HandshakeNonceSize] = _handshakeVersion;
 
         SendHandshakePayload(synapseConnection.RemoteEndPoint, payload);
     }
@@ -655,12 +677,17 @@ public sealed partial class TransmissionEngine
     /// <param name="splitter">The connection's splitter, whose transmission unit sizes the segments.</param>
     /// <param name="payloadLength">The payload's length.</param>
     /// <param name="isReliable">True when the payload is split into reliable segments.</param>
+    /// <param name="sessionTokenReservedSize">
+    /// The room each segment leaves for the session token, counted as sent. A session still waiting on its handshake leaves it empty, so
+    /// there the count is a little high.
+    /// </param>
     /// <param name="segmentCount">The segments the payload splits into, or zero when the transmission unit cannot hold a segment header.</param>
     /// <returns>True when the queue can take every segment.</returns>
-    private bool HasQueueRoomForSplit(SynapseConnection synapseConnection, PacketSplitter splitter, int payloadLength, bool isReliable, out int segmentCount)
+    private bool HasQueueRoomForSplit(SynapseConnection synapseConnection, PacketSplitter splitter, int payloadLength, bool isReliable, int sessionTokenReservedSize, out int segmentCount)
     {
-        int headerSize = PacketHeader.ComputeHeaderSize(isReliable ? PacketType.ReliableSegmented : PacketType.Segmented);
-        int segmentPayloadSize = (int)splitter.MaximumTransmissionUnit - headerSize;
+        // Each segment's header and the room it leaves for the session token.
+        int segmentOverhead = PacketHeader.ComputeHeaderSize(isReliable ? PacketType.ReliableSegmented : PacketType.Segmented) + sessionTokenReservedSize;
+        int segmentPayloadSize = (int)splitter.MaximumTransmissionUnit - segmentOverhead;
 
         // A transmission unit too small for a segment header is left for the split to report clearly.
         if (segmentPayloadSize <= 0)
@@ -672,7 +699,7 @@ public sealed partial class TransmissionEngine
 
         segmentCount = (payloadLength + segmentPayloadSize - 1) / segmentPayloadSize;
 
-        return synapseConnection.SendThrottle.QueuedBytes + payloadLength + segmentCount * headerSize <= _maximumQueuedBytes;
+        return synapseConnection.SendThrottle.QueuedBytes + payloadLength + segmentCount * segmentOverhead <= _maximumQueuedBytes;
     }
 
     /// <summary>
@@ -866,6 +893,29 @@ public sealed partial class TransmissionEngine
             return packetLength;
 
         BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(packetLength), synapseConnection.RemoteSessionToken);
+
+        return packetLength + PacketHeader.SessionTokenSize;
+    }
+
+    /// <summary>
+    /// Builds an unsegmented data packet into <paramref name="destination"/>, ending it with the connection's
+    /// <see cref="SynapseConnection.RemoteSessionToken"/> when <paramref name="isSessionTokenAppended"/>.
+    /// </summary>
+    /// <param name="destination">Where the packet is built, with room for the token when it is appended.</param>
+    /// <param name="type"><see cref="PacketType.None"/> or <see cref="PacketType.Reliable"/>.</param>
+    /// <param name="sequence">The reliable sequence, written only when <paramref name="type"/> carries one.</param>
+    /// <param name="payload">The application payload.</param>
+    /// <param name="synapseConnection">The connection the packet is for.</param>
+    /// <param name="isSessionTokenAppended">True when the connection's data packets carry the session token.</param>
+    /// <returns>The packet's length, including the token when one was written.</returns>
+    private static int BuildDataPacket(Span<byte> destination, PacketType type, ushort sequence, ReadOnlySpan<byte> payload, SynapseConnection synapseConnection, bool isSessionTokenAppended)
+    {
+        int packetLength = PacketHeader.BuildPacket(destination, type, sequence, segmentId: 0, segmentIndex: 0, segmentCount: 0, payload);
+
+        if (!isSessionTokenAppended)
+            return packetLength;
+
+        BinaryPrimitives.WriteUInt32LittleEndian(destination[packetLength..], synapseConnection.RemoteSessionToken);
 
         return packetLength + PacketHeader.SessionTokenSize;
     }
